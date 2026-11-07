@@ -1,23 +1,31 @@
 """Runtime injection of an exact AdaLN table into a MiniMax-H3 MODEL.
 
-The injection must not depend on how the sampler is invoked. Custom sampler
-nodes (SequenceForge, HyperFlow adapters, etc.) often call
-`comfy.sample.sample()` directly with their own model_options, so a
-`set_model_patch_replace(..., "dit", "double_block", 0)` callback may never
-run. Instead we identify timesteps from the `t_emb` tensor itself:
+Two independent resolvers, in this order:
 
-  * pruned / curve checkpoint: t_emb is the 8-wide lerped curve coordinate,
-    rebuilt from `adaln_t_table`
-  * full checkpoint: t_emb is `time_embedder(t).to(dtype)`, 2688-wide,
-    rebuilt by running the model's own `time_embedder` on the baked t values
+1. **t_emb matching (primary).** Every table row is a function of one distinct
+   timestep, and the model builds exactly one `t_emb` row per distinct
+   timestep. So the incoming `t_emb` rows can be matched against per-row keys
+   rebuilt from the *target* model:
 
-Both give a [T, k] key matrix. Each `adaln_proj` forward hook nearest-matches
-the incoming t_emb rows against those keys and returns the exact baked rows.
-No layout, no transformer_options["sigmas"], no patches_replace required.
+     * pruned / curve checkpoint -> lerp of `adaln_t_table` (fp32, 8-wide)
+     * full checkpoint           -> `time_embedder(t).to(dtype)` (2688-wide)
 
-A dit patch is kept only as a last-resort fallback. ComfyUI calls it as
-patch(args, {"original_block": callable}) -- a dict, not a function -- so both
-that form and a bare callable are accepted.
+   Keys are rebuilt lazily on the tensor's own device and cast to its own
+   dtype, because that is what the model does; computing them on CPU or in
+   another dtype makes the distance non-zero for reasons that have nothing to
+   do with the table. Because Record stores the float32 image of t, this
+   match is expected to be **exactly zero**, and anything else is reported
+   instead of silently snapped to the nearest row.
+
+2. **sigma reconstruction (fallback).** A `WrappersMP.DIFFUSION_MODEL` wrapper
+   wraps `_forward` -- unlike `patches_replace`, which custom samplers that
+   call `comfy.sample.sample()` never populate. It sees the real `timestep`
+   and the packed `layout`, so `unique_t` can be rebuilt and mapped by value.
+   It also produces the "which timesteps are missing from the table" list used
+   by the strict-mode error message.
+
+No layout, no patches_replace and no transformer_options are required for the
+primary path.
 """
 
 import logging
@@ -51,58 +59,130 @@ class ExactAdaLNRuntime:
         self.previous_patch = None
         self.hook_handles = []
         self._device_cache = {}
-        self.match_keys, self.match_mode = self._build_match_keys(dm)
-        self.use_match = self.match_keys is not None
+        self._key_specs, self.match_mode = self._discover_key_sets(dm)
+        self._key_cache = {}
+        self.use_match = bool(self._key_specs)
+        self.wrapper_key = None
         self.state = {
-            "t_indices": None, "hits": 0, "fallbacks": 0,
-            "missing": set(), "last_sigma": None,
-            "match_hits": 0, "match_failures": 0,
+            "t_indices": None, "sigma_hits": 0, "fallbacks": 0,
+            "missing": set(), "last_sigma": None, "last_t": None,
+            "match_hits": 0, "match_failures": 0, "match_approx": 0,
             "max_match_distance": 0.0, "last_diag": "",
-            "dit_hits": 0, "native_steps": 0,
+            "injected": 0, "native_steps": 0, "wrapper_steps": 0,
+            "sigma_misses": 0,
         }
 
-    def _build_match_keys(self, dm):
-        """Return ([T, k] keys, human readable mode) or (None, 'dit patch')."""
-        t = torch.tensor(self.t_values, dtype=torch.float32)
-        try:
-            if getattr(dm, "use_adaln_curves", False):
-                table = getattr(dm, "adaln_t_table", None)
-                if table is not None and table.ndim == 2 and table.shape[0] >= 2:
-                    tbl = table.detach().to(device="cpu", dtype=torch.float32).contiguous()
-                    pos = t.clamp(0.0, 1.0) * (tbl.shape[0] - 1)
-                    i0 = pos.floor().long().clamp(max=tbl.shape[0] - 2)
-                    frac = (pos - i0).unsqueeze(1)
-                    keys = torch.lerp(tbl[i0], tbl[i0 + 1], frac)
-                    return keys.contiguous(), "curve-coordinate (8-wide)"
+    # -- key construction ------------------------------------------------
+    def _discover_key_sets(self, dm):
+        """{t_emb width: kind} for every way this model can build t_emb."""
+        specs = {}
+        modes = []
+        tbl = getattr(dm, "adaln_t_table", None)
+        if torch.is_tensor(tbl) and tbl.ndim == 2 and tbl.shape[0] >= 2:
+            specs[int(tbl.shape[1])] = "curve"
+            modes.append("curve-coordinate ({}-wide)".format(int(tbl.shape[1])))
+        te = getattr(dm, "time_embedder", None)
+        if te is not None:
+            width = int(getattr(getattr(te, "proj_out", None), "out_features", 0) or 0)
+            if width:
+                specs[width] = "time_embedder"
+                modes.append("time-embedder ({}-wide)".format(width))
+        return specs, " + ".join(modes) if modes else "unavailable"
 
-            te = getattr(dm, "time_embedder", None)
-            if te is not None:
-                dev = next(te.parameters()).device
-                with torch.no_grad():
-                    keys = te(t.to(dev)).to(self.out_dtype)
-                keys = keys.detach().to(device="cpu", dtype=torch.float32).contiguous()
-                if keys.ndim == 2 and keys.shape[0] == len(self.t_values):
-                    return keys, "time-embedder ({} -wide)".format(keys.shape[-1])
-                logging.warning("H3ExactAdaLN: unexpected time_embedder shape %s",
-                                tuple(keys.shape))
-        except Exception as e:
-            logging.warning("H3ExactAdaLN: could not build match keys (%s: %s); "
-                            "falling back to dit patch", type(e).__name__, e)
-        return None, "dit patch fallback"
+    def _keys_for(self, t_emb):
+        """Per-row keys on t_emb's device/dtype, or None if width is unknown."""
+        width = int(t_emb.shape[-1])
+        kind = self._key_specs.get(width)
+        if kind is None:
+            return None, None
+        cache_key = (width, t_emb.device.type, str(t_emb.dtype))
+        cached = self._key_cache.get(cache_key)
+        if cached is not None:
+            return cached, kind
+        dev = t_emb.device
+        dtype = t_emb.dtype
+        t = torch.tensor(self.t_values, dtype=torch.float32, device=dev)
+        with torch.no_grad():
+            if kind == "curve":
+                tbl = getattr(self.dm, "adaln_t_table")
+                try:
+                    import comfy.model_management
+                    tbl = comfy.model_management.cast_to(tbl, device=dev)
+                except Exception:
+                    tbl = tbl.to(device=dev)
+                tbl = tbl.to(torch.float32)
+                pos = t.clamp(0.0, 1.0) * (tbl.shape[0] - 1)
+                i0 = pos.floor().long().clamp(max=tbl.shape[0] - 2)
+                keys = torch.lerp(tbl[i0], tbl[i0 + 1], (pos - i0).unsqueeze(1))
+            else:
+                keys = self.dm.time_embedder(t)
+            keys = keys.to(dtype).contiguous()
+        self._key_cache[cache_key] = keys
+        return keys, kind
 
     def _match_indices(self, t_emb):
-        """Return (indices, max_distance, tolerance) for t_emb rows."""
-        keys = self.match_keys.to(device=t_emb.device, dtype=torch.float32)
+        """(indices|None, max_distance, soft_tolerance, note)."""
+        keys, kind = self._keys_for(t_emb)
+        if keys is None:
+            return None, float("inf"), 0.0, "no key set for width {}".format(t_emb.shape[-1])
         x = t_emb.detach().to(torch.float32)
         if x.ndim != 2 or x.shape[-1] != keys.shape[-1]:
-            return None, float("inf"), 0.0
+            return None, float("inf"), 0.0, "shape {} vs keys {}".format(
+                tuple(x.shape), tuple(keys.shape))
         dist = torch.cdist(x, keys)
         idx = dist.argmin(dim=1)
         mind = dist.gather(1, idx[:, None]).squeeze(1)
+        # float32 rounding only; anything above one ulp of the key magnitude is
+        # a real difference and must not be swallowed by a tolerance.
         scale = float(keys.abs().max().clamp(min=1.0))
-        tol = max(1e-3, 2e-3 * scale)
-        return idx.detach().cpu().tolist(), float(mind.max()), tol
+        return (idx.detach().cpu().tolist(), float(mind.max()),
+                1e-6 * scale, "{} keys".format(kind))
 
+    # -- fallback wrapper -------------------------------------------------
+    def _build_t_indices(self, timestep, transformer_options, minimax_payload):
+        """Rebuild model.py:709 unique_t and map it to table rows."""
+        payload = minimax_payload or {}
+        layout = payload.get("layout")
+        if layout is None:
+            layout = (transformer_options or {}).get("minimax_h3_layout")
+        sigma = sigma_plan.sigma_from_timestep(timestep)
+        shift_v, shift_a = sigma_plan.shifts_from_options(transformer_options, self.dm)
+        unique_t = sigma_plan.runtime_unique_t(
+            sigma, layout, shift_v, shift_a, self.visual_aug, self.audio_aug)
+        indices = [self.lookup(t) for t in unique_t]
+        missing = [t for t, i in zip(unique_t, indices) if i is None]
+        self.state["last_sigma"] = sigma
+        self.state["last_t"] = unique_t
+        if missing:
+            self.state["missing"].update(missing)
+            self.state["t_indices"] = None
+            return None
+        self.state["t_indices"] = indices
+        return indices
+
+    def diffusion_wrapper(self, executor, *args, **kwargs):
+        """Tolerant wrapper: never changes the forward, only observes it.
+
+        Signature is `(executor, *args, **kwargs)` on purpose. ComfyUI has
+        changed the exact kwarg set of `_forward` between releases, and a
+        wrapper that raises here would break sampling for no benefit.
+        """
+        try:
+            timestep = args[1] if len(args) > 1 else kwargs.get("timestep")
+            transformer_options = (args[3] if len(args) > 3
+                                   else kwargs.get("transformer_options", {})) or {}
+            payload = kwargs.get("minimax_payload")
+            if payload is None and len(args) > 4:
+                payload = args[4]
+            self.state["wrapper_steps"] += 1
+            self._build_t_indices(timestep, transformer_options, payload)
+        except Exception as e:
+            logging.warning("H3ExactAdaLN: sigma reconstruction failed (%s: %s)",
+                            type(e).__name__, e)
+            self.state["t_indices"] = None
+        return executor(*args, **kwargs)
+
+    # -- legacy dit patch -------------------------------------------------
     def _previous(self, model):
         try:
             to = model.model_options.get("transformer_options", {})
@@ -111,7 +191,7 @@ class ExactAdaLNRuntime:
             return None
 
     def dit_patch(self, args, block_info=None):
-        """Fallback resolver; only used when numeric matching is unavailable."""
+        """Legacy resolver for engines that only populate patches_replace."""
         if isinstance(block_info, dict):
             info = block_info
             fn = block_info.get("original_block")
@@ -121,33 +201,26 @@ class ExactAdaLNRuntime:
 
         to = args.get("transformer_options", {}) or {}
         try:
-            sigma = sigma_plan.sigma_from_options(to, None)
-            self.state["last_sigma"] = sigma
-            shift_v, shift_a = sigma_plan.shifts_from_options(to, self.dm)
-            layout = args.get("layout")
-            unique_t = sigma_plan.runtime_unique_t(
-                sigma, layout, shift_v, shift_a, self.visual_aug, self.audio_aug)
-            indices = [self.lookup(t) for t in unique_t]
-            missing = [t for t, i in zip(unique_t, indices) if i is None]
-            if missing:
-                self.state["missing"].update(round(float(t), 7) for t in missing)
+            indices = self._build_t_indices(
+                to.get("sigmas"), to, {"layout": args.get("layout")})
+            if indices is None:
                 if self.mode == "strict":
                     raise RuntimeError(
-                        "H3ExactAdaLN: table has no rows for t={} at sigma={:.8f}. "
-                        "Re-bake with these values in extra_t (or use mode=fallback).".format(
-                            ", ".join("{:.7f}".format(t) for t in missing), sigma))
-                self.state["t_indices"] = None
-                self.state["fallbacks"] += 1
+                        "H3ExactAdaLN: table has no row for t={} (sigma={}). Re-record "
+                        "with this workflow's sigmas, or use mode=fallback.".format(
+                            ", ".join("{:.7f}".format(t)
+                                      for t in sorted(self.state["missing"])[:8]),
+                            self.state["last_sigma"]))
+                self.state["sigma_misses"] += 1
             else:
-                self.state["t_indices"] = indices
-                self.state["hits"] += 1
+                self.state["sigma_hits"] += 1
         except RuntimeError:
             raise
         except Exception as e:
             logging.warning("H3ExactAdaLN: could not resolve timesteps (%s: %s)",
                             type(e).__name__, e)
             self.state["t_indices"] = None
-            self.state["fallbacks"] += 1
+            self.state["sigma_misses"] += 1
 
         if not callable(fn):
             raise RuntimeError(
@@ -157,6 +230,7 @@ class ExactAdaLNRuntime:
             return self.previous_patch(args, info)
         return fn(args)
 
+    # -- injection --------------------------------------------------------
     def _raw(self, key, device):
         cached = self._device_cache.get(key)
         if cached is not None and cached.device == device:
@@ -165,48 +239,67 @@ class ExactAdaLNRuntime:
         self._device_cache[key] = tensor
         return tensor
 
+    def _strict_error(self, key, t_emb, detail):
+        missing = sorted(self.state["missing"])
+        rows = ["H3ExactAdaLN: cannot map {} rows to table rows.".format(
+            tuple(t_emb.shape)),
+            "reason: {}".format(detail),
+            "table t rows ({}): {}".format(
+                len(self.t_values),
+                ", ".join("{:.7f}".format(t) for t in self.t_values[:12]) +
+                (" ..." if len(self.t_values) > 12 else ""))]
+        if missing:
+            rows.append("missing from table ({}): {}".format(
+                len(missing), ", ".join("{:.7f}".format(t) for t in missing[:12])))
+            rows.append("This is a t-set mismatch, not a precision problem: the running "
+                        "schedule/shift produces timesteps the table was never recorded "
+                        "for. Re-record on this exact schedule (or add them via extra_t).")
+        else:
+            rows.append("No timestep reconstruction was available either. Record the "
+                        "table on this exact model + schedule, or set mode=fallback.")
+        return "\n".join(rows)
+
     def make_hook(self, key):
         def hook(module, inputs, output):
             t_emb = inputs[0]
-            m = t_emb.shape[0]
+            m = int(t_emb.shape[0])
             indices = None
-            maxd, tol = 0.0, 0.0
+            detail = ""
 
-            if self.use_match and t_emb.shape[-1] == self.match_keys.shape[-1]:
-                indices, maxd, tol = self._match_indices(t_emb)
+            if self.use_match:
+                indices, maxd, tol, note = self._match_indices(t_emb)
                 self.state["max_match_distance"] = max(
                     self.state["max_match_distance"], maxd)
-                if maxd > tol:
-                    self.state["match_failures"] += 1
-                    self.state["last_diag"] = (
-                        "t_emb={} keys={} max_dist={:.3e} tol={:.3e}".format(
-                            tuple(t_emb.shape), tuple(self.match_keys.shape), maxd, tol))
-                    indices = None
-                else:
+                if indices is not None and maxd <= tol:
                     self.state["match_hits"] += 1
+                    if maxd > 0.0:
+                        self.state["match_approx"] += 1
+                else:
+                    self.state["match_failures"] += 1
+                    keys, _kind = self._keys_for(t_emb)
+                    self.state["last_diag"] = (
+                        "t_emb={} keys={} max_dist={:.3e} tol={:.3e} ({})".format(
+                            tuple(t_emb.shape),
+                            tuple(keys.shape) if keys is not None else "?",
+                            maxd, tol, note))
+                    indices = None
 
             if indices is None:
-                indices = self.state["t_indices"]
-                if indices is not None:
-                    self.state["dit_hits"] += 1
+                fallback = self.state["t_indices"]
+                if fallback is not None and len(fallback) == m:
+                    indices = fallback
+                    self.state["sigma_hits"] += 1
+                else:
+                    detail = self.state["last_diag"] or "no key set and no sigma mapping"
 
             if indices is None or len(indices) != m:
                 self.state["native_steps"] += 1
                 if self.mode == "strict":
-                    raise RuntimeError(
-                        "H3ExactAdaLN: could not map t_emb rows to baked table rows "
-                        "(mode=strict). match_mode={}. {} "
-                        "This usually means the table was baked for a DIFFERENT "
-                        "sigma schedule / shift than this workflow uses. Re-bake "
-                        "with this workflow's sigmas, or set mode=fallback to let "
-                        "unknown timesteps use the native AdaLN path.".format(
-                            self.match_mode,
-                            self.state["last_diag"] or "t_emb={}".format(tuple(t_emb.shape))))
+                    raise RuntimeError(self._strict_error(key, t_emb, detail))
                 return None
 
-            # One explicit log line proving hooks fired during sampling;
-            # Apply's own report is printed before the sampler runs.
-            if self.state["match_hits"] + self.state["dit_hits"] == 1:
+            self.state["injected"] += 1
+            if self.state["injected"] == 1:
                 logging.info(
                     "H3ExactAdaLN: first injection confirmed during sampling "
                     "(%s, %d rows, indices=%s, max_dist=%.3e)",
@@ -220,7 +313,8 @@ class ExactAdaLNRuntime:
             return x.chunk(module.expand, dim=-1)
         return hook
 
-    def register(self, model):
+    # -- registration ------------------------------------------------------
+    def register(self, model, use_sigma_wrapper=True, use_dit_patch=False):
         """Attach to `model` (a ModelPatcher). Returns number of hooked modules."""
         dm = self.dm
         targets = []
@@ -239,13 +333,29 @@ class ExactAdaLNRuntime:
             raise RuntimeError("H3ExactAdaLN Apply: table is missing projections: {}".format(
                 ", ".join(missing_keys[:8])))
 
-        if not self.use_match:
+        if use_sigma_wrapper:
+            self._register_sigma_wrapper(model)
+        if use_dit_patch:
             self.previous_patch = self._previous(model)
             model.set_model_patch_replace(self.dit_patch, "dit", "double_block", 0)
 
         for key, module in targets:
             self.hook_handles.append(module.register_forward_hook(self.make_hook(key)))
         return len(targets)
+
+    def _register_sigma_wrapper(self, model):
+        try:
+            import comfy.patcher_extension as pe
+            self.wrapper_key = "h3_exact_apply"
+            self._wrapper_model = model
+            pe.add_wrapper_with_key(
+                pe.WrappersMP.DIFFUSION_MODEL, self.wrapper_key,
+                self.diffusion_wrapper, model.model_options, is_model_options=True)
+        except Exception as e:
+            logging.warning("H3ExactAdaLN: could not register the sigma wrapper "
+                            "(%s: %s); relying on t_emb matching only",
+                            type(e).__name__, e)
+            self.wrapper_key = None
 
     def remove(self):
         for h in self.hook_handles:
@@ -255,26 +365,48 @@ class ExactAdaLNRuntime:
                 pass
         self.hook_handles = []
         self._device_cache.clear()
+        self._key_cache.clear()
+        # Drop the wrapper too: re-running Apply on the same MODEL object would
+        # otherwise stack one wrapper per run, each holding a dead runtime.
+        model = getattr(self, "_wrapper_model", None)
+        if model is not None and self.wrapper_key:
+            try:
+                wrappers = (model.model_options.get("transformer_options", {})
+                            .get("wrappers", {}).get("diffusion_model", {}))
+                bucket = wrappers.get(self.wrapper_key)
+                if bucket:
+                    # bound methods are created fresh on every attribute
+                    # access, so identity has to go through __self__.
+                    wrappers[self.wrapper_key] = [
+                        f for f in bucket if getattr(f, "__self__", None) is not self]
+                    if not wrappers[self.wrapper_key]:
+                        wrappers.pop(self.wrapper_key, None)
+            except Exception:
+                pass
+            self._wrapper_model = None
 
     def summary(self):
         return "\n".join([
             "mode             : {}".format(self.mode),
-            "injection mode   : {}".format(
-                self.match_mode if self.use_match else "dit patch fallback"),
+            "injection mode   : {}".format(self.match_mode),
             "t rows in table  : {}".format(len(self.t_values)),
             "projections      : {}".format(len(self.raw_by_key)),
             "out dtype        : {}".format(self.out_dtype),
-            "match hits       : {}".format(self.state["match_hits"]),
+            "exact matches    : {}".format(self.state["match_hits"] -
+                                           self.state["match_approx"]),
+            "approx matches   : {} (max_dist={:.3e})".format(
+                self.state["match_approx"], self.state["max_match_distance"]),
             "match failures   : {}".format(self.state["match_failures"]),
-            "max match dist   : {:.3e}".format(self.state["max_match_distance"]),
             "last diagnostic  : {}".format(self.state["last_diag"] or "none"),
-            "dit hits         : {}".format(self.state["dit_hits"]),
+            "sigma fallbacks  : {} hit / {} miss (wrapper steps {})".format(
+                self.state["sigma_hits"], self.state["sigma_misses"],
+                self.state["wrapper_steps"]),
             "native steps     : {}".format(self.state["native_steps"]),
-            "dit steps        : {}/fallback {}".format(
-                self.state["hits"], self.state["fallbacks"]),
-            "last sigma       : {}".format(self.state["last_sigma"]),
+            "last sigma / t   : {} / {}".format(
+                self.state["last_sigma"],
+                ",".join("{:.7f}".format(t) for t in (self.state["last_t"] or [])[:6])
+                or "none"),
             "missing t values : {}".format(
                 ", ".join("{:.7f}".format(t) for t in sorted(self.state["missing"])[:12])
                 or "none"),
-            "chained patch    : {}".format(self.previous_patch is not None),
         ])
