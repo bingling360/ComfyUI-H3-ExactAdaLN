@@ -1,0 +1,1431 @@
+{
+  "last_node_id": 20,
+  "last_link_id": 25,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "CLIPLoader",
+      "pos": [
+        50,
+        90
+      ],
+      "size": [
+        640,
+        150
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "clip_name",
+          "name": "clip_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "clip_name"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "type",
+          "name": "type",
+          "type": "COMBO",
+          "widget": {
+            "name": "type"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "device",
+          "name": "device",
+          "shape": 7,
+          "type": "COMBO",
+          "widget": {
+            "name": "device"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "CLIP",
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0",
+        "models": [
+          {
+            "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "directory": "text_encoders"
+          }
+        ]
+      },
+      "widgets_values": [
+        "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+        "minimax",
+        "default"
+      ],
+      "widgets_values_named": {
+        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "type": "minimax",
+        "device": "default"
+      },
+      "title": "共享文本编码器 (int8, A10 可用)"
+    },
+    {
+      "id": 2,
+      "type": "VAELoader",
+      "pos": [
+        50,
+        270
+      ],
+      "size": [
+        650,
+        100
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "vae_name",
+          "name": "vae_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "vae_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "VAE",
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0",
+        "models": [
+          {
+            "name": "minimax_h3_audio_vae_fp32.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+            "directory": "vae"
+          }
+        ]
+      },
+      "widgets_values": [
+        "minimax_h3_video_vae_fp16.safetensors"
+      ],
+      "widgets_values_named": {
+        "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+      },
+      "title": "共享视频 VAE"
+    },
+    {
+      "id": 3,
+      "type": "MiniMaxH3ImageToVideo",
+      "pos": [
+        50,
+        450
+      ],
+      "size": [
+        430,
+        550
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "clip",
+          "name": "clip",
+          "type": "CLIP",
+          "link": 1
+        },
+        {
+          "localized_name": "vae",
+          "name": "vae",
+          "type": "VAE",
+          "link": 2
+        },
+        {
+          "localized_name": "first_frame",
+          "name": "first_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "last_frame",
+          "name": "last_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "length",
+          "name": "length",
+          "type": "INT",
+          "widget": {
+            "name": "length"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "positive",
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            3,
+            4
+          ]
+        },
+        {
+          "localized_name": "LATENT",
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            5,
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MiniMaxH3ImageToVideo",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      },
+      "widgets_values": [
+        "A lone figure walking slowly through a neon-lit street at night, steady camera, shallow depth of field",
+        832,
+        480,
+        39
+      ],
+      "widgets_values_named": {
+        "prompt": "Vaporwave title sequence look: pink and blue gradient palette, VHS tracking artifacts, Greek statue motifs, chrome palm trees, RGB chromatic aberration, lo-fi retro atmosphere, mood languid and nostalgic.\n\nTimeline:\n[0s-1s] VHS static opens the frame, the title \"COMFYUI\" appears with RGB split and a slight horizontal jitter.\n[1s-2.5s] Hard cut, a Greek plaster bust close-up, pink-purple gradient sky, a pixelated sun.\n[2.5s-4s] Clean \"STARRING\" credits appear, \"LATENT\" and \"CONTROLNET\" each shown exactly once.\n[4s-5s] Final card \"DIRECTED BY COMFYUI\" holds, one VHS tracking glitch settling into stability.\n\nHard cuts only, transitions landing with tape jumps, no push-ins, no dissolves.\n\nAudio: lo-fi vaporwave score, slow drum machine with soft bass, VHS tape-noise sample joins at 2.5s, melody fading for the last 1s.\n\nAll text must be clearly legible, do not misspell English, no Chinese characters, do not repeat names or job titles, no soft dissolves, no subtitle bars.",
+        "width": 1344,
+        "height": 768,
+        "length": 73
+      },
+      "title": "共享 conditioning + latent"
+    },
+    {
+      "id": 4,
+      "type": "RandomNoise",
+      "pos": [
+        50,
+        800
+      ],
+      "size": [
+        360,
+        90
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "noise_seed",
+          "name": "noise_seed",
+          "type": "INT",
+          "widget": {
+            "name": "noise_seed"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "NOISE",
+          "name": "NOISE",
+          "type": "NOISE",
+          "links": [
+            7,
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "RandomNoise",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      },
+      "widgets_values": [
+        1,
+        "fixed"
+      ],
+      "widgets_values_named": {
+        "noise_seed": 1,
+        "control_after_generate": "fixed"
+      },
+      "title": "共享固定 seed"
+    },
+    {
+      "id": 5,
+      "type": "KSamplerSelect",
+      "pos": [
+        50,
+        940
+      ],
+      "size": [
+        370,
+        90
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "sampler_name",
+          "name": "sampler_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "sampler_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "SAMPLER",
+          "name": "SAMPLER",
+          "type": "SAMPLER",
+          "links": [
+            9,
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSamplerSelect",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      },
+      "widgets_values": [
+        "euler"
+      ],
+      "widgets_values_named": {
+        "sampler_name": "res_multistep"
+      },
+      "title": "共享 sampler"
+    },
+    {
+      "id": 6,
+      "type": "UNETLoader",
+      "pos": [
+        470,
+        80
+      ],
+      "size": [
+        640,
+        120
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "unet_name",
+          "name": "unet_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "unet_name"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "weight_dtype",
+          "name": "weight_dtype",
+          "type": "COMBO",
+          "widget": {
+            "name": "weight_dtype"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "MODEL",
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UNETLoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0",
+        "models": [
+          {
+            "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "directory": "diffusion_models"
+          }
+        ]
+      },
+      "widgets_values": [
+        "minimax_h3_ref2va_int8_convrot.safetensors",
+        "default"
+      ],
+      "widgets_values_named": {
+        "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "weight_dtype": "default"
+      },
+      "title": "A: FULL 34GB"
+    },
+    {
+      "id": 7,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        470,
+        250
+      ],
+      "size": [
+        640,
+        130
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "MODEL",
+          "link": 11
+        },
+        {
+          "localized_name": "lora_name",
+          "name": "lora_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "lora_name"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "strength_model",
+          "name": "strength_model",
+          "type": "FLOAT",
+          "widget": {
+            "name": "strength_model"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "MODEL",
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0",
+        "models": [
+          {
+            "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "directory": "loras"
+          }
+        ]
+      },
+      "widgets_values": [
+        "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
+        1.0
+      ],
+      "widgets_values_named": {
+        "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+        "strength_model": 1
+      },
+      "title": "A: DMAD 8-step"
+    },
+    {
+      "id": 8,
+      "type": "MiniMaxH3SigmaShift",
+      "pos": [
+        470,
+        410
+      ],
+      "size": [
+        300,
+        130
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "properties": {},
+      "widgets_values": [
+        12.0,
+        2.0
+      ],
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 12
+        },
+        {
+          "name": "shift_video",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "shift_audio",
+          "type": "FLOAT",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            13,
+            14
+          ]
+        }
+      ],
+      "title": "A: shift 12 / 2"
+    },
+    {
+      "id": 9,
+      "type": "BasicScheduler",
+      "pos": [
+        470,
+        570
+      ],
+      "size": [
+        370,
+        150
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "MODEL",
+          "link": 13
+        },
+        {
+          "localized_name": "scheduler",
+          "name": "scheduler",
+          "type": "COMBO",
+          "widget": {
+            "name": "scheduler"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "steps",
+          "name": "steps",
+          "type": "INT",
+          "widget": {
+            "name": "steps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "denoise",
+          "name": "denoise",
+          "type": "FLOAT",
+          "widget": {
+            "name": "denoise"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "SIGMAS",
+          "name": "SIGMAS",
+          "type": "SIGMAS",
+          "links": [
+            16,
+            17
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicScheduler",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      },
+      "widgets_values": [
+        "simple",
+        8,
+        1.0
+      ],
+      "widgets_values_named": {
+        "scheduler": "simple",
+        "steps": 4,
+        "denoise": 1
+      },
+      "title": "共享 sigma 网格（8 步）"
+    },
+    {
+      "id": 10,
+      "type": "BasicGuider",
+      "pos": [
+        470,
+        740
+      ],
+      "size": [
+        360,
+        80
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "MODEL",
+          "link": 14
+        },
+        {
+          "localized_name": "conditioning",
+          "name": "conditioning",
+          "type": "CONDITIONING",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "GUIDER",
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicGuider",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      }
+    },
+    {
+      "id": 11,
+      "type": "SamplerCustomAdvanced",
+      "pos": [
+        470,
+        900
+      ],
+      "size": [
+        230,
+        390
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "noise",
+          "name": "noise",
+          "type": "NOISE",
+          "link": 7
+        },
+        {
+          "localized_name": "guider",
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 15
+        },
+        {
+          "localized_name": "sampler",
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 9
+        },
+        {
+          "localized_name": "sigmas",
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 16
+        },
+        {
+          "localized_name": "latent_image",
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "output",
+          "name": "output",
+          "type": "LATENT",
+          "links": [
+            24
+          ]
+        },
+        {
+          "localized_name": "denoised_output",
+          "name": "denoised_output",
+          "type": "LATENT",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SamplerCustomAdvanced",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      },
+      "title": "A: latent"
+    },
+    {
+      "id": 12,
+      "type": "UNETLoader",
+      "pos": [
+        870,
+        80
+      ],
+      "size": [
+        640,
+        120
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "unet_name",
+          "name": "unet_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "unet_name"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "weight_dtype",
+          "name": "weight_dtype",
+          "type": "COMBO",
+          "widget": {
+            "name": "weight_dtype"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "MODEL",
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            18
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UNETLoader",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0",
+        "models": [
+          {
+            "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "directory": "diffusion_models"
+          }
+        ]
+      },
+      "widgets_values": [
+        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "default"
+      ],
+      "widgets_values_named": {
+        "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "weight_dtype": "default"
+      },
+      "title": "B: PRUNED 21GB"
+    },
+    {
+      "id": 13,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        870,
+        250
+      ],
+      "size": [
+        640,
+        130
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "MODEL",
+          "link": 18
+        },
+        {
+          "localized_name": "lora_name",
+          "name": "lora_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "lora_name"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "strength_model",
+          "name": "strength_model",
+          "type": "FLOAT",
+          "widget": {
+            "name": "strength_model"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "MODEL",
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0",
+        "models": [
+          {
+            "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "directory": "loras"
+          }
+        ]
+      },
+      "widgets_values": [
+        "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
+        1.0
+      ],
+      "widgets_values_named": {
+        "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+        "strength_model": 1
+      },
+      "title": "B: DMAD 8-step"
+    },
+    {
+      "id": 14,
+      "type": "MiniMaxH3SigmaShift",
+      "pos": [
+        870,
+        410
+      ],
+      "size": [
+        300,
+        130
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "properties": {},
+      "widgets_values": [
+        12.0,
+        2.0
+      ],
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 19
+        },
+        {
+          "name": "shift_video",
+          "type": "FLOAT",
+          "link": null
+        },
+        {
+          "name": "shift_audio",
+          "type": "FLOAT",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            20
+          ]
+        }
+      ],
+      "title": "B: shift 12 / 2"
+    },
+    {
+      "id": 15,
+      "type": "H3ExactAdaLNLoad",
+      "pos": [
+        870,
+        570
+      ],
+      "size": [
+        330,
+        150
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "properties": {},
+      "widgets_values": [
+        "h3_exact_dmad8_v1_00001.safetensors",
+        ""
+      ],
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "table",
+          "type": "H3_ADALN_TABLE",
+          "links": [
+            21
+          ]
+        },
+        {
+          "name": "info",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "加载 / 上传表文件"
+    },
+    {
+      "id": 16,
+      "type": "H3ExactAdaLNApply",
+      "pos": [
+        870,
+        760
+      ],
+      "size": [
+        330,
+        180
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "properties": {},
+      "widgets_values": [
+        "strict",
+        ""
+      ],
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 20
+        },
+        {
+          "name": "table",
+          "type": "H3_ADALN_TABLE",
+          "link": 21
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "links": [
+            22
+          ]
+        },
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "B: 注入精确表"
+    },
+    {
+      "id": 17,
+      "type": "BasicGuider",
+      "pos": [
+        870,
+        980
+      ],
+      "size": [
+        360,
+        80
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "MODEL",
+          "link": 22
+        },
+        {
+          "localized_name": "conditioning",
+          "name": "conditioning",
+          "type": "CONDITIONING",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "GUIDER",
+          "name": "GUIDER",
+          "type": "GUIDER",
+          "links": [
+            23
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "BasicGuider",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      }
+    },
+    {
+      "id": 18,
+      "type": "SamplerCustomAdvanced",
+      "pos": [
+        870,
+        1140
+      ],
+      "size": [
+        230,
+        390
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "noise",
+          "name": "noise",
+          "type": "NOISE",
+          "link": 8
+        },
+        {
+          "localized_name": "guider",
+          "name": "guider",
+          "type": "GUIDER",
+          "link": 23
+        },
+        {
+          "localized_name": "sampler",
+          "name": "sampler",
+          "type": "SAMPLER",
+          "link": 10
+        },
+        {
+          "localized_name": "sigmas",
+          "name": "sigmas",
+          "type": "SIGMAS",
+          "link": 17
+        },
+        {
+          "localized_name": "latent_image",
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "output",
+          "name": "output",
+          "type": "LATENT",
+          "links": [
+            25
+          ]
+        },
+        {
+          "localized_name": "denoised_output",
+          "name": "denoised_output",
+          "type": "LATENT",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SamplerCustomAdvanced",
+        "cnr_id": "comfy-core",
+        "ver": "0.33.0"
+      },
+      "title": "B: latent"
+    },
+    {
+      "id": 19,
+      "type": "H3LatentCompare",
+      "pos": [
+        1270,
+        900
+      ],
+      "size": [
+        340,
+        160
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "properties": {},
+      "widgets_values": [
+        "full model (native)",
+        "pruned + exact table"
+      ],
+      "inputs": [
+        {
+          "name": "latent_a",
+          "type": "LATENT",
+          "link": 24
+        },
+        {
+          "name": "latent_b",
+          "type": "LATENT",
+          "link": 25
+        }
+      ],
+      "outputs": [
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "title": "逐位比对"
+    },
+    {
+      "id": 20,
+      "type": "Note",
+      "pos": [
+        1270,
+        160
+      ],
+      "size": [
+        430,
+        420
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "properties": {},
+      "widgets_values": [
+        "验证口径（DMAD 8-step）\n• 两条链只有底模不同：A 用完整 34GB，B 用剪枝 21GB；量化同为 int8_convrot。\n• LoRA = dmad_minimax_h3_8step_full_critic_comfyui.safetensors，强度 1.0。\n  元数据：8 步 / video shift 12 / audio shift 2 / no CFG / rank 128。\n• 注意：该 LoRA 是 backbone-only（208 个 attn/mlp 目标，无 AdaLN / time_embedder 键）。\n  因此本次验证检验的是「精确表能否让剪枝底模 ≡ 完整底模」，\n  而不是「LoRA 的 AdaLN delta 被烘焙」。要测后者需换含 AdaLN 键的 LoRA\n  （例如 HyperFlow 的 full 版），其它接线不变。\n• 表文件用 Load 节点加载（像 Load Image）：点上传按钮选 .safetensors，\n  或先放进 ComfyUI/input/ 再刷新页面让下拉更新；下拉看不到时，\n  直接把 Save 报告里的完整路径填进 table_path 即可。\n  Load 的 table 输出接 Apply 的 table 输入。\n• A 不接 Apply（原生 AdaLN 路径），B 接 Apply（跳过插值表与剪枝 adaln_proj）。\n• 共享 BasicScheduler / RandomNoise / Conditioning / shift，保证 t 集合一致。\n  两个 shift 节点参数必须完全相同（audio shift 2，不是默认 3）。\n• 通过标准：compare 报告 equal=True 且 max_abs=0。\n• 对照实验：把 Apply 的 mode 设为 off，应当得到 FAIL。\n• strict 报缺 t 时会列出数值，填进 Bake 的 extra_t 重烘焙。\n• 验证档 8 步 / euler / simple / 832x480 / 39 帧。DMAD 推荐 1344x768 / 124 帧\n  及 re-noise step rule；改尺寸、步数或换成自定义 sigmas 时两边同步改并重新烘焙。\n• 条件部分用官方 I2V conditioning；换成你自己的 ref2va 条件链也可以，\n  只要两条链共享同一组条件节点。"
+      ],
+      "inputs": [],
+      "outputs": [],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      3,
+      0,
+      "CLIP"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      1,
+      "VAE"
+    ],
+    [
+      3,
+      3,
+      0,
+      10,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      4,
+      3,
+      0,
+      17,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      5,
+      3,
+      1,
+      11,
+      4,
+      "LATENT"
+    ],
+    [
+      6,
+      3,
+      1,
+      18,
+      4,
+      "LATENT"
+    ],
+    [
+      7,
+      4,
+      0,
+      11,
+      0,
+      "NOISE"
+    ],
+    [
+      8,
+      4,
+      0,
+      18,
+      0,
+      "NOISE"
+    ],
+    [
+      9,
+      5,
+      0,
+      11,
+      2,
+      "SAMPLER"
+    ],
+    [
+      10,
+      5,
+      0,
+      18,
+      2,
+      "SAMPLER"
+    ],
+    [
+      11,
+      6,
+      0,
+      7,
+      0,
+      "MODEL"
+    ],
+    [
+      12,
+      7,
+      0,
+      8,
+      0,
+      "MODEL"
+    ],
+    [
+      13,
+      8,
+      0,
+      9,
+      0,
+      "MODEL"
+    ],
+    [
+      14,
+      8,
+      0,
+      10,
+      0,
+      "MODEL"
+    ],
+    [
+      15,
+      10,
+      0,
+      11,
+      1,
+      "GUIDER"
+    ],
+    [
+      16,
+      9,
+      0,
+      11,
+      3,
+      "SIGMAS"
+    ],
+    [
+      17,
+      9,
+      0,
+      18,
+      3,
+      "SIGMAS"
+    ],
+    [
+      18,
+      12,
+      0,
+      13,
+      0,
+      "MODEL"
+    ],
+    [
+      19,
+      13,
+      0,
+      14,
+      0,
+      "MODEL"
+    ],
+    [
+      20,
+      14,
+      0,
+      16,
+      0,
+      "MODEL"
+    ],
+    [
+      21,
+      15,
+      0,
+      16,
+      1,
+      "H3_ADALN_TABLE"
+    ],
+    [
+      22,
+      16,
+      0,
+      17,
+      0,
+      "MODEL"
+    ],
+    [
+      23,
+      17,
+      0,
+      18,
+      1,
+      "GUIDER"
+    ],
+    [
+      24,
+      11,
+      0,
+      19,
+      0,
+      "LATENT"
+    ],
+    [
+      25,
+      18,
+      0,
+      19,
+      1,
+      "LATENT"
+    ]
+  ],
+  "groups": [
+    {
+      "title": "共享条件（两边必须完全一致）",
+      "bounding": [
+        20,
+        20,
+        400,
+        1360
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "A 完整模型 · 原生 AdaLN",
+      "bounding": [
+        440,
+        20,
+        380,
+        1360
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "B 剪枝模型 · 加载表 + 注入",
+      "bounding": [
+        840,
+        20,
+        380,
+        1360
+      ],
+      "color": "#389e6b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "title": "表文件 / 比对",
+      "bounding": [
+        1240,
+        20,
+        400,
+        1360
+      ],
+      "color": "#9e6b3f",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}
