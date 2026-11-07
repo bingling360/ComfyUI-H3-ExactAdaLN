@@ -24,9 +24,9 @@ import os
 import torch
 
 try:
-    from . import apply_engine, bake_engine, sigma_plan, table_io
+    from . import apply_engine, bake_engine, sigma_plan, table_io, latent_io
 except ImportError:
-    import apply_engine, bake_engine, sigma_plan, table_io
+    import apply_engine, bake_engine, sigma_plan, table_io, latent_io
 
 CATEGORY = "MiniMaxH3/ExactAdaLN"
 TABLE_TYPE = "H3_ADALN_TABLE"
@@ -596,6 +596,7 @@ NODE_CLASS_MAPPINGS = {
     "H3ExactAdaLNLoad": H3ExactAdaLNLoad,
     "H3ExactAdaLNApply": H3ExactAdaLNApply,
     "H3LatentCompare": H3LatentCompare,
+    "H3LatentSave": latent_io.H3LatentSave,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -604,4 +605,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ExactAdaLNLoad": "H3 Exact AdaLN Load Table",
     "H3ExactAdaLNApply": "H3 Exact AdaLN Apply (pruned base)",
     "H3LatentCompare": "H3 Latent Compare (verification)",
+    "H3LatentSave": "H3 Latent Save (NestedTensor)",
 }
