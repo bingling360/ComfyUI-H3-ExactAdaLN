@@ -492,11 +492,21 @@ class H3LatentCompare:
 
         ta = strip_side(collect(latent_a, "a"), "a")
         tb = strip_side(collect(latent_b, "b"), "b")
+        def describe(obj):
+            if isinstance(obj, dict):
+                items = [(k, type(v).__name__,
+                          tuple(v.shape) if torch.is_tensor(v) else "")
+                         for k, v in obj.items()]
+                return "dict " + str(items)[:500]
+            return "{} repr={}".format(type(obj).__name__, repr(obj)[:400])
+
         lines = ["=== latent comparison ===",
                  "A: {}".format(label_a), "B: {}".format(label_b),
                  "inputs : A={} keys={} | B={} keys={}".format(
                      type(latent_a).__name__, sorted(ta),
-                     type(latent_b).__name__, sorted(tb))]
+                     type(latent_b).__name__, sorted(tb)),
+                 "raw A  : {}".format(describe(latent_a)),
+                 "raw B  : {}".format(describe(latent_b))]
         all_equal = True
         compared = 0
         for key in sorted(set(ta) | set(tb)):
