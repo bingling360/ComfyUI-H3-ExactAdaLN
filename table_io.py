@@ -23,19 +23,47 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-FORMAT = "h3_exact_adaln/v1"
+FORMAT = "h3_exact_adaln/v2"
+LEGACY_FORMATS = ("h3_exact_adaln/v1",)
 BLOCK_PREFIX = "blocks."
 FINAL_KEY = "final_layer"
 
 
 class AdaLNTable:
-    """In-memory value passed between nodes as the H3_ADALN_TABLE type."""
+    """In-memory value passed between nodes as the H3_ADALN_TABLE type.
 
-    def __init__(self, t_values, raw_by_key, meta, source=None):
+    A table produced by Record starts out *live*: the node hands the sampler a
+    recorder handle and the rows only exist once sampling has run. `finalize()`
+    pulls them in; every consumer calls it before touching the data.
+    """
+
+    def __init__(self, t_values, raw_by_key, meta, source=None, recorder=None):
         self.t_values = [float(t) for t in t_values]
         self.raw_by_key = dict(raw_by_key)
         self.meta = dict(meta)
         self.source = source
+        self.recorder = recorder
+
+    @property
+    def is_live(self):
+        return self.recorder is not None and not self.raw_by_key
+
+    def finalize(self, required=True):
+        """Materialise a live (recording) table. Idempotent."""
+        if not self.is_live:
+            return self
+        rec = self.recorder
+        if not rec.rows:
+            if required:
+                rec.build()  # raises with the actionable message
+            return self
+        t_values, raw, extra = rec.build()
+        self.t_values = t_values
+        self.raw_by_key = raw
+        self.meta.update(extra)
+        self.meta["t_count"] = str(len(t_values))
+        self.recorder = None
+        return self
 
     @property
     def out_dtype(self):
@@ -48,18 +76,22 @@ class AdaLNTable:
         return len(self.raw_by_key)
 
     def summary(self):
+        self.finalize(required=False)
         meta = self.meta
+        rows = len(self.t_values)
         return "\n".join([
             "format       : {}".format(meta.get("format", FORMAT)),
             "source       : {}".format(self.source or "(in-memory, not saved yet)"),
             "teacher      : {}".format(meta.get("teacher", "?")),
+            "provenance   : {}".format(meta.get("record_mode", "offline bake")),
             "lora tag     : {}".format(meta.get("lora_tag", "?")),
             "lora fp      : {} ({} non-AdaLN keys)".format(
                 meta.get("lora_fingerprint", "?"), meta.get("lora_patch_count", "?")),
             "sigmas       : {}".format(str(meta.get("sigmas", "[]"))[:180]),
             "shift_v/a    : {} / {}".format(meta.get("shift_v", "?"), meta.get("shift_a", "?")),
             "compute dtype: {}".format(meta.get("compute_dtype", "?")),
-            "t rows       : {}".format(len(self.t_values)),
+            "out dtype    : {}".format(self.out_dtype),
+            "t rows       : {}".format(rows if not self.is_live else "(live recorder)"),
             "projections  : {}".format(self.projections()),
             "table size   : {:.1f} MiB".format(self.size_bytes() / (1 << 20)),
         ])
@@ -75,6 +107,8 @@ def save_table(path, t_values, raw_by_key, meta, out_dtype="torch.bfloat16"):
     """Write a table. `raw_by_key` maps 'blocks.N'/'final_layer' -> [T, F]."""
     tensors = {"t_values": torch.tensor(t_values, dtype=torch.float32).contiguous()}
     t_count = len(t_values)
+    if not t_count:
+        raise RuntimeError("H3ExactAdaLN: refusing to save an empty table (0 t rows)")
     for key, value in raw_by_key.items():
         v = value.detach().to(torch.float32).cpu().contiguous()
         if v.ndim != 2 or v.shape[0] != t_count:
@@ -98,7 +132,7 @@ def load_table(path, device="cpu"):
     # header and must be read with safe_open().
     with safe_open(path, framework="pt", device="cpu") as f:
         meta = dict(f.metadata() or {})
-    if meta.get("format") != FORMAT:
+    if meta.get("format") != FORMAT and meta.get("format") not in LEGACY_FORMATS:
         raise RuntimeError("H3ExactAdaLN: unsupported table format {!r} in {}".format(
             meta.get("format"), path))
     t_values = sd["t_values"].to(torch.float32).tolist()
@@ -107,6 +141,7 @@ def load_table(path, device="cpu"):
 
 
 def write_table_file(path, table):
+    table.finalize(required=True)
     return save_table(path, table.t_values, table.raw_by_key,
                       table.meta, out_dtype=table.out_dtype)
 
