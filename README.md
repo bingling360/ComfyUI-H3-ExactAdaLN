@@ -64,6 +64,7 @@ Verified against ComfyUI 0.44.0 / PyTorch 2.9.1 / RTX 4080 SUPER.
 | `H3 Exact AdaLN Load Table` | `table_name` (free text) / `table_path` | `H3_ADALN_TABLE` | Resolves a filename, substring, relative path or absolute path. Scans `input/`, `output/`, `models/h3_exact_adaln/`. |
 | `H3 Exact AdaLN Apply` | pruned MODEL + `H3_ADALN_TABLE` | MODEL | Replaces all 51 AdaLN projections at runtime. `strict` / `fallback` / `off`. |
 | `H3 Latent Compare` | two LATENT | report | `equal`, `max_abs`, `PSNR`; PASS = bitwise identical. |
+| `H3 Latent Save` | LATENT | file | Saves H3's `NestedTensor` latents (stock `SaveLatent` cannot). |
 
 A saved table is **self-contained**: its safetensors header carries the
 teacher, LoRA fingerprint, sigma grid, shifts, compute dtype and ComfyUI
@@ -99,6 +100,9 @@ lists every table file it can see.
 - `workflows/02_verify_full_vs_pruned.json` — Load → Apply on chain B, chain A
   runs the full model natively; both chains share LoRA, sigmas, seed, sampler,
   conditioning and shift. Compare the two latents.
+- `workflows/03_verify_save_latent.json` — same, plus two `H3LatentSave` taps
+  that write both latents to disk; compare them with `tools/compare_latents.py`
+  as an independent cross-check.
 
 Defaults match the DMAD 8-step LoRA: 8 steps, `euler`, `simple`, strength 1.0,
 no CFG, video shift 12 / **audio shift 2**. Change the LoRA filename to your
@@ -136,6 +140,11 @@ and the table is re-baked.
   tolerance) when timesteps cannot be matched; the usual cause is a table
   baked for a **different sigma schedule / shift** than the running workflow.
 - Tables are stored fp32; bf16 costs ~2.5e-2 relative AdaLN error.
+- On ComfyUI 0.44 H3 latents are `comfy.nested_tensor.NestedTensor`
+  (video + audio tensors), not a `torch.Tensor`. Both `H3LatentCompare` and
+  `H3LatentSave` expand it via `.unbind()` into `samples__part0`,
+  `samples__part1`, ... ComfyUI's stock `SaveLatent` calls `.contiguous()`
+  on it and crashes — use `H3LatentSave` instead.
 
 ## Known limits
 
@@ -153,7 +162,10 @@ and the table is re-baked.
 - Status: baking was verified end-to-end on ComfyUI 0.44.0 (51 projections,
   17 t rows, 314.5 MiB table). The curve-matching injection and the dit-patch
   signature fix passed local regression against that real table with synthetic
-  modules; **a fresh end-to-end sampling run after this fix is still pending**.
+  modules. On ComfyUI 0.44 / RTX 4080 SUPER, baking (51 projections, 17 t rows,
+  314.5 MiB) and the first confirmed injection (`max_dist=0.000e+00`) were
+  both verified end-to-end; the latent comparison is now NestedTensor-aware
+  and awaits one final end-to-end sampling run.
 
 ## Related work
 
