@@ -462,6 +462,25 @@ class H3LatentCompare:
     CATEGORY = CATEGORY
 
     def run(self, latent_a, latent_b, label_a, label_b):
+        # ComfyUI 0.44 packs H3's video/audio latents into NestedTensor,
+        # which is not a torch.Tensor. Expand it into plain tensors first.
+        def normalize(obj):
+            if not isinstance(obj, dict):
+                return obj
+            out = {}
+            for k, v in obj.items():
+                if torch.is_tensor(v):
+                    out[k] = v
+                elif getattr(v, "is_nested", False) and hasattr(v, "unbind"):
+                    for i, part in enumerate(v.unbind()):
+                        out["{}__part{}".format(k, i)] = part
+                else:
+                    out[k] = v
+            return out
+
+        latent_a = normalize(latent_a)
+        latent_b = normalize(latent_b)
+
         def collect(obj, prefix="", out=None, depth=0):
             """Find tensors inside dict / list / Latent-like wrapper objects."""
             if out is None:

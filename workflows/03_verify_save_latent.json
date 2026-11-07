@@ -1176,7 +1176,7 @@
     },
     {
       "id": 21,
-      "type": "SaveLatent",
+      "type": "H3LatentSave",
       "pos": [
         470,
         1340
@@ -1190,30 +1190,23 @@
       "mode": 0,
       "inputs": [
         {
-          "name": "samples",
+          "name": "latent",
           "type": "LATENT",
           "link": 26
         }
       ],
-      "outputs": [
-        {
-          "name": "samples",
-          "type": "LATENT",
-          "links": []
-        }
-      ],
+      "outputs": [],
       "properties": {
-        "Node name for S&R": "SaveLatent",
-        "cnr_id": "comfy-core"
+        "Node name for S&R": "H3LatentSave"
       },
       "widgets_values": [
         "latents/verify_a"
       ],
-      "title": "A: 保存 latent (verify_a)"
+      "title": "A: H3 保存 latent (verify_a)"
     },
     {
       "id": 22,
-      "type": "SaveLatent",
+      "type": "H3LatentSave",
       "pos": [
         870,
         1370
@@ -1227,26 +1220,19 @@
       "mode": 0,
       "inputs": [
         {
-          "name": "samples",
+          "name": "latent",
           "type": "LATENT",
           "link": 27
         }
       ],
-      "outputs": [
-        {
-          "name": "samples",
-          "type": "LATENT",
-          "links": []
-        }
-      ],
+      "outputs": [],
       "properties": {
-        "Node name for S&R": "SaveLatent",
-        "cnr_id": "comfy-core"
+        "Node name for S&R": "H3LatentSave"
       },
       "widgets_values": [
         "latents/verify_b"
       ],
-      "title": "B: 保存 latent (verify_b)"
+      "title": "B: H3 保存 latent (verify_b)"
     },
     {
       "id": 23,
@@ -1266,7 +1252,7 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "SaveLatent 比对流程（ComfyUI 0.44）\n• 两个 SaveLatent 分别接 A/B 采样器的 output，其余节点与 02 完全一致。\n• Queue 一次，产物在 ComfyUI/output/latents/：\n    verify_a_00001_.latent / verify_b_00001_.latent\n• 跑完把这两个文件逐位比对（tools/compare_latents.py），\n  得到严格的 PASS / FAIL，绕开 v3→v1 的 LATENT 传值问题。\n• H3LatentCompare 仍保留，它的 raw A / raw B 只是诊断信息，\n  当前预期为 INCONCLUSIVE，不要用它当结论。\n• 对照实验：把 Apply 的 mode 设为 off 再跑一次，\n  两个 latent 必须不同（比对结果应为 FAIL）。"
+        "H3 Latent 比对流程（0.44 / NestedTensor）\n• 两个 H3LatentSave 会把双流 NestedTensor 展开成多个张量落盘，\n  产物在 output/h3_adaln/latents/verify_a_00001_.latent 等。\n• H3LatentCompare 也已支持 NestedTensor，报告里应有\n  samples__part0 / samples__part1 两条明细和 VERDICT。\n• 核心 SaveLatent 不兼容 H3 的 NestedTensor（没有 contiguous），不要用。\n• 对照实验：Apply 的 mode 设为 off 再跑，比对结果应为 FAIL。"
       ],
       "color": "#432",
       "bgcolor": "#653"

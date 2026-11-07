@@ -31,4 +31,14 @@ except ImportError:  # pragma: no cover - direct-file loading fallback
     NODE_CLASS_MAPPINGS = _mod.NODE_CLASS_MAPPINGS
     NODE_DISPLAY_NAME_MAPPINGS = _mod.NODE_DISPLAY_NAME_MAPPINGS
 
+try:
+    import logging
+    from .latent_io import (EXTRA_NODE_CLASS_MAPPINGS,
+                            EXTRA_NODE_DISPLAY_NAME_MAPPINGS)
+    NODE_CLASS_MAPPINGS.update(EXTRA_NODE_CLASS_MAPPINGS)
+    NODE_DISPLAY_NAME_MAPPINGS.update(EXTRA_NODE_DISPLAY_NAME_MAPPINGS)
+except Exception as _e:
+    logging.getLogger(__name__).warning(
+        "ComfyUI-H3-ExactAdaLN: optional latent_io nodes unavailable: %s", _e)
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
