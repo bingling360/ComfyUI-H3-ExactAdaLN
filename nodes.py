@@ -1,19 +1,27 @@
-"""ComfyUI nodes for exact (pre-baked) MiniMax-H3 AdaLN modulation.
+"""ComfyUI nodes for exact (pre-baked / recorded) MiniMax-H3 AdaLN modulation.
 
-Four-stage, image-like workflow
+Five-stage, image-like workflow
 --------------------------------
-  Bake   [full teacher MODEL + LoRA + sigmas] -> H3_ADALN_TABLE (in memory)
+  Record [full teacher MODEL + LoRA, during a real sampling run] -> H3_ADALN_TABLE
+  Bake   [full teacher MODEL + LoRA + sigmas, offline]            -> H3_ADALN_TABLE
   Save   [H3_ADALN_TABLE]  -> .safetensors in output/ (shareable, like Save Image)
   Load   [upload / pick file] -> H3_ADALN_TABLE (like Load Image)
   Apply  [pruned MODEL + H3_ADALN_TABLE] -> patched MODEL
+
+**Record is the exact path.** Bake computes the same numbers offline on
+unloaded CPU weights, which cannot reproduce the kernels ComfyUI picks at
+sampling time; measured drift is one bf16 ulp per projection, amplified to
+~0.145 mean_abs on the latent after 8 steps. Record observes the teacher's own
+output during a real run, so replaying it is bitwise by construction.
 
 The table file is self-contained: all provenance (teacher, LoRA fingerprint,
 sigma grid, shifts, dtype, ComfyUI version) lives in its safetensors header,
 so it can be copied to another machine and loaded without any sidecar.
 
-The bake path never parses a safetensors file by hand: it goes through
-ComfyUI's ModelPatcher, so bf16 / fp16 / fp8_scaled / int8_convrot / nvfp4
-checkpoints and any ComfyUI-applicable LoRA are handled by ComfyUI itself.
+The bake path never parses a safetensors file by hand: it asks ComfyUI for the
+effective (dequantised + LoRA-patched) weights, so bf16 / fp16 / fp8_scaled /
+int8_convrot / nvfp4 checkpoints and any ComfyUI-applicable LoRA are handled by
+ComfyUI itself.
 """
 
 import hashlib
@@ -24,13 +32,22 @@ import os
 import torch
 
 try:
-    from . import apply_engine, bake_engine, sigma_plan, table_io, latent_io
+    from . import apply_engine, bake_engine, record_engine, sigma_plan, table_io, latent_io
 except ImportError:
-    import apply_engine, bake_engine, sigma_plan, table_io, latent_io
+    import apply_engine
+    import bake_engine
+    import record_engine
+    import sigma_plan
+    import table_io
+    import latent_io
 
 CATEGORY = "MiniMaxH3/ExactAdaLN"
 TABLE_TYPE = "H3_ADALN_TABLE"
 _MODES = ["strict", "fallback", "off"]
+
+_AFTER_DOC = ("Purely an execution-order edge: nothing is read from it. ComfyUI "
+              "runs nodes as soon as their inputs exist, so wire the sampler's "
+              "LATENT here to make this node wait until sampling has finished.")
 
 
 def _sigmas_from_model(model, steps, scheduler):
@@ -40,6 +57,28 @@ def _sigmas_from_model(model, steps, scheduler):
 
 
 def _auto_shifts(model):
+    """Video/audio shift as model.py:672-673 resolves them.
+
+    The DiT reads `transformer_options` first and only then the module
+    attribute, so reading `model_sampling` alone can disagree with what the
+    forward pass actually used.
+    """
+    try:
+        to = model.model_options.get("transformer_options", {}) or {}
+        sv = to.get("minimax_h3_sigma_shift_video")
+        sa = to.get("minimax_h3_sigma_shift_audio")
+        if sv is not None and sa is not None:
+            return float(sv), float(sa)
+    except Exception:
+        pass
+    try:
+        dm = model.model.diffusion_model
+        sv = getattr(dm, "sigma_shift_video", None)
+        sa = getattr(dm, "sigma_shift_audio", None)
+        if sv is not None and sa is not None:
+            return float(sv), float(sa)
+    except Exception:
+        pass
     try:
         ms = model.get_model_object("model_sampling")
         return float(getattr(ms, "shift", 12.0)), float(getattr(ms, "audio_shift", 3.0))
@@ -63,7 +102,7 @@ def _lora_fingerprint(model):
 
     AdaLN / time_embedder keys exist on the full teacher but are absent on a
     pruned base, so they are excluded: the remaining key sets must match
-    between the bake chain and the apply chain.
+    between the record/bake chain and the apply chain.
     """
     keys = sorted(
         k for k in getattr(model, "patches", {}).keys()
@@ -81,8 +120,106 @@ def _comfy_version():
         return "unknown"
 
 
+class H3AdaLNRecord:
+    """Capture the teacher's native AdaLN output while it is actually sampling.
+
+    This is the bitwise path. The node is a pass-through for MODEL: it attaches
+    read-only forward hooks and hands the same model on to the guider. The
+    table object it returns is filled *during* sampling, so whatever consumes
+    it must run afterwards -- connect the sampler's LATENT to that node's
+    `after` input (or run Record and Save/Apply in two separate prompts).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "mode": (["strict", "lenient"], {"default": "strict",
+                        "tooltip": "strict: refuse to sample when rows cannot be "
+                                   "labelled. lenient: log and keep going."}),
+            },
+            "optional": {
+                "teacher_tag": ("STRING", {"default": "",
+                                           "tooltip": "Recorded into the table "
+                                                      "metadata, e.g. the checkpoint name."}),
+                "lora_tag": ("STRING", {"default": "",
+                                        "tooltip": "Free-form note about the LoRA stack."}),
+                "after": ("*", {"tooltip": _AFTER_DOC}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", TABLE_TYPE, "STRING")
+    RETURN_NAMES = ("model", "table", "report")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, model, mode="strict", teacher_tag="", lora_tag="", after=None):
+        dm = getattr(getattr(model, "model", None), "diffusion_model", None)
+        if dm is None:
+            raise RuntimeError("H3AdaLNRecord: expected a ComfyUI MODEL (ModelPatcher) "
+                               "for MiniMax-H3")
+
+        old = getattr(model, "_h3_recorder", None)
+        if old is not None:
+            try:
+                old.remove()
+            except Exception:
+                pass
+
+        recorder = record_engine.AdaLNRecorder(model, dm, mode=mode, tag=teacher_tag)
+        n = recorder.register()
+        model._h3_recorder = recorder
+        try:
+            import comfy.patcher_extension
+            model.add_callback(comfy.patcher_extension.CallbacksMP.ON_CLEANUP,
+                               lambda *a, **k: recorder.remove())
+        except Exception:
+            pass
+
+        fp, count = _lora_fingerprint(model)
+        shift_v, shift_a = _auto_shifts(model)
+        meta = {
+            "teacher": teacher_tag or "(unspecified full checkpoint)",
+            "lora_tag": lora_tag,
+            "lora_fingerprint": fp,
+            "lora_patch_count": str(count),
+            "sigmas": "[]",
+            "shift_v": str(float(shift_v)),
+            "shift_a": str(float(shift_a)),
+            "visual_aug": str(sigma_plan.VISUAL_COND_TIMESTEP),
+            "audio_aug": str(sigma_plan.AUDIO_COND_TIMESTEP),
+            "compute_dtype": "recorded",
+            "out_dtype": "unknown",
+            "comfyui_version": _comfy_version(),
+            "format": table_io.FORMAT,
+        }
+        table = table_io.AdaLNTable([], {}, meta, recorder=recorder)
+
+        report = "\n".join([
+            "=== H3 Exact AdaLN record (armed) ===",
+            "hooked modules : {} projections + time_embedder".format(n),
+            "teacher        : {}".format(meta["teacher"]),
+            "lora fp        : {} ({} non-AdaLN keys)".format(fp, count),
+            "shift_v / a    : {} / {}".format(shift_v, shift_a),
+            "",
+            "The table is EMPTY until the sampler runs. Anything that reads it",
+            "(Save / Apply / summary) must execute after sampling -- connect the",
+            "sampler's LATENT to that node's `after` input, or split the run into",
+            "two prompts (record+save, then load+apply).",
+            "",
+            "Note: AdaLN depends only on t, so a table recorded in an earlier run",
+            "is bitwise identical as long as the schedule, shifts and layout match.",
+        ])
+        logging.info("%s", report)
+        return (model, table, report)
+
+
 class H3ExactAdaLNBake:
-    """Compute an exact table from a FULL H3 model (+ optional LoRA). No disk IO."""
+    """Offline approximation from a FULL H3 model (+ optional LoRA). No disk IO.
+
+    Prefer H3AdaLNRecord for bitwise results; see the module docstring.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -118,6 +255,13 @@ class H3ExactAdaLNBake:
                                         "step": 0.001}),
                 "teacher_tag": ("STRING", {"default": ""}),
                 "lora_tag": ("STRING", {"default": ""}),
+                "splice": ("STRING", {"default": "",
+                                      "tooltip": "Hybrid teacher: FILE:FIRST-LAST, e.g. "
+                                                 "/models/ref2va.safetensors:25-49. Blocks "
+                                                 "in that range take their adaln_proj "
+                                                 "weight/bias from the donor file. The "
+                                                 "donor must be a plain float checkpoint "
+                                                 "(bf16/fp16/fp32), not quantised."}),
             },
         }
 
@@ -129,7 +273,8 @@ class H3ExactAdaLNBake:
 
     def run(self, model, steps, scheduler, compute_dtype, device, auto_shift,
             sigmas=None, extra_t="", shift_v=12.0, shift_a=3.0,
-            visual_aug=0.999, audio_aug=1.0, teacher_tag="", lora_tag=""):
+            visual_aug=0.999, audio_aug=1.0, teacher_tag="", lora_tag="",
+            splice=""):
         if sigmas is not None:
             sigma_values = sigma_plan.normalise_sigmas(sigmas)
         else:
@@ -158,15 +303,16 @@ class H3ExactAdaLNBake:
 
         raw_by_key, info = bake_engine.bake(
             model, t_values, compute_dtype=compute_dtype, device=dev,
-            progress=progress)
+            progress=progress, splice=splice)
 
+        dm = model.model.diffusion_model
         fingerprint, patch_count = _lora_fingerprint(model)
         meta = {
             "teacher": teacher_tag or "(unspecified full checkpoint)",
             "lora_tag": lora_tag,
             "lora_fingerprint": fingerprint,
             "lora_patch_count": str(patch_count),
-            "sigmas": json.dumps([round(float(s), 9) for s in sigma_values]),
+            "sigmas": json.dumps([float(s) for s in sigma_values]),
             "shift_v": str(float(shift_v)),
             "shift_a": str(float(shift_a)),
             "visual_aug": str(float(visual_aug)),
@@ -176,25 +322,42 @@ class H3ExactAdaLNBake:
             "t_embed_dim": str(info["t_embed_dim"]),
             "applied_lora_patches": str(info["applied_patches"]),
             "comfyui_version": _comfy_version(),
-            "out_dtype": "torch." + compute_dtype,
+            "out_dtype": bake_engine.teacher_out_dtype(dm),
+            "record_mode": "offline bake (approximate, use Record for bitwise)",
+            "format": table_io.FORMAT,
         }
+        meta.update({k: v for k, v in info.items() if k.startswith("splice")})
         table = table_io.AdaLNTable(t_values, raw_by_key, meta)
 
-        report = "\n".join([
-            "=== H3 Exact AdaLN bake (in memory) ===",
+        lines = [
+            "=== H3 Exact AdaLN bake (offline, approximate) ===",
             table.summary(),
             "auto shift     : {} (v={}, a={})".format(auto_shift, shift_v, shift_a),
             "applied patches: {}/{} AdaLN+timestep keys".format(
                 info["applied_patches"], info["target_patch_keys"]),
-            "patch errors   : {}".format("; ".join(info["patch_errors"][:3]) or "none"),
             "teacher weights: te={} ({}) | adaln={} ({}) in_features={}".format(
                 info.get("teacher_te_type", "?"), info.get("teacher_te_dtype", "?"),
                 info.get("teacher_adaln_type", "?"), info.get("teacher_adaln_dtype", "?"),
                 info.get("teacher_adaln_in_features", "?")),
             "device         : {}".format(info["device"]),
+        ]
+        if info.get("splice"):
+            lines.append("splice         : {} (blocks {}..{}, fingerprint {})".format(
+                info["splice"], info.get("splice_first"), info.get("splice_last"),
+                info.get("splice_fingerprint")))
+        if meta["out_dtype"].split(".")[-1] != compute_dtype:
+            lines.append("note           : compute_dtype={} but the teacher's AdaLN path "
+                         "runs in {}; the table stores that dtype so replay matches "
+                         "the model.".format(compute_dtype, meta["out_dtype"]))
+        lines += [
+            "",
+            "This is the OFFLINE path: it cannot see the kernels the sampler uses, so",
+            "it is not bitwise against a native run. Use H3AdaLNRecord when exactness",
+            "matters; keep Bake for exploring schedules without sampling.",
             "",
             "Next: connect `table` to H3 Exact AdaLN Save.",
-        ])
+        ]
+        report = "\n".join(lines)
         logging.info("%s", report)
         return {"ui": {"text": [report]}, "result": (table, report)}
 
@@ -215,6 +378,7 @@ class H3ExactAdaLNSave:
             "optional": {
                 "location": (["output", "models/h3_exact_adaln"],
                              {"default": "output"}),
+                "after": ("*", {"tooltip": _AFTER_DOC}),
             },
         }
 
@@ -224,10 +388,13 @@ class H3ExactAdaLNSave:
     FUNCTION = "save"
     CATEGORY = CATEGORY
 
-    def save(self, table, filename_prefix="h3_adaln/H3Exact", location="output"):
+    def save(self, table, filename_prefix="h3_adaln/H3Exact", location="output",
+             after=None):
         import shutil
         import folder_paths
         from urllib.parse import quote
+
+        table.finalize(required=True)
 
         prefix = str(filename_prefix).strip() or "h3_adaln/H3Exact"
         if location == "output":
@@ -375,6 +542,7 @@ class H3ExactAdaLNApply:
             },
             "optional": {
                 "expected_teacher": ("STRING", {"default": ""}),
+                "after": ("*", {"tooltip": _AFTER_DOC}),
             },
         }
 
@@ -383,10 +551,11 @@ class H3ExactAdaLNApply:
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, model, table, mode, expected_teacher=""):
+    def run(self, model, table, mode, expected_teacher="", after=None):
         if mode == "off":
             return (model, "H3ExactAdaLNApply: mode=off, model untouched (A/B control)")
 
+        table.finalize(required=True)
         dm = model.model.diffusion_model
         arch = "pruned/curve" if getattr(dm, "use_adaln_curves", False) else "full"
         current_fp, current_count = _lora_fingerprint(model)
@@ -404,7 +573,7 @@ class H3ExactAdaLNApply:
                 expected_teacher, table.meta.get("teacher", "")))
         if problems and mode == "strict":
             raise RuntimeError("H3ExactAdaLNApply: " + " | ".join(problems) +
-                               " -- re-bake the table with this exact model+LoRA stack.")
+                               " -- re-record the table with this exact model+LoRA stack.")
 
         old = getattr(model, "_h3_exact_runtime", None)
         if old is not None:
@@ -428,10 +597,13 @@ class H3ExactAdaLNApply:
         report = "\n".join([
             "=== H3 Exact AdaLN apply ===",
             "table          : {}".format(table.source or "(in-memory)"),
+            "provenance     : {}".format(table.meta.get("record_mode", "offline bake")),
             "target arch    : {}".format(arch),
             "hooked modules : {}".format(n),
             "lora fp        : {} ({})".format(current_fp, "match" if fp_ok else "MISMATCH"),
             "teacher        : {}".format(table.meta.get("teacher", "?")),
+            "out dtype      : {}".format(table.out_dtype),
+            "t rows         : {}".format(len(table.t_values)),
             "sigmas in table: {}".format(str(table.meta.get("sigmas", "?"))[:180]),
             "warnings       : {}".format("; ".join(problems) or "none"),
             "",
@@ -591,6 +763,7 @@ class H3LatentCompare:
 
 
 NODE_CLASS_MAPPINGS = {
+    "H3AdaLNRecord": H3AdaLNRecord,
     "H3ExactAdaLNBake": H3ExactAdaLNBake,
     "H3ExactAdaLNSave": H3ExactAdaLNSave,
     "H3ExactAdaLNLoad": H3ExactAdaLNLoad,
@@ -600,7 +773,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "H3ExactAdaLNBake": "H3 Exact AdaLN Bake (full teacher)",
+    "H3AdaLNRecord": "H3 AdaLN Record (exact, during sampling)",
+    "H3ExactAdaLNBake": "H3 Exact AdaLN Bake (offline, approximate)",
     "H3ExactAdaLNSave": "H3 Exact AdaLN Save Table",
     "H3ExactAdaLNLoad": "H3 Exact AdaLN Load Table",
     "H3ExactAdaLNApply": "H3 Exact AdaLN Apply (pruned base)",

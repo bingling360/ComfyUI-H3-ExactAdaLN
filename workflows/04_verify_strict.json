@@ -942,7 +942,8 @@
         0.999,
         1.0,
         "minimax_h3_ref2va_int8_convrot.safetensors",
-        "dmad8_s1.0"
+        "dmad8_s1.0",
+        ""
       ],
       "inputs": [
         {
@@ -1188,7 +1189,7 @@
       "mode": 0,
       "properties": {},
       "widgets_values": [
-        "严格验证口径\n• 同一次 prompt 内两条链共享 RandomNoise / SIGMAS /\n  conditioning / latent_image，不存在跨次运行的非确定性。\n• 表由 Bake 在本次执行中从 A 链 MODEL 直接算出，\n  table 输出直连 Apply，不需要 Save / Load / 上传。\n• 只用 Bake / Apply / Compare 三个节点（首发即有），\n  不依赖 H3LatentSave 等后加节点。\n• 通过标准：Compare 报告里 video/audio 各分量\n  equal=True、max_abs=0、VERDICT: PASS。\n• 对照实验：把 Apply 的 mode 设为 off 再跑，应为 FAIL。\n• 若 sigmas 换成自定义表，直接接 Bake 的 sigmas 输入；\n  shift_v/shift_a 也要与运行时一致。"
+        "离线比对口径（Bake 路径）\n• 注意：Bake 是离线重算，拿不到采样时的量化 kernel，\n  结果与原生仍差一个 bf16 ulp，8 步后放大到 ~0.145。\n  要逐位一致请用 05_record_strict.json（记录式）。\n• 两条链共享 RandomNoise / SIGMAS /\n  conditioning / latent_image，不存在跨次运行的非确定性。\n• 表由 Bake 在本次执行中从 A 链 MODEL 直接算出，\n  table 输出直连 Apply，不需要 Save / Load / 上传。\n• 只用 Bake / Apply / Compare 三个节点（首发即有），\n  不依赖 H3LatentSave 等后加节点。\n• 通过标准：Compare 报告里 video/audio 各分量\n  equal=True、max_abs=0、VERDICT: PASS。\n• 对照实验：把 Apply 的 mode 设为 off 再跑，应为 FAIL。\n• 若 sigmas 换成自定义表，直接接 Bake 的 sigmas 输入；\n  shift_v/shift_a 也要与运行时一致。"
       ],
       "inputs": [],
       "outputs": [],

@@ -1,20 +1,29 @@
 """ComfyUI-H3-ExactAdaLN
 
-Pre-bake the full MiniMax-H3 model's AdaLN modulation (including every LoRA
-delta) into an exact timestep-indexed table, then replay that table on a
-pruned/curve checkpoint at generation time.
+Make a pruned MiniMax-H3 checkpoint reproduce the *full* model's AdaLN
+modulation exactly, so that "pruned base + exact table + LoRA" is bitwise
+identical to "full teacher + the same LoRA".
+
+Two ways to produce the table:
+
+  * `H3AdaLNRecord` -- read-only hooks during a real sampling run. Bitwise by
+    construction, because it stores the tensors the teacher actually produced.
+    **This is the exact path.**
+  * `H3ExactAdaLNBake` -- offline recomputation on unloaded CPU weights. Cheap
+    and needs no sampling, but cannot reproduce the kernels ComfyUI selects at
+    run time (measured drift: one bf16 ulp per projection -> ~0.145 mean_abs on
+    the latent after 8 steps).
 
 Nodes (Save/Load behave like Save Image / Load Image):
-  H3ExactAdaLNBake    full teacher MODEL + sigmas -> H3_ADALN_TABLE
+  H3AdaLNRecord       full teacher MODEL -> H3_ADALN_TABLE (filled while sampling)
+  H3ExactAdaLNBake    full teacher MODEL + sigmas -> H3_ADALN_TABLE (offline)
   H3ExactAdaLNSave    H3_ADALN_TABLE -> shareable .safetensors in output/
   H3ExactAdaLNLoad    upload / pick a table file -> H3_ADALN_TABLE
   H3ExactAdaLNApply   pruned MODEL + H3_ADALN_TABLE -> patched MODEL
   H3LatentCompare     verification: bitwise latent comparison
+  H3LatentSave        NestedTensor-aware latent writer
 
-The bake path never parses a safetensors file by hand: it goes through
-ComfyUI's ModelPatcher, so bf16 / fp16 / fp8_scaled / int8_convrot / nvfp4
-checkpoints and any ComfyUI-applicable LoRA are handled by ComfyUI itself.
-See README section in the workflow JSON notes for limits.
+See README for the exactness contract and the known limits.
 """
 
 try:
