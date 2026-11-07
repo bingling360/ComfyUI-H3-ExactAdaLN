@@ -306,15 +306,48 @@ control), and that an unrecorded sigma is rejected with a t-set message.
 
 Set `COMFYUI_DIR` if your ComfyUI lives somewhere other than the default path.
 
+## Repo layout
+
+```
+record_engine.py   observe AdaLN during sampling (the exact path)
+bake_engine.py     offline recomputation + splice donors
+apply_engine.py    runtime injection: t_emb matching + sigma fallback
+sigma_plan.py      float32-exact t arithmetic, mirrors model.py:671-751
+table_io.py        safetensors container, live (recording) tables
+nodes.py           the seven nodes
+workflows/         01 bake, 02/03 load+apply A/B, 04 offline strict, 05 record strict
+tests/             test_exact.py (numbers), test_workflows.py (graph structure)
+tools/             workflow generators + model fetch/compare helpers
+HANDOFF.md         repair plan, root-cause evidence and per-phase status
+```
+
+The workflow JSONs are **generated**, never hand-edited:
+
+```bash
+python tools/build_workflows.py   # 01, 02
+python tools/add_savelatent.py    # 03 (from 02)
+python tools/build_strict.py      # 04
+python tools/build_record.py      # 05
+```
+
+They read node slot definitions from ComfyUI's own
+`blueprints/Image to Video (MiniMax H3).json`; set `COMFYUI_DIR` or
+`H3_BLUEPRINT` if it is not in the default place. Regenerating on a clean
+checkout reproduces the committed files byte-for-byte, which is a cheap way to
+tell whether a workflow was hand-edited.
+
 ## Status
 
 - Record → Apply verified bitwise on a real `MiniMaxH3Model` (tiny config):
   4/4 steps `equal=True`, `max_dist=0.000e+00`, 12 exact t_emb matches, control
   fails as expected.
-- End-to-end on ComfyUI 0.44.0 / RTX 4080 SUPER: bake produced 51 projections
-  / 17 t rows / 314.5 MiB, and the first injection was confirmed
-  (`max_dist=0.000e+00`). The full-precision run on the 34 GB teacher is the
-  remaining step — that is what `05_record_strict.json` is for.
+- End-to-end on ComfyUI 0.44.0 / RTX 4080 SUPER: the offline bake produced 51
+  projections / 17 t rows / 314.5 MiB and the first injection was confirmed
+  (`max_dist=0.000e+00`), yet the latents still differ — that measurement is
+  what identified the offline path as the root cause and motivated Record.
+- Remaining: one run of `05_record_strict.json` on the 34 GB teacher, plus the
+  `mode=off` control. Root cause, evidence and per-phase status live in
+  [`HANDOFF.md`](HANDOFF.md).
 
 ## Related work
 
