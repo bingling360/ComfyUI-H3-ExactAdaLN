@@ -30,8 +30,27 @@ exact for any LoRA that ComfyUI can apply.
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/bingling360/ComfyUI-H3-ExactAdaLN.git
+git clone --depth 1 -b main https://github.com/bingling360/ComfyUI-H3-ExactAdaLN.git
 ```
+
+If `github.com:443` times out (common on Chinese cloud platforms such as
+OpenI / 启智), use one of these fallbacks, both verified end-to-end:
+
+```bash
+# 1) reverse proxy - full git clone, keeps .git so `git pull` works
+git clone --depth 1 -b main https://gh-proxy.com/https://github.com/bingling360/ComfyUI-H3-ExactAdaLN.git
+
+# 2) GitHub's own codeload CDN - no third-party proxy involved
+curl -4 -L --retry 3 -o /tmp/h3exact.zip \
+  https://codeload.github.com/bingling360/ComfyUI-H3-ExactAdaLN/zip/refs/heads/main \
+  && unzip -q /tmp/h3exact.zip \
+  && mv ComfyUI-H3-ExactAdaLN-main ComfyUI-H3-ExactAdaLN \
+  && rm -f /tmp/h3exact.zip
+```
+
+The ComfyUI root differs between images; find it with
+`find / -maxdepth 5 -type d -name custom_nodes 2>/dev/null`.
+On OpenI debug instances it is usually `/ComfyUI/custom_nodes`.
 
 Restart ComfyUI. Requirements: ComfyUI 0.42.5+ (the `MiniMaxH3Model` /
 `patches_replace` implementation), PyTorch, `safetensors`. No extra pip packages.
