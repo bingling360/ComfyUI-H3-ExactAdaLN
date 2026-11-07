@@ -462,13 +462,49 @@ class H3LatentCompare:
     CATEGORY = CATEGORY
 
     def run(self, latent_a, latent_b, label_a, label_b):
+        def collect(obj, prefix="", out=None, depth=0):
+            """Find tensors inside dict / list / Latent-like wrapper objects."""
+            if out is None:
+                out = {}
+            if depth > 4:
+                return out
+            if torch.is_tensor(obj):
+                out[prefix or "tensor"] = obj
+                return out
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    p = "{}/{}".format(prefix, k) if prefix else str(k)
+                    collect(v, p, out, depth + 1)
+            elif isinstance(obj, (list, tuple)):
+                for i, v in enumerate(obj):
+                    collect(v, "{}[{}]".format(prefix or "v", i), out, depth + 1)
+            elif hasattr(obj, "__dict__"):
+                for name in ("samples", "latent", "data", "x"):
+                    v = getattr(obj, name, None)
+                    if v is not None:
+                        collect(v, "{}/{}".format(prefix, name) if prefix else name,
+                                out, depth + 1)
+            return out
+
+        def strip_side(d, side):
+            return {k.split("/", 1)[1] if k.startswith(side + "/") else k: v
+                    for k, v in d.items()}
+
+        ta = strip_side(collect(latent_a, "a"), "a")
+        tb = strip_side(collect(latent_b, "b"), "b")
         lines = ["=== latent comparison ===",
-                 "A: {}".format(label_a), "B: {}".format(label_b)]
+                 "A: {}".format(label_a), "B: {}".format(label_b),
+                 "inputs : A={} keys={} | B={} keys={}".format(
+                     type(latent_a).__name__, sorted(ta),
+                     type(latent_b).__name__, sorted(tb))]
         all_equal = True
-        keys = sorted(set(latent_a.keys()) | set(latent_b.keys()))
-        for key in keys:
-            a, b = latent_a.get(key), latent_b.get(key)
-            if not (torch.is_tensor(a) and torch.is_tensor(b)):
+        compared = 0
+        for key in sorted(set(ta) | set(tb)):
+            a, b = ta.get(key), tb.get(key)
+            if a is None or b is None:
+                lines.append("{}: MISSING on {} side".format(
+                    key, "A" if a is None else "B"))
+                all_equal = False
                 continue
             if a.shape != b.shape:
                 lines.append("{}: SHAPE MISMATCH {} vs {}".format(
@@ -491,12 +527,37 @@ class H3LatentCompare:
                     "inf" if mse == 0 else "{:.2f} dB".format(psnr),
                     tuple(a.shape)))
             all_equal = all_equal and eq
+            compared += 1
+        lines.append("compared tensor pairs: {}".format(compared))
+        if compared == 0:
+            verdict = ("INCONCLUSIVE - no latent tensors were compared; "
+                       "check the two LATENT inputs")
+        elif all_equal:
+            verdict = "PASS - bitwise identical"
+        else:
+            verdict = "FAIL - outputs differ (see max_abs / psnr above)"
         lines.append("")
-        lines.append("VERDICT: {}".format(
-            "PASS - bitwise identical" if all_equal else
-            "FAIL - outputs differ (see max_abs / psnr above)"))
+        lines.append("VERDICT: {}".format(verdict))
         report = "\n".join(lines)
         logging.info("%s", report)
+
+        # Also persist the report so it can be read without the UI/log panel.
+        try:
+            import folder_paths
+            from datetime import datetime
+            folder = os.path.join(folder_paths.get_output_directory(), "h3_adaln")
+            os.makedirs(folder, exist_ok=True)
+            tag = "PASS" if (all_equal and compared) else "OTHER"
+            path = os.path.join(folder, "compare_{}_{}.txt".format(
+                tag, datetime.now().strftime("%Y%m%d_%H%M%S")))
+            lines.append("report file: {}".format(path))
+            report = "\n".join(lines)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(report + "\n")
+        except Exception as e:
+            logging.warning("H3LatentCompare: could not write report file: %s", e)
+            lines.append("report file: (unavailable: {})".format(e))
+            report = "\n".join(lines)
         return {"ui": {"text": [report]}, "result": (report,)}
 
 

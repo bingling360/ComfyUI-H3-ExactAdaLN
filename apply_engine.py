@@ -189,6 +189,15 @@ class ExactAdaLNRuntime:
                         "sigma schedule / timestep set.")
                 return None
 
+            # One explicit log line so the server log proves the hooks really
+            # fired during sampling (Apply's own report is printed before the
+            # sampler runs, so its counters are always zero there).
+            if self.state["curve_hits"] + self.state["dit_hits"] == 1:
+                logging.info(
+                    "H3ExactAdaLN: first injection confirmed during sampling "
+                    "(%s, %d rows, indices=%s, max_curve_dist=%.3e)",
+                    key, m, indices, self.state["max_curve_distance"])
+
             raw = self._raw(key, t_emb.device)
             index = torch.as_tensor(indices, dtype=torch.long, device=raw.device)
             gathered = raw.index_select(0, index)
