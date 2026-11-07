@@ -117,17 +117,24 @@ and the table is re-baked.
 - The table stores the **raw** `adaln_proj.linear` output, before
   `view`/`chunk`. Runtime gathers rows by `t` and replays the module's own
   reshape, so it does not depend on `expand`/`hidden`/`modalities` semantics.
-- **Injection (pruned bases)**: `t_emb` is the 8-wide lerped curve coordinate.
-  Apply rebuilds those same coordinates from `adaln_t_table` for every baked
-  `t`, then an `adaln_proj` forward hook matches rows by nearest neighbour and
-  returns the exact tensors. This needs no `patches_replace`, no `layout`, no
-  `transformer_options["sigmas"]`, and handles per-row mask timesteps.
-- **Injection (full bases)**: falls back to
-  `set_model_patch_replace(..., "dit", "double_block", 0)` to rebuild
-  `unique_t`, plus the same 51 hooks. ComfyUI passes the second argument as
-  `{"original_block": callable}` (a dict, not a function); both that form and a
-  bare callable are handled. Generic `set_model_attn1_patch`-style options are
-  not used because H3's `model.py` does not read them.
+- **Injection is sampler-agnostic**: Apply identifies timesteps from `t_emb`
+  itself, so it works whether the sampler is `SamplerCustomAdvanced` or a
+  custom node calling `comfy.sample.sample()` directly (SequenceForge,
+  HyperFlow adapters, LCM, ...), which never reaches `patches_replace`.
+  - pruned / curve base: `t_emb` is the 8-wide lerped curve coordinate,
+    rebuilt from `adaln_t_table` for every baked `t`;
+  - full base: `t_emb = time_embedder(t).to(dtype)` (2688-wide), rebuilt by
+    running the model's own `time_embedder` on the baked `t` values.
+  Each of the 51 `adaln_proj` forward hooks nearest-matches the incoming
+  `t_emb` rows against that `[T, k]` key matrix and returns the exact rows.
+  No `layout`, no `transformer_options["sigmas"]`, no `patches_replace`.
+- A dit patch (`set_model_patch_replace(..., "dit", "double_block", 0)`) is
+  kept only as a last resort. ComfyUI passes its second argument as
+  `{"original_block": callable}` (a dict, not a function); both that form and
+  a bare callable are handled.
+- `strict` reports diagnostic info (t_emb shape, key shape, max distance,
+  tolerance) when timesteps cannot be matched; the usual cause is a table
+  baked for a **different sigma schedule / shift** than the running workflow.
 - Tables are stored fp32; bf16 costs ~2.5e-2 relative AdaLN error.
 
 ## Known limits

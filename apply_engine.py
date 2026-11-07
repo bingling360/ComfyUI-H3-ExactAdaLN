@@ -1,21 +1,23 @@
 """Runtime injection of an exact AdaLN table into a MiniMax-H3 MODEL.
 
-Primary path (pruned / curve checkpoints): curve-coordinate matching.
-    ComfyUI computes t_emb as lerp(adaln_t_table[i0], adaln_t_table[i0+1], frac)
-    for each distinct timestep. We rebuild those same coordinates for every
-    baked t and match them by nearest neighbour directly inside the
-    adaln_proj forward hook. No `patches_replace` needed, no layout needed,
-    no dependency on transformer_options["sigmas"], and per-row denoise-mask
-    timesteps are handled automatically.
+The injection must not depend on how the sampler is invoked. Custom sampler
+nodes (SequenceForge, HyperFlow adapters, etc.) often call
+`comfy.sample.sample()` directly with their own model_options, so a
+`set_model_patch_replace(..., "dit", "double_block", 0)` callback may never
+run. Instead we identify timesteps from the `t_emb` tensor itself:
 
-Fallback path (full checkpoints): set_model_patch_replace(..., "dit",
-"double_block", 0) to rebuild `unique_t`, plus the same 51 forward hooks.
+  * pruned / curve checkpoint: t_emb is the 8-wide lerped curve coordinate,
+    rebuilt from `adaln_t_table`
+  * full checkpoint: t_emb is `time_embedder(t).to(dtype)`, 2688-wide,
+    rebuilt by running the model's own `time_embedder` on the baked t values
 
-NOTE: ComfyUI calls dit patches as
-    patch(args, {"original_block": block_wrap})
-The second argument is a DICT, not a callable. Earlier versions of this file
-called it directly and raised "'dict' object is not callable" on the first
-sampling step. Both forms are now handled.
+Both give a [T, k] key matrix. Each `adaln_proj` forward hook nearest-matches
+the incoming t_emb rows against those keys and returns the exact baked rows.
+No layout, no transformer_options["sigmas"], no patches_replace required.
+
+A dit patch is kept only as a last-resort fallback. ComfyUI calls it as
+patch(args, {"original_block": callable}) -- a dict, not a function -- so both
+that form and a bare callable are accepted.
 """
 
 import logging
@@ -49,38 +51,48 @@ class ExactAdaLNRuntime:
         self.previous_patch = None
         self.hook_handles = []
         self._device_cache = {}
-        self.curve_keys = self._build_curve_keys(dm)
-        self.use_curve = self.curve_keys is not None
+        self.match_keys, self.match_mode = self._build_match_keys(dm)
+        self.use_match = self.match_keys is not None
         self.state = {
             "t_indices": None, "hits": 0, "fallbacks": 0,
             "missing": set(), "last_sigma": None,
-            "curve_hits": 0, "dit_hits": 0, "native_steps": 0,
-            "max_curve_distance": 0.0, "curve_failures": 0,
+            "match_hits": 0, "match_failures": 0,
+            "max_match_distance": 0.0, "last_diag": "",
+            "dit_hits": 0, "native_steps": 0,
         }
 
-    def _build_curve_keys(self, dm):
-        """[T, k] lerped curve coordinate for every baked t (k is normally 8)."""
+    def _build_match_keys(self, dm):
+        """Return ([T, k] keys, human readable mode) or (None, 'dit patch')."""
+        t = torch.tensor(self.t_values, dtype=torch.float32)
         try:
-            if not getattr(dm, "use_adaln_curves", False):
-                return None
-            table = getattr(dm, "adaln_t_table", None)
-            if table is None or table.ndim != 2 or table.shape[0] < 2:
-                return None
-            tbl = table.detach().to(device="cpu", dtype=torch.float32).contiguous()
-            t = torch.tensor(self.t_values, dtype=torch.float32)
-            pos = t.clamp(0.0, 1.0) * (tbl.shape[0] - 1)
-            i0 = pos.floor().long().clamp(max=tbl.shape[0] - 2)
-            frac = (pos - i0).unsqueeze(1)
-            keys = torch.lerp(tbl[i0], tbl[i0 + 1], frac)
-            return keys.contiguous()
-        except Exception as e:
-            logging.warning("H3ExactAdaLN: curve keys unavailable (%s: %s); "
-                            "falling back to dit patch mode", type(e).__name__, e)
-            return None
+            if getattr(dm, "use_adaln_curves", False):
+                table = getattr(dm, "adaln_t_table", None)
+                if table is not None and table.ndim == 2 and table.shape[0] >= 2:
+                    tbl = table.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                    pos = t.clamp(0.0, 1.0) * (tbl.shape[0] - 1)
+                    i0 = pos.floor().long().clamp(max=tbl.shape[0] - 2)
+                    frac = (pos - i0).unsqueeze(1)
+                    keys = torch.lerp(tbl[i0], tbl[i0 + 1], frac)
+                    return keys.contiguous(), "curve-coordinate (8-wide)"
 
-    def _curve_indices(self, t_emb):
-        """Return (indices, max_distance, tolerance) matching t_emb rows to t rows."""
-        keys = self.curve_keys.to(device=t_emb.device, dtype=torch.float32)
+            te = getattr(dm, "time_embedder", None)
+            if te is not None:
+                dev = next(te.parameters()).device
+                with torch.no_grad():
+                    keys = te(t.to(dev)).to(self.out_dtype)
+                keys = keys.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                if keys.ndim == 2 and keys.shape[0] == len(self.t_values):
+                    return keys, "time-embedder ({} -wide)".format(keys.shape[-1])
+                logging.warning("H3ExactAdaLN: unexpected time_embedder shape %s",
+                                tuple(keys.shape))
+        except Exception as e:
+            logging.warning("H3ExactAdaLN: could not build match keys (%s: %s); "
+                            "falling back to dit patch", type(e).__name__, e)
+        return None, "dit patch fallback"
+
+    def _match_indices(self, t_emb):
+        """Return (indices, max_distance, tolerance) for t_emb rows."""
+        keys = self.match_keys.to(device=t_emb.device, dtype=torch.float32)
         x = t_emb.detach().to(torch.float32)
         if x.ndim != 2 or x.shape[-1] != keys.shape[-1]:
             return None, float("inf"), 0.0
@@ -88,7 +100,7 @@ class ExactAdaLNRuntime:
         idx = dist.argmin(dim=1)
         mind = dist.gather(1, idx[:, None]).squeeze(1)
         scale = float(keys.abs().max().clamp(min=1.0))
-        tol = 2e-3 * scale
+        tol = max(1e-3, 2e-3 * scale)
         return idx.detach().cpu().tolist(), float(mind.max()), tol
 
     def _previous(self, model):
@@ -99,11 +111,7 @@ class ExactAdaLNRuntime:
             return None
 
     def dit_patch(self, args, block_info=None):
-        """Fallback timestep resolver for full (non-curve) checkpoints.
-
-        `block_info` is normally the dict {"original_block": block_wrap}.
-        Some builds pass the callable directly; both are accepted.
-        """
+        """Fallback resolver; only used when numeric matching is unavailable."""
         if isinstance(block_info, dict):
             info = block_info
             fn = block_info.get("original_block")
@@ -136,8 +144,7 @@ class ExactAdaLNRuntime:
         except RuntimeError:
             raise
         except Exception as e:
-            logging.warning("H3ExactAdaLN: could not resolve timesteps (%s: %s); "
-                            "falling back to the native AdaLN path for this step",
+            logging.warning("H3ExactAdaLN: could not resolve timesteps (%s: %s)",
                             type(e).__name__, e)
             self.state["t_indices"] = None
             self.state["fallbacks"] += 1
@@ -163,16 +170,20 @@ class ExactAdaLNRuntime:
             t_emb = inputs[0]
             m = t_emb.shape[0]
             indices = None
+            maxd, tol = 0.0, 0.0
 
-            if self.use_curve and t_emb.shape[-1] == self.curve_keys.shape[-1]:
-                indices, maxd, tol = self._curve_indices(t_emb)
-                self.state["max_curve_distance"] = max(
-                    self.state["max_curve_distance"], maxd)
+            if self.use_match and t_emb.shape[-1] == self.match_keys.shape[-1]:
+                indices, maxd, tol = self._match_indices(t_emb)
+                self.state["max_match_distance"] = max(
+                    self.state["max_match_distance"], maxd)
                 if maxd > tol:
-                    self.state["curve_failures"] += 1
+                    self.state["match_failures"] += 1
+                    self.state["last_diag"] = (
+                        "t_emb={} keys={} max_dist={:.3e} tol={:.3e}".format(
+                            tuple(t_emb.shape), tuple(self.match_keys.shape), maxd, tol))
                     indices = None
                 else:
-                    self.state["curve_hits"] += 1
+                    self.state["match_hits"] += 1
 
             if indices is None:
                 indices = self.state["t_indices"]
@@ -183,20 +194,23 @@ class ExactAdaLNRuntime:
                 self.state["native_steps"] += 1
                 if self.mode == "strict":
                     raise RuntimeError(
-                        "H3ExactAdaLN: could not map t_emb rows to table rows "
-                        "(mode=strict). Set mode=fallback to let this step use "
-                        "the native AdaLN path, or re-bake the table for this "
-                        "sigma schedule / timestep set.")
+                        "H3ExactAdaLN: could not map t_emb rows to baked table rows "
+                        "(mode=strict). match_mode={}. {} "
+                        "This usually means the table was baked for a DIFFERENT "
+                        "sigma schedule / shift than this workflow uses. Re-bake "
+                        "with this workflow's sigmas, or set mode=fallback to let "
+                        "unknown timesteps use the native AdaLN path.".format(
+                            self.match_mode,
+                            self.state["last_diag"] or "t_emb={}".format(tuple(t_emb.shape))))
                 return None
 
-            # One explicit log line so the server log proves the hooks really
-            # fired during sampling (Apply's own report is printed before the
-            # sampler runs, so its counters are always zero there).
-            if self.state["curve_hits"] + self.state["dit_hits"] == 1:
+            # One explicit log line proving hooks fired during sampling;
+            # Apply's own report is printed before the sampler runs.
+            if self.state["match_hits"] + self.state["dit_hits"] == 1:
                 logging.info(
                     "H3ExactAdaLN: first injection confirmed during sampling "
-                    "(%s, %d rows, indices=%s, max_curve_dist=%.3e)",
-                    key, m, indices, self.state["max_curve_distance"])
+                    "(%s, %d rows, indices=%s, max_dist=%.3e)",
+                    key, m, indices, self.state["max_match_distance"])
 
             raw = self._raw(key, t_emb.device)
             index = torch.as_tensor(indices, dtype=torch.long, device=raw.device)
@@ -225,10 +239,7 @@ class ExactAdaLNRuntime:
             raise RuntimeError("H3ExactAdaLN Apply: table is missing projections: {}".format(
                 ", ".join(missing_keys[:8])))
 
-        # Only register the dit patch when curve matching is unavailable.
-        # On a pruned base this avoids touching patches_replace entirely,
-        # which also avoids ComfyUI model-compiler graph breaks.
-        if not self.use_curve:
+        if not self.use_match:
             self.previous_patch = self._previous(model)
             model.set_model_patch_replace(self.dit_patch, "dit", "double_block", 0)
 
@@ -246,16 +257,17 @@ class ExactAdaLNRuntime:
         self._device_cache.clear()
 
     def summary(self):
-        lines = [
+        return "\n".join([
             "mode             : {}".format(self.mode),
             "injection mode   : {}".format(
-                "curve-coordinate match" if self.use_curve else "dit patch fallback"),
+                self.match_mode if self.use_match else "dit patch fallback"),
             "t rows in table  : {}".format(len(self.t_values)),
             "projections      : {}".format(len(self.raw_by_key)),
             "out dtype        : {}".format(self.out_dtype),
-            "curve hits       : {}".format(self.state["curve_hits"]),
-            "curve failures   : {}".format(self.state["curve_failures"]),
-            "max curve dist   : {:.3e}".format(self.state["max_curve_distance"]),
+            "match hits       : {}".format(self.state["match_hits"]),
+            "match failures   : {}".format(self.state["match_failures"]),
+            "max match dist   : {:.3e}".format(self.state["max_match_distance"]),
+            "last diagnostic  : {}".format(self.state["last_diag"] or "none"),
             "dit hits         : {}".format(self.state["dit_hits"]),
             "native steps     : {}".format(self.state["native_steps"]),
             "dit steps        : {}/fallback {}".format(
@@ -265,5 +277,4 @@ class ExactAdaLNRuntime:
                 ", ".join("{:.7f}".format(t) for t in sorted(self.state["missing"])[:12])
                 or "none"),
             "chained patch    : {}".format(self.previous_patch is not None),
-        ]
-        return "\n".join(lines)
+        ])
