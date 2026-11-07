@@ -33,8 +33,8 @@ cd ComfyUI/custom_nodes
 git clone --depth 1 -b main https://github.com/bingling360/ComfyUI-H3-ExactAdaLN.git
 ```
 
-If `github.com:443` times out (common on Chinese cloud platforms such as
-OpenI / 启智), use one of these fallbacks, both verified end-to-end:
+If `github.com:443` times out (common on Chinese cloud platforms), use one of
+these fallbacks, both verified end-to-end:
 
 ```bash
 # 1) reverse proxy - full git clone, keeps .git so `git pull` works
@@ -50,18 +50,18 @@ curl -4 -L --retry 3 -o /tmp/h3exact.zip \
 
 The ComfyUI root differs between images; find it with
 `find / -maxdepth 5 -type d -name custom_nodes 2>/dev/null`.
-On OpenI debug instances it is usually `/ComfyUI/custom_nodes`.
 
 Restart ComfyUI. Requirements: ComfyUI 0.42.5+ (the `MiniMaxH3Model` /
 `patches_replace` implementation), PyTorch, `safetensors`. No extra pip packages.
+Verified against ComfyUI 0.44.0 / PyTorch 2.9.1 / RTX 4080 SUPER.
 
 ## Nodes
 
 | Node | In | Out | Behaviour |
 |---|---|---|---|
 | `H3 Exact AdaLN Bake` | full MODEL (+ LoRA), SIGMAS or steps/scheduler | `H3_ADALN_TABLE` | Computes the table in memory. No disk IO. |
-| `H3 Exact AdaLN Save Table` | `H3_ADALN_TABLE` | file path | Like **Save Image**: auto-numbered `.safetensors` under `output/h3_adaln/`, or into `models/h3_exact_adaln/`. |
-| `H3 Exact AdaLN Load Table` | upload button / dropdown / absolute path | `H3_ADALN_TABLE` | Like **Load Image**: scans `input/`, `output/`, `models/h3_exact_adaln/`. |
+| `H3 Exact AdaLN Save Table` | `H3_ADALN_TABLE` | file path | Like **Save Image**: auto-numbered `.safetensors` under `output/h3_adaln/`, or into `models/h3_exact_adaln/`. Also mirrors into `input/`. |
+| `H3 Exact AdaLN Load Table` | `table_name` (free text) / `table_path` | `H3_ADALN_TABLE` | Resolves a filename, substring, relative path or absolute path. Scans `input/`, `output/`, `models/h3_exact_adaln/`. |
 | `H3 Exact AdaLN Apply` | pruned MODEL + `H3_ADALN_TABLE` | MODEL | Replaces all 51 AdaLN projections at runtime. `strict` / `fallback` / `off`. |
 | `H3 Latent Compare` | two LATENT | report | `equal`, `max_abs`, `PSNR`; PASS = bitwise identical. |
 
@@ -69,6 +69,29 @@ A saved table is **self-contained**: its safetensors header carries the
 teacher, LoRA fingerprint, sigma grid, shifts, compute dtype and ComfyUI
 version. Copy the file anywhere to share it; the receiving side just Loads it.
 `strict` mode refuses a table baked with a different LoRA stack.
+
+## Sharing and downloading tables
+
+ComfyUI's asset/output panel only understands media types, so a raw
+`.safetensors` produced by a custom node is normally not downloadable from the
+UI. Save Table works around this in three ways:
+
+1. **Direct download link** — the Save report prints a relative URL like
+   `/view?filename=h3_exact_dmad8_v1_00001.safetensors&subfolder=h3_adaln&type=output`.
+   Paste `<your ComfyUI host>` + that URL into a browser; `/view` serves any
+   file under `output/` as `application/octet-stream`, so it downloads directly.
+2. **Output panel entry** — Save also reports the file through ComfyUI's
+   generic `ui.images` channel, so a download card appears without opening the
+   folder (the thumbnail may be blank for a non-image file).
+3. **input/ mirror** — the same file is copied into `ComfyUI/input/`, which
+   most platform file browsers and the Load node can reach directly.
+
+Load Table deliberately uses **free text**, not a dropdown + `image_upload`
+widget. A COMBO list is built once at ComfyUI startup (so a table saved later
+never appears), and the image upload control only accepts image formats (so a
+`.safetensors` cannot be selected). The table is already on the server; point
+at it by name or path instead. If the name cannot be resolved, the error message
+lists every table file it can see.
 
 ## Workflows
 
@@ -94,10 +117,17 @@ and the table is re-baked.
 - The table stores the **raw** `adaln_proj.linear` output, before
   `view`/`chunk`. Runtime gathers rows by `t` and replays the module's own
   reshape, so it does not depend on `expand`/`hidden`/`modalities` semantics.
-- Injection uses `set_model_patch_replace(..., "dit", "double_block", 0)` to
-  rebuild `unique_t` and 51 `adaln_proj` forward hooks. It chains with any
-  pre-existing dit patch. Generic `set_model_attn1_patch`-style options are not
-  used because H3's `model.py` does not read them.
+- **Injection (pruned bases)**: `t_emb` is the 8-wide lerped curve coordinate.
+  Apply rebuilds those same coordinates from `adaln_t_table` for every baked
+  `t`, then an `adaln_proj` forward hook matches rows by nearest neighbour and
+  returns the exact tensors. This needs no `patches_replace`, no `layout`, no
+  `transformer_options["sigmas"]`, and handles per-row mask timesteps.
+- **Injection (full bases)**: falls back to
+  `set_model_patch_replace(..., "dit", "double_block", 0)` to rebuild
+  `unique_t`, plus the same 51 hooks. ComfyUI passes the second argument as
+  `{"original_block": callable}` (a dict, not a function); both that form and a
+  bare callable are handled. Generic `set_model_attn1_patch`-style options are
+  not used because H3's `model.py` does not read them.
 - Tables are stored fp32; bf16 costs ~2.5e-2 relative AdaLN error.
 
 ## Known limits
@@ -108,15 +138,15 @@ and the table is re-baked.
   it non-linear).
 - `compute_dtype` defaults to `bfloat16` and must match the actual inference
   dtype, or the two chains will not be bitwise identical.
-- Per-row `denoise_mask` timesteps and HyperFlow-style `(t, r)` conditioning
-  are not enumerated by default. `strict` reports the missing `t` values; add
-  them to Bake's `extra_t` and re-bake, or use `mode=fallback` to let those
-  steps use the native path.
+- HyperFlow-style `(t, r)` endpoint conditioning is not reproduced by Bake;
+  per-row `denoise_mask` timesteps work at runtime but must exist in the baked
+  table (add them via `extra_t`, or use `mode=fallback`).
 - Python hooks cannot reach DiTs executed by a C++ engine (e.g. QuantFunc) or
   fused kernels that bypass `module.forward`.
-- This is an experimental v0.1. Local validation covered schemas, table
-  round-trips, hook replacement, sigma/t coverage and workflow wiring with
-  synthetic tensors; **end-to-end GPU verification is still pending**.
+- Status: baking was verified end-to-end on ComfyUI 0.44.0 (51 projections,
+  17 t rows, 314.5 MiB table). The curve-matching injection and the dit-patch
+  signature fix passed local regression against that real table with synthetic
+  modules; **a fresh end-to-end sampling run after this fix is still pending**.
 
 ## Related work
 

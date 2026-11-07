@@ -152,12 +152,7 @@ def list_table_files():
     return sorted(names)
 
 
-def find_table_file(name):
-    """Resolve a COMBO basename (or an absolute path) to an existing file."""
-    if not name:
-        return None
-    if os.path.isabs(name):
-        return name if os.path.isfile(name) else None
+def _search_by_name(name):
     for d in _scan_dirs():
         if not os.path.isdir(d):
             continue
@@ -168,6 +163,48 @@ def find_table_file(name):
             if name in files:
                 return os.path.join(root, name)
     return None
+
+
+def find_table_file(name):
+    """Resolve a filename / substring / relative path / absolute path.
+
+    The Load node accepts free-form text: an exact filename, a partial string
+    (e.g. "dmad8"), a path under input/ or output/, or an absolute path.
+    """
+    if not name:
+        return None
+    name = str(name).strip()
+    if not name:
+        return None
+    if os.path.isabs(name):
+        return name if os.path.isfile(name) else None
+
+    names = list_table_files()
+    base = os.path.basename(name)
+    if base in names:
+        return _search_by_name(base)
+    if name in names:
+        return _search_by_name(name)
+
+    low = base.lower()
+    hits = [n for n in names if low in n.lower()]
+    if len(hits) == 1:
+        return _search_by_name(hits[0])
+    return None
+
+
+def describe_available(limit=12):
+    """Human-readable candidate list for Load node error messages."""
+    names = list_table_files()
+    if not names:
+        return "(no .safetensors tables found in input/, output/ or models/h3_exact_adaln/)"
+    lines = ["available table files ({}):".format(len(names))]
+    for n in names[:limit]:
+        p = _search_by_name(n)
+        lines.append("  {}  ->  {}".format(n, p or "?"))
+    if len(names) > limit:
+        lines.append("  ... and {} more".format(len(names) - limit))
+    return "\n".join(lines)
 
 
 def list_tables():

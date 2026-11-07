@@ -947,7 +947,7 @@
           "links": []
         }
       ],
-      "title": "加载 / 上传表文件"
+      "title": "按名称/路径加载表文件"
     },
     {
       "id": 16,
@@ -1165,7 +1165,7 @@
       "mode": 0,
       "properties": {},
       "widgets_values": [
-        "验证口径（DMAD 8-step）\n• 两条链只有底模不同：A 用完整 34GB，B 用剪枝 21GB；量化同为 int8_convrot。\n• LoRA = dmad_minimax_h3_8step_full_critic_comfyui.safetensors，强度 1.0。\n  元数据：8 步 / video shift 12 / audio shift 2 / no CFG / rank 128。\n• 注意：该 LoRA 是 backbone-only（208 个 attn/mlp 目标，无 AdaLN / time_embedder 键）。\n  因此本次验证检验的是「精确表能否让剪枝底模 ≡ 完整底模」，\n  而不是「LoRA 的 AdaLN delta 被烘焙」。要测后者需换含 AdaLN 键的 LoRA\n  （例如 HyperFlow 的 full 版），其它接线不变。\n• 表文件用 Load 节点加载（像 Load Image）：点上传按钮选 .safetensors，\n  或先放进 ComfyUI/input/ 再刷新页面让下拉更新；下拉看不到时，\n  直接把 Save 报告里的完整路径填进 table_path 即可。\n  Load 的 table 输出接 Apply 的 table 输入。\n• A 不接 Apply（原生 AdaLN 路径），B 接 Apply（跳过插值表与剪枝 adaln_proj）。\n• 共享 BasicScheduler / RandomNoise / Conditioning / shift，保证 t 集合一致。\n  两个 shift 节点参数必须完全相同（audio shift 2，不是默认 3）。\n• 通过标准：compare 报告 equal=True 且 max_abs=0。\n• 对照实验：把 Apply 的 mode 设为 off，应当得到 FAIL。\n• strict 报缺 t 时会列出数值，填进 Bake 的 extra_t 重烘焙。\n• 验证档 8 步 / euler / simple / 832x480 / 39 帧。DMAD 推荐 1344x768 / 124 帧\n  及 re-noise step rule；改尺寸、步数或换成自定义 sigmas 时两边同步改并重新烘焙。\n• 条件部分用官方 I2V conditioning；换成你自己的 ref2va 条件链也可以，\n  只要两条链共享同一组条件节点。"
+        "验证口径（DMAD 8-step）\n• 两条链只有底模不同：A 用完整 34GB，B 用剪枝 21GB；量化同为 int8_convrot。\n• LoRA = dmad_minimax_h3_8step_full_critic_comfyui.safetensors，强度 1.0。\n  元数据：8 步 / video shift 12 / audio shift 2 / no CFG / rank 128。\n• 注意：该 LoRA 是 backbone-only（208 个 attn/mlp 目标，无 AdaLN / time_embedder 键）。\n  因此本次验证检验的是「精确表能否让剪枝底模 ≡ 完整底模」，\n  而不是「LoRA 的 AdaLN delta 被烘焙」。要测后者需换含 AdaLN 键的 LoRA\n  （例如 HyperFlow 的 full 版），其它接线不变。\n• 表文件用 Load 节点加载：table_name 填文件名/部分名字/相对路径，\n  或 table_path 填绝对路径。自由文本输入，不受下拉缓存与图片格式限制。\n  Load 的 table 输出接 Apply 的 table 输入。\n• A 不接 Apply（原生 AdaLN 路径），B 接 Apply（跳过插值表与剪枝 adaln_proj）。\n• 共享 BasicScheduler / RandomNoise / Conditioning / shift，保证 t 集合一致。\n  两个 shift 节点参数必须完全相同（audio shift 2，不是默认 3）。\n• 通过标准：compare 报告 equal=True 且 max_abs=0。\n• 对照实验：把 Apply 的 mode 设为 off，应当得到 FAIL。\n• strict 报缺 t 时会列出数值，填进 Bake 的 extra_t 重烘焙。\n• 验证档 8 步 / euler / simple / 832x480 / 39 帧。DMAD 推荐 1344x768 / 124 帧\n  及 re-noise step rule；改尺寸、步数或换成自定义 sigmas 时两边同步改并重新烘焙。\n• 条件部分用官方 I2V conditioning；换成你自己的 ref2va 条件链也可以，\n  只要两条链共享同一组条件节点。"
       ],
       "inputs": [],
       "outputs": [],

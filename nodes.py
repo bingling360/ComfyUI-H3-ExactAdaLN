@@ -225,7 +225,10 @@ class H3ExactAdaLNSave:
     CATEGORY = CATEGORY
 
     def save(self, table, filename_prefix="h3_adaln/H3Exact", location="output"):
+        import shutil
         import folder_paths
+        from urllib.parse import quote
+
         prefix = str(filename_prefix).strip() or "h3_adaln/H3Exact"
         if location == "output":
             folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
@@ -234,6 +237,8 @@ class H3ExactAdaLNSave:
             path = os.path.join(folder, name)
             rel = os.path.join(subfolder, name).replace("\\", "/")
             ui_type = "output"
+            download_url = "/view?filename={}&subfolder={}&type=output".format(
+                quote(name), quote(subfolder))
         else:
             folder = table_io.table_dir()
             base = os.path.basename(os.path.normpath(prefix)) or "H3Exact"
@@ -246,46 +251,81 @@ class H3ExactAdaLNSave:
                 counter += 1
             rel = name
             ui_type = "input"
+            download_url = None
 
         table_io.write_table_file(path, table)
-        report = "\n".join([
-            "=== H3 Exact AdaLN table saved ===",
-            "path     : {}".format(path),
-            "relative : {}".format(rel),
-            "location : {}".format(location),
-            "share    : copy this .safetensors anywhere, then use "
-                       "H3 Exact AdaLN Load (upload or pick file).",
-            "",
-            table.summary(),
-        ])
-        logging.info("%s", report)
-        return {
-            "ui": {
-                "text": [report],
-                "h3_adaln_tables": [
-                    {"filename": name, "subfolder": os.path.dirname(rel),
-                     "type": ui_type}
-                ],
-            },
-            "result": (path,),
+        table.source = os.path.abspath(path)
+
+        # Mirror into input/ so the Load node, ComfyUI's file picker and the
+        # platform's asset browser can all reach it without digging through
+        # output/h3_adaln/. Saving twice the file size is acceptable (tables
+        # are a few hundred MB) and avoids upload-widget format filtering.
+        mirrored = None
+        try:
+            inp = folder_paths.get_input_directory()
+            os.makedirs(inp, exist_ok=True)
+            dst = os.path.join(inp, name)
+            if os.path.abspath(dst) != os.path.abspath(path):
+                shutil.copy2(path, dst)
+                mirrored = dst
+        except Exception as e:
+            logging.warning("H3ExactAdaLNSave: could not mirror into input/: %s", e)
+
+        # ComfyUI's /view endpoint serves any file under output/ with
+        # application/octet-stream, so this link downloads directly.
+        ui = {
+            "text": ["=== H3 Exact AdaLN table saved ===",
+                     "path     : {}".format(path),
+                     "relative : {}".format(rel),
+                     "location : {}".format(location),
+                     "download : {}".format(download_url or "(use the path above)"),
+                     "input mirror : {}".format(mirrored or "(unavailable)"),
+                     "tip      : paste <ComfyUI host>{} into your browser to "
+                                "download without opening the folder".format(download_url or ""),
+                     "",
+                     table.summary()],
+            "h3_adaln_tables": [
+                {"filename": name, "subfolder": os.path.dirname(rel),
+                 "type": ui_type, "download_url": download_url,
+                 "path": path}
+            ],
         }
+        # Also expose it through ComfyUI's generic output panel. Non-image
+        # files show a broken thumbnail but the panel still offers /view
+        # download; harmless if this frontend ignores unknown extensions.
+        if download_url:
+            ui["images"] = [{"filename": name,
+                             "subfolder": os.path.dirname(rel),
+                             "type": "output"}]
+        report = "\n".join(ui["text"])
+        logging.info("%s", report)
+        return {"ui": ui, "result": (path,)}
 
 
 class H3ExactAdaLNLoad:
-    """Load a shared table like Load Image: upload button + file dropdown."""
+    """Load a shared table by name / path (free text, no dropdown cache).
+
+    A COMBO + `image_upload` widget cannot work here: ComfyUI only builds that
+    list once at startup (so a table saved later never appears), and the upload
+    button is image-only (so .safetensors cannot be selected). The table is
+    already on the server anyway -- pointing at it by text is the reliable way.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
-        files = ["<none>"] + table_io.list_table_files()
         return {
             "required": {
-                "table_file": (files, {"image_upload": True, "default": files[0]}),
+                "table_name": ("STRING", {
+                    "default": "",
+                    "tooltip": "Filename, partial name (e.g. dmad8), relative "
+                               "path under input/ or output/, or an absolute "
+                               "path to a baked .safetensors table."}),
             },
             "optional": {
                 "table_path": ("STRING", {
                     "default": "",
-                    "tooltip": "Absolute path override. Useful when the file "
-                               "is outside input/ or output/."}),
+                    "tooltip": "Absolute path override; takes priority over "
+                               "table_name when set."}),
             },
         }
 
@@ -295,18 +335,21 @@ class H3ExactAdaLNLoad:
     FUNCTION = "load"
     CATEGORY = CATEGORY
 
-    def load(self, table_file="<none>", table_path=""):
-        path = str(table_path).strip()
-        if not path:
-            if not table_file or table_file == "<none>":
-                raise RuntimeError(
-                    "H3ExactAdaLNLoad: pick a table file (or upload one with the "
-                    "upload button, or fill `table_path`). Uploaded files land in "
-                    "ComfyUI/input/ and appear in the dropdown after a refresh.")
-            path = table_io.find_table_file(table_file)
+    def load(self, table_name="", table_path=""):
+        query = str(table_path).strip() or str(table_name).strip()
+        if not query:
+            raise RuntimeError(
+                "H3ExactAdaLNLoad: enter a table filename (or part of it) in "
+                "`table_name`, or an absolute path in `table_path`.\n"
+                + table_io.describe_available())
+        if os.path.isabs(query):
+            path = query if os.path.isfile(query) else None
+        else:
+            path = table_io.find_table_file(query)
         if not path or not os.path.isfile(path):
-            raise RuntimeError("H3ExactAdaLNLoad: table file not found: {!r}".format(
-                table_file or table_path))
+            raise RuntimeError(
+                "H3ExactAdaLNLoad: cannot resolve {!r} to a table file.\n{}".format(
+                    query, table_io.describe_available()))
 
         table = table_io.read_table_file(path)
         report = "\n".join([

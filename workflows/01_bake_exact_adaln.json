@@ -372,7 +372,7 @@
       "mode": 0,
       "properties": {},
       "widgets_values": [
-        "烘焙 + 保存\n1. 这里必须加载完整（未剪枝）模型，量化格式与验证用的剪枝模型一致。\n2. LoRA = dmad_minimax_h3_8step_full_critic_comfyui.safetensors，强度 1.0。\n   该 LoRA 元数据：8 步 / video shift 12 / audio shift 2 / no CFG。\n3. shift 节点必须与验证工作流一致（audio shift 是 2，不是默认 3）。\n4. Bake 只产出内存中的表对象；Save 才写盘，和 Save Image 一样自动编号，\n   默认落在 ComfyUI/output/h3_adaln/<prefix>_00001.safetensors。\n5. 把那个 .safetensors 拷给别人即可分享：文件头里已含 teacher、LoRA 指纹、\n   sigmas、shift、dtype、ComfyUI 版本，不需要任何附属文件。\n6. Save 的 location 也可选 models/h3_exact_adaln，方便集中管理。\n7. 改 LoRA / 强度 / 步数 / sigmas / shift 都必须重新烘焙并另存。\n8. strict 报「table has no rows for t=...」时，把列出的 t 填进 extra_t 重烘焙。"
+        "烘焙 + 保存\n1. 这里必须加载完整（未剪枝）模型，量化格式与验证用的剪枝模型一致。\n2. LoRA = dmad_minimax_h3_8step_full_critic_comfyui.safetensors，强度 1.0。\n   该 LoRA 元数据：8 步 / video shift 12 / audio shift 2 / no CFG。\n3. shift 节点必须与验证工作流一致（audio shift 是 2，不是默认 3）。\n4. Bake 只产出内存中的表对象；Save 才写盘，和 Save Image 一样自动编号，\n   默认落在 ComfyUI/output/h3_adaln/<prefix>_00001.safetensors，\n   并镜像一份到 input/（Load 和文件浏览器都能直接看到）。\n5. Save 报告里会打印 /view?... 下载直链，粘到浏览器即可下载；\n   同时会登记到 ComfyUI 输出面板，不必进文件夹翻。\n6. 把那个 .safetensors 拷给别人即可分享：文件头里已含 teacher、LoRA 指纹、\n   sigmas、shift、dtype、ComfyUI 版本，不需要任何附属文件。\n7. Save 的 location 也可选 models/h3_exact_adaln，方便集中管理。\n7. 改 LoRA / 强度 / 步数 / sigmas / shift 都必须重新烘焙并另存。\n8. strict 报「table has no rows for t=...」时，把列出的 t 填进 extra_t 重烘焙。"
       ],
       "inputs": [],
       "outputs": [],
@@ -384,7 +384,7 @@
       "type": "Note",
       "pos": [
         960,
-        440
+        460
       ],
       "size": [
         430,
@@ -395,7 +395,7 @@
       "mode": 0,
       "properties": {},
       "widgets_values": [
-        "分享流程\nSave -> output/h3_adaln/*.safetensors -> 复制/发送\n-> 对方放进 ComfyUI/input/ 或用 Load 节点的上传按钮\n-> Load 选中文件 -> 接 Apply 的 table 输入。"
+        "分享 / 下载流程\nSave -> output/h3_adaln/*.safetensors（+ input/ 镜像）\n-> 用 Save 报告里的 /view?... 直链下载，或复制发送\n-> 对方把文件放进 ComfyUI/input/，在 Load 的 table_name\n   里填文件名（支持部分匹配）或绝对路径即可\n-> Load 的 table 接 Apply 的 table 输入。\nLoad 用自由文本输入，不依赖启动时缓存的下拉列表，\n也不受图片上传控件只收图片格式的限制。"
       ],
       "inputs": [],
       "outputs": [],
