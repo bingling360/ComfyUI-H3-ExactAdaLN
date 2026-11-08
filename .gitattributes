@@ -1,0 +1,3 @@
+# Workflow JSONs are generated verbatim by tools/build_*.py on Linux.
+# Keep them LF so a clean checkout regenerates byte-for-byte identical files.
+workflows/*.json text eol=lf
