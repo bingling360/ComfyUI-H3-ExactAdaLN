@@ -498,12 +498,33 @@ conditioning / sigmas / seed。
 | 全量原生 vs 剪枝原生（都不加表） | 27.24 dB | 25.70 dB |
 | 全量原生 vs 剪枝 + 表 | 36.05 dB | 29.10 dB |
 
-表把差距拉近 6~9 dB，但仍有 ~30 dB 残差。注入本身是完美的，所以残差在
-**非 AdaLN 路径**：这份 pruned b25-49 与本仓库合成的全量 teacher 在这套
-工作流（ReferenceToVideo 条件、int8 VAE/CLIP、shift 12/3、显存换出）下
-并非逐位同源。此前 §11.1 的 05 工作流能逐位 PASS，是因为那边用
-MiniMaxH3ImageToVideo + shift 12/2 + 单模型压力更小的显存状态。
-这是模型对/精度问题，不是表能修的部分。
+表把差距拉近 6~9 dB，但仍有 ~30 dB 残差。注入本身是完美的
+（102/102 精确命中、0 回退、0 native 步），所以残差不在表的覆盖范围。
+当时推测是模型对/精度问题 —— **§11.6e 证明这个推测不对**：同一实例、
+同一对模型、换成没有 SelfLift 的 DMAD 工作流后直接逐位 PASS。
+残差来自 SelfLift 自身的高/低分辨率机制，不是模型对。
+
+### 11.6e DMAD8 步工作流（无 SelfLift）对照 → 逐位 PASS（2026-11-09）
+
+`DMAD8步-文戏专用.json`：35 节点、标准 `SamplerCustomAdvanced +
+BasicGuider`，5 个 LoRA（含 dmad8 @1.0）、simple 8 步、lcm、
+shift 12/2。同样裁成低开销采样主干（256x144 / 5 帧）并保留完整模型链
+（SageAttentionPatch → 5 LoRA → SigmaShift → ModelAttentionBackend），
+两条链共用 conditioning / noise / sigmas / seed。
+
+- 重新在全量 teacher 上录表：15 个 t 行、0 冲突、8 次 forward、bf16。
+- `record` → 切 `apply` + `table_source=last`，零改动衔接。
+- **A 链全量原生 vs B 链剪枝 + 表**：
+  `samples__part0 equal=True max_abs=0.000e+00 psnr=inf`、
+  `samples__part1 equal=True max_abs=0.000e+00 psnr=inf`，
+  **VERDICT: PASS - bitwise identical**。
+- 负对照（B 链 `mode=off`，即不加表）：30.48 dB / 29.87 dB，FAIL。
+  说明 PASS 确实是表带来的，不是两条链碰巧相同。
+
+**结论**：表与节点本身在标准采样路径上完全正确；§11.6d 的残差是
+SelfLift 特有的。已把 `H3AdaLN` 插进两份 UI 工作流（YZ 版插在
+`模型` 总线前，DMAD 版插在 `ModelAttentionBackend` 之后），
+成品在 `D:/下载/*_H3AdaLN.json`。
 
 ### 11.7 尚未做
 
