@@ -183,6 +183,26 @@ def _dm_of(model):
     return getattr(getattr(model, "model", None), "diffusion_model", None)
 
 
+def _model_compute_dtype(model, dm):
+    """Best-effort dtype the diffusion model actually runs its maths in.
+
+    Only two trustworthy sources: ComfyUI's own `manual_cast_dtype`, and the
+    model's declared dtype. Guessing from the first floating-point parameter is
+    deliberately avoided -- norms are often fp32 and would report a false
+    mismatch.
+    """
+    d = getattr(dm, "manual_cast_dtype", None)
+    if isinstance(d, torch.dtype):
+        return d
+    try:
+        d = model.model.get_dtype()
+        if isinstance(d, torch.dtype):
+            return d
+    except Exception:
+        pass
+    return None
+
+
 def _resolve_checkpoint(name):
     """Absolute path for a checkpoint name/substring/path in diffusion_models."""
     name = (name or "").strip()
@@ -236,10 +256,14 @@ def _patch_time_embedder(model, name):
     """
     path = _resolve_checkpoint(name)
     if not path:
+        if os.path.isabs(name):
+            raise RuntimeError(
+                "H3AdaLNRecord: time_embedder_from={!r} does not exist (absolute "
+                "paths are used as-is, with no search).".format(name))
         raise RuntimeError(
-            "H3AdaLNRecord: time_embedder_from={!r} was not found under "
-            "ComfyUI/models/diffusion_models (absolute paths are accepted too)."
-            .format(name))
+            "H3AdaLNRecord: time_embedder_from={!r} matches nothing in "
+            "ComfyUI/models/diffusion_models. Pass a filename, a unique "
+            "substring, or an absolute path to an existing file.".format(name))
     try:
         from safetensors import safe_open
     except Exception as e:  # pragma: no cover
@@ -926,6 +950,21 @@ class H3ExactAdaLNApply:
         # different non-AdaLN LoRA cannot invalidate a recorded table -- verified
         # bitwise (record with LoRA A, apply with LoRA B, latent diff 0). Only
         # the AdaLN / timestep patches, and an explicitly requested teacher, can.
+        model_dtype = _model_compute_dtype(model, dm)
+        table_dtype = str(table.out_dtype or "").split(".")[-1]
+        dtype_ok = None
+        if model_dtype is not None:
+            dtype_ok = str(model_dtype).split(".")[-1] == table_dtype
+            if not dtype_ok:
+                logging.warning(
+                    "H3ExactAdaLN: table out_dtype=%s but this model computes in %s; "
+                    "FinalLayer.mod picks its multiply-add precision from scale.dtype, "
+                    "so replay will not be bitwise",
+                    table_dtype, str(model_dtype).split(".")[-1])
+        teacher_note = ""
+        if teacher_ok and expected_teacher and expected_teacher != table.meta.get("teacher", ""):
+            teacher_note = " (substring match)"
+
         problems = []
         if not adaln_ok:
             problems.append("AdaLN/timestep LoRA fingerprint mismatch: "
@@ -970,8 +1009,14 @@ class H3ExactAdaLNApply:
             "adaln lora fp  : {} / {} ({})".format(
                 adaln_baked or "(none)", adaln_current or "(none)",
                 "match" if adaln_ok else "MISMATCH"),
-            "teacher        : {}".format(table.meta.get("teacher", "?")),
-            "out dtype      : {}".format(table.out_dtype),
+            "teacher        : {}{}".format(table.meta.get("teacher", "?"), teacher_note),
+            "out dtype      : {}{}".format(
+                table.out_dtype,
+                "" if dtype_ok is None
+                else ("  (model computes in {}, match)".format(str(model_dtype).split(".")[-1])
+                      if dtype_ok else
+                      "  MISMATCH: model computes in {} -- replay is NOT bitwise"
+                      .format(str(model_dtype).split(".")[-1]))),
             "t rows         : {}".format(len(table.t_values)),
             "sigmas in table: {}".format(str(table.meta.get("sigmas", "?"))[:180]),
             "warnings       : {}".format("; ".join(problems) or "none"),

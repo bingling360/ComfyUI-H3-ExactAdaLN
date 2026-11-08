@@ -414,7 +414,9 @@ cross-LoRA case above could only be run with `mode=fallback`.
   Changing any of them requires a re-record. Strength cannot be interpolated at
   runtime when a LoRA touches `time_embedder` (two SiLUs make it non-linear).
 - `out_dtype` is fixed when the table is produced and must match the teacher's
-  inference dtype. Recording a bf16 teacher and applying into a model forced to
+  inference dtype. `Apply` compares it against the target model's compute
+  dtype and prints `MISMATCH: ... replay is NOT bitwise` (plus a warning in
+  the log) instead of leaving you to notice it in the pixels. Recording a bf16 teacher and applying into a model forced to
   fp32 gives different arithmetic than the teacher used.
 - Per-row `denoise_mask` timesteps are not supported by Record (it labels rows
   by the `unique_t` the forward actually used, and per-row masks multiply that

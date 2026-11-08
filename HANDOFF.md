@@ -444,8 +444,23 @@ VERDICT: PASS - bitwise identical
 调制只由 `adaln_proj` / `time_embedder` 决定。仍然硬失败：AdaLN/时间步指纹不匹配、
 显式 `expected_teacher` 不匹配、t 集合不匹配。此前跨 LoRA 场景只能用 `mode=fallback`。
 
+### 11.6b Apply 的 dtype 与教师匹配提示（2026-11-08 晚）
+
+- Apply 现在把 `table.out_dtype` 和目标模型的计算 dtype 对比（只取
+  `manual_cast_dtype` 与 `model.get_dtype()` 两个可信来源，不用参数 dtype 猜，
+  避免 norm 的 fp32 造成假报警），不一致时报告里写
+  `MISMATCH: model computes in bf16 -- replay is NOT bitwise` 并打日志。
+  实测：把表元数据改成 `torch.float16` 后告警正常触发。
+- `expected_teacher` 仍是子串匹配，但当匹配不是完整字符串时，报告里会标
+  `(substring match)`，方便确认自己匹配到了哪张表。
+- `time_embedder_from` 传绝对路径且文件不存在时，报错改成
+  「does not exist (absolute paths are used as-is, with no search)」，
+  不再误导成「在 diffusion_models 里没找到」。
+
 ### 11.7 尚未做
 
-- b15-49 / b20-49 等其他切分的全量 teacher（`minimax-h3-other/` 里有对应的 pruned 版）。
-- `tools/build_hybrid.py` 还没把 `time_embedder_from` 写进生成的 `06_b25-49_hybrid.json`。
+- ~~b15-49 / b20-49 等其他切分的全量 teacher~~ 已出 b5/b20/b25/b30/b45，发布在 `binglingzhimeng/MiniMax-H3-b25-49-full`。
+- 只在 ComfyUI 0.42.5 / torch 2.9.1 上验过；`manual_cast_dtype` 打开时
+  object patch 是否会绕过 cast 未测，遇到异常优先怀疑这条。
+- ~~`tools/build_hybrid.py` 还没把 `time_embedder_from` 写进生成的 06~~ 已补。
 - 模型卡里已写明「与老合并表不是同一目标」及全部实测数字。
