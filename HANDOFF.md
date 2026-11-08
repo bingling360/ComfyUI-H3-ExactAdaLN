@@ -112,8 +112,8 @@ VERDICT: FAIL - outputs differ
 完整调制。精确做法是**两次 Record 再按块合并**：FL2VA full → A 表，Ref2VA full →
 B 表（同 steps/shift/分辨率/LoRA 强度），`split=25`、`final_from=a`：0-24 取 A、
 25-49 取 B、`final_layer` 取 A。每块仍是教师原生输出，逐块精确，不经过 8 维截断。
-工作流 `06_b25-49_hybrid.json`（一次运行：录 B + 合并 + 保存 B 表与 hybrid 表）和
-`07_merge_tables.json`（纯 CPU 重合并）。Merge 校验 t 集合、投影集合、`out_dtype`、
+工作流 `08_record_fl2va.json`（录基准 A 表）、`06_b25-49_hybrid.json`（一次运行：
+录 B + 合并 + 保存 B 表与 hybrid 表）和 `07_merge_tables.json`（纯 CPU 重合并）。Merge 校验 t 集合、投影集合、`out_dtype`、
 LoRA 指纹；旧版（keys-only）指纹表自动回退比较。本地 `tests/test_merge.py` 10 项全过。
 
 **实例验证（2026-11-08，0.44.0 / 4080 SUPER，b25-49 就在实例上）**：

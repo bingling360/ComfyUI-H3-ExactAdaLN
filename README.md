@@ -156,9 +156,11 @@ bitwise identical as long as the schedule, shifts and layout match.
   chains, `after`-ordered: A records while it samples, B applies the recorded
   rows, Compare must print `equal=True / max_abs=0 / VERDICT: PASS`. Set
   `Apply.mode=off` and rerun for the negative control (must FAIL).
+- `workflows/08_record_fl2va.json` — records the **FL2VA full** teacher, the
+  base half of a bX-49 hybrid. Run this once before 06.
 - `workflows/06_b25-49_hybrid.json` — **bX-49 hybrid, one run.** Records the
-  Ref2VA full teacher, merges it with an existing FL2VA table (`split=25`),
-  and saves both the donor table and the hybrid table.
+  Ref2VA full teacher, merges it with the FL2VA table (`split=25`), and saves
+  both the donor table and the hybrid table.
 - `workflows/07_merge_tables.json` — CPU-only merge of two saved tables, for
   re-combining after either side was re-recorded.
 
@@ -293,9 +295,9 @@ assembled from two records instead:
 
 Every block is still a row its teacher actually produced, so replay is exact
 per block; the merge refuses mismatched timesteps, projection sets, out dtypes
-or LoRA stacks. Workflow `06_b25-49_hybrid.json` does steps 2–3 in one run
-(the base table is a `Load`), and `07_merge_tables.json` re-merges two saved
-tables on CPU. Both teachers must be **full** checkpoints; a pruned donor has
+or LoRA stacks. `08_record_fl2va.json` does step 1, `06_b25-49_hybrid.json`
+does steps 2–3 in one run (the base table is a `Load`), and
+`07_merge_tables.json` re-merges two saved tables on CPU. Both teachers must be **full** checkpoints; a pruned donor has
 already lost the information the table needs.
 
 ## Known limits
@@ -346,7 +348,8 @@ sigma_plan.py      float32-exact t arithmetic, mirrors model.py:671-751
 table_io.py        safetensors container, live (recording) tables
 nodes.py           the seven nodes
 workflows/         01 bake, 02/03 load+apply A/B, 04 offline strict,
-                   05 record strict, 06 bX-49 hybrid, 07 merge only
+                   05 record strict, 06 bX-49 hybrid, 07 merge only,
+                   08 record FL2VA base
 tests/             test_exact.py (numbers), test_merge.py (hybrid merge),
                    test_workflows.py (graph structure)
 tools/             workflow generators (incl. build_hybrid.py) + fetch helpers

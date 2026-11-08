@@ -17,8 +17,12 @@ sys.path.insert(0, HERE)
 from build_workflows import (  # noqa: E402
     CLIP, FULL, LORA, PROMPT, TABLE_TYPE, VIDEO_VAE, Graph, templates)
 
-# Table recorded on the FL2VA full teacher by 05_record_strict.json.
-BASE_TABLE = "recorded_00001.safetensors"
+# The base half of a bX-49 hybrid comes from the FL2VA full teacher.
+FL2VA = "minimax_h3_fl2va_int8_convrot.safetensors"
+# Table recorded on the FL2VA full teacher by 08_record_fl2va.json.
+BASE_TABLE = "fl2va_dmad8_00001.safetensors"
+BASE_TAG = "fl2va full int8_convrot"
+BASE_PREFIX = "h3_adaln/fl2va_dmad8"
 DONOR_PREFIX = "h3_adaln/ref2va_dmad8"
 HYBRID_PREFIX = "h3_adaln/b25-49_hybrid"
 DONOR_TAG = "ref2va full int8_convrot"
@@ -136,6 +140,68 @@ def build_hybrid(tpl):
     return g.save("06_b25-49_hybrid.json")
 
 
+def build_record_fl2va(tpl):
+    """Record the FL2VA full teacher (the 0..split-1 half of a bX-49 hybrid)."""
+    g = Graph(tpl)
+    g.group("共享条件 · 后面的 06 会按同一调度录 Ref2VA", [20, 20, 390, 1200])
+    g.group("FL2VA 完整教师 · 记录基准表", [430, 20, 400, 1200], "#3f789e")
+
+    clip, vae, cond, noise, sampler_sel, sched = _shared(g)
+
+    unet = g.add("UNETLoader", (450, 80), [FL2VA, "default"],
+                 "A 教师：FL2VA FULL 34GB")
+    lora = g.add("LoraLoaderModelOnly", (450, 240), [LORA, 1.0],
+                 "与 06 相同的 LoRA / 强度")
+    shift = g.custom(
+        "MiniMaxH3SigmaShift", (450, 400),
+        inputs=[("model", "MODEL"), ("shift_video", "FLOAT"),
+                ("shift_audio", "FLOAT")],
+        outputs=[("MODEL", "MODEL")], widgets=[12.0, 2.0],
+        title="shift 12 / 2", size=[300, 130])
+    record = g.custom(
+        "H3AdaLNRecord", (450, 560),
+        inputs=[("model", "MODEL"), ("after", "*")],
+        outputs=[("model", "MODEL"), ("table", TABLE_TYPE), ("report", "STRING")],
+        widgets=["strict", BASE_TAG, LORA_TAG],
+        title="记录 A 表（FL2VA 原生 AdaLN）", size=[340, 220])
+    guider = g.add("BasicGuider", (450, 850))
+    samp = g.add("SamplerCustomAdvanced", (450, 990), None,
+                 "FL2VA latent（只为填表）")
+    save = g.custom(
+        "H3ExactAdaLNSave", (870, 300),
+        inputs=[("table", TABLE_TYPE), ("after", "*")],
+        outputs=[("file_path", "STRING")],
+        widgets=[BASE_PREFIX, "output"],
+        title="保存 A 表（FL2VA，06 会用）", size=[340, 190])
+
+    g.note((870, 560), (
+        "跑完 08 再跑 06。\n"
+        "• b25-49 = FL2VA 的 blocks 0-24 + Ref2VA 的 blocks 25-49。\n"
+        "• 两张表必须同 8 步 / simple / shift 12,2 / 同分辨率 /\n"
+        "  同 LoRA 强度，否则 06 的 Merge 会拒绝。\n"
+        "• 这里录到的 fl2va_dmad8_*.safetensors 就是 06 里\n"
+        "  `A 表：FL2VA full（已有）` 要 Load 的文件。\n"
+        "• 换 LoRA 或强度后，08 和 06 都要重跑。"),
+        size=(430, 260))
+
+    g.link(clip, 0, cond, 0, "CLIP")
+    g.link(vae, 0, cond, 1, "VAE")
+    g.link(cond, 0, guider, 1, "CONDITIONING")
+    g.link(cond, 1, samp, 4, "LATENT")
+    g.link(noise, 0, samp, 0, "NOISE")
+    g.link(sampler_sel, 0, samp, 2, "SAMPLER")
+    g.link(sched, 0, samp, 3, "SIGMAS")
+    g.link(unet, 0, lora, 0, "MODEL")
+    g.link(lora, 0, shift, 0, "MODEL")
+    g.link(shift, 0, record, 0, "MODEL")
+    g.link(shift, 0, sched, 0, "MODEL")
+    g.link(record, 0, guider, 0, "MODEL")
+    g.link(guider, 0, samp, 1, "GUIDER")
+    g.link(record, 1, save, 0, TABLE_TYPE)
+    g.link(samp, 0, save, 1, "LATENT")
+    return g.save("08_record_fl2va.json")
+
+
 def build_merge_only(tpl):
     g = Graph(tpl)
     g.group("纯 CPU 合并 · 两张表都已落盘时用", [20, 20, 900, 700], "#9e6b3f")
@@ -181,6 +247,7 @@ def build_merge_only(tpl):
 
 def main():
     tpl = templates()
+    build_record_fl2va(tpl)
     build_hybrid(tpl)
     build_merge_only(tpl)
 
