@@ -51,4 +51,16 @@ except Exception as _e:
     logging.getLogger(__name__).warning(
         "ComfyUI-H3-ExactAdaLN: optional latent_io nodes unavailable: %s", _e)
 
+# Optional: the unified node (experimental). Imported defensively so a failure
+# here can never take down the eight stable nodes above.
+try:
+    import logging
+    from .h3_unified import H3AdaLN, register_folder
+    register_folder()
+    NODE_CLASS_MAPPINGS["H3AdaLN"] = H3AdaLN
+    NODE_DISPLAY_NAME_MAPPINGS["H3AdaLN"] = "H3 AdaLN (record / apply / merge)"
+except Exception as _e:
+    logging.getLogger(__name__).warning(
+        "ComfyUI-H3-ExactAdaLN: unified H3AdaLN node unavailable: %s", _e)
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

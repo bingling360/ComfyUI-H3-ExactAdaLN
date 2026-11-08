@@ -1,18 +1,24 @@
 """Unified H3 AdaLN node -- one node, several modes (EXPERIMENTAL).
 
-Not wired into `__init__.py` yet: the pieces that need a live ComfyUI are still
-unverified (ON_CLEANUP timing, whether a COMBO over models/h3_exact_adaln
-refreshes without a restart, multi-pass behaviour). Design:
-`docs/unified-node.md`.
+Design: `docs/unified-node.md`. Registered from `__init__.py` behind a
+try/except so a failure here cannot take down the eight stable nodes. The parts
+that need a live ComfyUI (ON_CLEANUP timing, COMBO refresh, multi-pass) are
+still unverified -- see the checklist in the design note.
 
 Everything here composes the existing engines instead of reimplementing them:
 `H3AdaLNRecord` / `H3ExactAdaLNLoad` / `H3AdaLNMerge` / `H3ExactAdaLNApply`.
+
+Tables live in `models/h3_exact_adaln/` and keep the `.safetensors` extension so
+the existing Load / Merge nodes and every external tool can still read them; the
+folder is what marks them as tables.
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
+import time
 
 import torch
 
@@ -23,20 +29,25 @@ except ImportError:  # direct-file loading
     import nodes as _nodes
     import table_io
 
-TABLE_EXT = ".h3adaln"
 FOLDER_KEY = "h3_exact_adaln"
+TABLE_TYPE = _nodes.TABLE_TYPE
+TABLE_EXT = ".safetensors"
+LAST_POINTER = "_last_table.json"
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- folder
 def register_folder():
-    """Make `models/h3_exact_adaln/` visible to ComfyUI's folder machinery.
-
-    Called from `__init__.py` once. Creates the directory so a fresh install has
-    somewhere to save into.
-    """
+    """Called once from `__init__.py`: make models/h3_exact_adaln a model folder."""
     import folder_paths
-    base = os.path.join(folder_paths.models_dir, FOLDER_KEY)
+    models_dir = getattr(folder_paths, "models_dir", None)
+    if not models_dir:  # older builds
+        try:
+            models_dir = os.path.dirname(
+                folder_paths.get_folder_paths("diffusion_models")[0])
+        except Exception:
+            models_dir = os.path.join(os.path.dirname(__file__), "models")
+    base = os.path.join(models_dir, FOLDER_KEY)
     try:
         os.makedirs(base, exist_ok=True)
     except OSError as e:
@@ -46,44 +57,69 @@ def register_folder():
 
 
 def table_folder():
-    import folder_paths
-    paths = folder_paths.get_folder_paths(FOLDER_KEY)
-    return paths[0] if paths else os.path.join(folder_paths.models_dir, FOLDER_KEY)
+    """Where tables are written; the same place table_io searches for Load."""
+    try:
+        return table_io.table_dir()
+    except Exception:
+        import folder_paths
+        return os.path.join(folder_paths.models_dir, FOLDER_KEY)
 
 
 def table_choices():
-    """Names shown in the dropdown; falls back to a single empty entry."""
+    """Dropdown contents: the table folder first, plus anything Load can see."""
+    names = []
     try:
-        import folder_paths
-        names = folder_paths.get_filename_list(FOLDER_KEY)
+        folder = table_folder()
+        if os.path.isdir(folder):
+            names = sorted(f for f in os.listdir(folder)
+                           if f.lower().endswith(TABLE_EXT) and not f.startswith("_"))
     except Exception:
-        return [""]
-    return [n for n in names if n.endswith(TABLE_EXT)] or [""]
+        names = []
+    if not names:
+        try:
+            names = [n for n in table_io.list_table_files()
+                     if n.lower().endswith(TABLE_EXT)]
+        except Exception:
+            names = []
+    return names or [""]
 
 
+# ---------------------------------------------------------------- naming
 def _tag(value, limit=32):
     text = _SAFE.sub("-", str(value or "").strip()).strip("-._")
     return text[:limit].rstrip("-._") or "unknown"
 
 
-def build_name(model_tag, lora_tag, scheduler, steps, shift_v, shift_a, fp6):
-    """`{model}__{lora}__{scheduler}{steps}__sh{sv}-{sa}__{fp6}.h3adaln`
+def build_name(model_tag, lora_tag, scheduler, steps, shift_v, shift_a, fp6,
+               pass_tag=""):
+    """`model__lora__[pass__]scheduler+steps__sh{sv}-{sa}__{fp6}.safetensors`
 
-    Deliberately no t-row count: re-recording the same configuration should
-    overwrite the previous table, not pile up `__t7` / `__t15` siblings.
+    One glance tells you which checkpoint, which LoRA, which scheduler/steps and
+    which shift pair produced the table.
+
+    No t-row count in the name on purpose: re-recording the same configuration
+    overwrites, instead of piling up `__t7` / `__t15` siblings. The row count
+    goes into the metadata and into the node report.
     """
-    return "{}__{}__{}{}__sh{}-{}__{}{}".format(
-        _tag(model_tag), _tag(lora_tag),
-        _tag(scheduler, 16) if str(scheduler or "").strip() else "nosched",
-        int(steps), ("%g" % float(shift_v)), ("%g" % float(shift_a)),
-        (fp6 or "nofp"), TABLE_EXT)
+    parts = [_tag(model_tag), _tag(lora_tag)]
+    if str(pass_tag or "").strip():
+        parts.append(_tag(pass_tag, 16))
+    parts += [
+        "{}{}".format(_tag(scheduler, 16) if str(scheduler or "").strip() else "nosched",
+                      int(steps)),
+        "sh{}-{}".format("%g" % float(shift_v), "%g" % float(shift_a)),
+        fp6 or "nofp",
+    ]
+    return "__".join(parts) + TABLE_EXT
 
 
+# ---------------------------------------------------------------- identity
 def model_fingerprint(dm):
     """Cheap identity for "which AdaLN weights are these".
 
-    Shapes alone are not enough (fl2va full and ref2va full share them), so the
-    first bytes of the first three block projections go in. Cached on the module.
+    Shapes alone are not enough -- fl2va full and ref2va full share them -- so
+    the first bytes of the first three block projections are hashed in. Cached
+    on the module; costs a few milliseconds.
     """
     cached = getattr(dm, "_h3_model_fp", None)
     if cached:
@@ -103,8 +139,8 @@ def model_fingerprint(dm):
         except Exception:
             h.update(b"?")
     final = getattr(getattr(dm, "final_layer", None), "adaln_proj", None)
-    out = getattr(getattr(final, "linear", None), "out_features", 0)
-    h.update(("final_out=%s" % out).encode())
+    h.update(("final_out=%s" % getattr(getattr(final, "linear", None),
+                                       "out_features", 0)).encode())
     fp = h.hexdigest()[:12]
     try:
         dm._h3_model_fp = fp
@@ -113,23 +149,84 @@ def model_fingerprint(dm):
     return fp
 
 
-def _resolve_name(table, table_text, label):
-    name = (table_text or "").strip() or (table or "").strip()
-    if not name:
+# ---------------------------------------------------------------- last pointer
+def _write_last(entry):
+    path = os.path.join(table_folder(), LAST_POINTER)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except OSError as e:
+        logging.warning("H3AdaLN: cannot write %s (%s)", path, e)
+
+
+def _read_last():
+    path = os.path.join(table_folder(), LAST_POINTER)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------- helpers
+def _load(name):
+    res = _nodes.H3ExactAdaLNLoad().load(name)
+    return res["result"][0]
+
+
+def _resolvable(name):
+    """True when `name` points at a table Load can actually open."""
+    try:
+        return bool(name) and bool(table_io.find_table_file(name))
+    except Exception:
+        return False
+
+
+def _pick_table(table, table_text, source, label):
+    """Resolve the table for apply/hybrid.
+
+    `auto` exists for the record -> apply hand-off: right after recording, the
+    dropdown usually still shows the previous list, and retyping the generated
+    name is exactly the friction the unified node is meant to remove.
+    """
+    text = (table_text or "").strip()
+    picked = (table or "").strip()
+    last = (_read_last() or {}).get("name", "")
+
+    if text:
+        if not _resolvable(text):
+            raise RuntimeError(
+                "H3AdaLN: table_text={!r} does not resolve to a table file.\n{}"
+                .format(text, table_io.describe_available()))
+        return text, "typed"
+
+    if source == "last":
+        if not _resolvable(last):
+            raise RuntimeError(
+                "H3AdaLN: table_source=last, but no table has been recorded yet "
+                "(no usable {} in {}).".format(LAST_POINTER, table_folder()))
+        return last, "last recorded"
+
+    if source == "auto":
+        if _resolvable(picked):
+            return picked, "dropdown"
+        if _resolvable(last):
+            return last, "last recorded (dropdown entry not on disk yet)"
         raise RuntimeError(
-            "H3AdaLN: mode needs a table, but none was picked (%s). Put a "
-            "%s file in models/%s/ or type its name into table_text."
-            % (label, TABLE_EXT, FOLDER_KEY))
-    return name
+            "H3AdaLN: no usable table for {}. Picked {!r}, last recorded {!r}.\n{}"
+            .format(label, picked, last, table_io.describe_available()))
+
+    if not _resolvable(picked):
+        raise RuntimeError(
+            "H3AdaLN: {} = {!r} does not resolve to a table file.\n{}"
+            .format(label, picked, table_io.describe_available()))
+    return picked, "dropdown"
 
 
-def _load_table(name):
-    table, info = _nodes.H3ExactAdaLNLoad().load(name)
-    return table, info
-
-
-def _save_named(table, name):
-    """Write to models/h3_exact_adaln/<name>, overwriting the same config."""
+def _save_table(table, name):
     folder = table_folder()
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, name)
@@ -139,26 +236,27 @@ def _save_named(table, name):
 
 
 def _check_model(table, dm, strict):
-    """Refuse a table recorded on a different AdaLN branch."""
     want = table.meta.get("model_fingerprint", "")
     if not want:
-        return ""            # table predates fingerprints
+        return "model fp     : (table has none; recorded before fingerprints existed)"
     got = model_fingerprint(dm)
     if want == got:
         return "model fp     : {} (match)".format(got)
-    msg = ("table was recorded on a different AdaLN branch (table={} model={}); "
-           "re-record on this model".format(want, got))
+    msg = ("table was recorded on a different AdaLN branch (table={} model={}) -- "
+           "the rows belong to another checkpoint".format(want, got))
     if strict:
-        raise RuntimeError("H3AdaLN: " + msg)
+        raise RuntimeError("H3AdaLN: " + msg + ". Re-record on this model.")
     logging.warning("H3AdaLN: %s", msg)
-    return "model fp     : {} / {} MISMATCH".format(want, got)
+    return "model fp     : {} / {} MISMATCH (continuing, strictness=fallback)".format(
+        want, got)
 
 
 # ---------------------------------------------------------------- node
 class H3AdaLN:
-    """Record, apply, or merge AdaLN tables -- one node, pick a mode."""
+    """Record, apply or merge AdaLN tables -- one node, pick a mode."""
 
     MODES = ["apply", "record", "hybrid", "merge", "off"]
+    SOURCES = ["auto", "dropdown", "last"]
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -169,65 +267,77 @@ class H3AdaLN:
                 "mode": (cls.MODES, {"default": "apply"}),
             },
             "optional": {
-                "table": (choices, {"default": choices[0]}),
-                "table_b": (choices, {"default": choices[0]}),
+                "table": (choices, {"default": choices[0],
+                        "tooltip": "Table for apply/hybrid/merge."}),
+                "table_b": (choices, {"default": choices[0],
+                        "tooltip": "Tail donor for hybrid/merge."}),
+                "table_source": (cls.SOURCES, {"default": "auto",
+                        "tooltip": "auto: use the dropdown entry, else fall back "
+                                   "to the table recorded most recently -- so "
+                                   "record -> apply needs no retyping even when "
+                                   "the dropdown has not refreshed."}),
                 "table_text": ("STRING", {"default": "",
-                        "tooltip": "Overrides the dropdown: filename, unique "
-                                   "substring or absolute path. Use this if the "
-                                   "dropdown does not refresh after saving."}),
+                        "tooltip": "Overrides everything: filename, unique "
+                                   "substring, or absolute path."}),
                 "table_b_text": ("STRING", {"default": ""}),
                 "split": ("INT", {"default": 25, "min": 0, "max": 50}),
                 "final_from": (["a", "b"], {"default": "a"}),
                 "strictness": (["strict", "fallback"], {"default": "strict"}),
                 "record_name": ("STRING", {"default": "",
                         "tooltip": "Leave empty to auto-name from the tags. "
-                                   "Same configuration overwrites."}),
+                                   "The same configuration overwrites."}),
                 "model_tag": ("STRING", {"default": "",
                         "tooltip": "Goes into the table name, e.g. b25-49full-int8."}),
                 "lora_tag": ("STRING", {"default": "",
                         "tooltip": "Goes into the table name, e.g. dmad8x1.0."}),
+                "pass_tag": ("STRING", {"default": "",
+                        "tooltip": "Only needed when one workflow records two "
+                                   "models (second pass, high/low): give each "
+                                   "node its own tag, e.g. p1 / p2 / high / low."}),
                 "scheduler_tag": ("STRING", {"default": "",
-                        "tooltip": "Goes into the table name; steps and shifts "
-                                   "are measured, the scheduler name is not "
-                                   "visible to a model-side node."}),
-                "table_in": (table_io.TABLE_TYPE, {"tooltip":
+                        "tooltip": "Free-form; the scheduler name is not visible "
+                                   "to a model-side node. Steps and shifts are "
+                                   "measured, not typed."}),
+                "table_in": (TABLE_TYPE, {"tooltip":
                         "Optional. Connect a table produced earlier in the SAME "
-                        "prompt (A/B verification); otherwise the dropdown wins."}),
+                        "prompt (A/B verification); otherwise the picker wins."}),
             },
         }
 
-    RETURN_TYPES = ("MODEL", table_io.TABLE_TYPE, "STRING")
-    RETURN_NAMES = ("model", "table", "report")
+    RETURN_TYPES = ("MODEL", TABLE_TYPE, "STRING", "STRING")
+    RETURN_NAMES = ("model", "table", "table_name", "report")
     FUNCTION = "run"
     CATEGORY = _nodes.CATEGORY
 
     # -- main ---------------------------------------------------------
-    def run(self, model, mode, table="", table_b="", table_text="", table_b_text="",
-            split=25, final_from="a", strictness="strict", record_name="",
-            model_tag="", lora_tag="", scheduler_tag="", table_in=None):
+    def run(self, model, mode, table="", table_b="", table_source="auto",
+            table_text="", table_b_text="", split=25, final_from="a",
+            strictness="strict", record_name="", model_tag="", lora_tag="",
+            pass_tag="", scheduler_tag="", table_in=None):
         mode = (mode or "apply").lower()
         if mode == "off":
             _nodes._clear_registered(model, "_h3_exact_runtimes")
-            return (model, table_in, "H3AdaLN: mode=off, model untouched")
+            return (model, table_in, "", "H3AdaLN: mode=off, model untouched")
         if mode == "record":
-            return self._record(model, strictness, record_name, model_tag, lora_tag,
-                                scheduler_tag)
+            return self._record(model, strictness, record_name, model_tag,
+                                lora_tag, pass_tag, scheduler_tag)
         if mode == "apply":
-            return self._apply(model, table, table_text, strictness, table_in)
+            return self._apply(model, table, table_text, table_source,
+                               strictness, table_in)
         if mode in ("hybrid", "merge"):
-            return self._hybrid(model, mode, table, table_b, table_text, table_b_text,
-                                split, final_from, strictness, record_name,
-                                model_tag, lora_tag, scheduler_tag)
+            return self._hybrid(model, mode, table, table_b, table_text,
+                                table_b_text, split, final_from, strictness,
+                                record_name, model_tag, lora_tag, pass_tag,
+                                scheduler_tag)
         raise RuntimeError("H3AdaLN: unknown mode %r" % mode)
 
-    # -- modes --------------------------------------------------------
-    def _record(self, model, strictness, record_name, model_tag, lora_tag, scheduler_tag):
+    # -- record -------------------------------------------------------
+    def _record(self, model, strictness, record_name, model_tag, lora_tag,
+                pass_tag, scheduler_tag):
         dm = _nodes._dm_of(model)
         if dm is None:
             raise RuntimeError("H3AdaLN: expected a MiniMax-H3 MODEL")
-
-        # Clear any previous pending save so a re-run starts clean.
-        for attr in ("_h3_pending_table", "_h3_pending_name", "_h3_saved"):
+        for attr in ("_h3_pending_table", "_h3_pending_tags", "_h3_saved"):
             if hasattr(model, attr):
                 try:
                     delattr(model, attr)
@@ -235,11 +345,14 @@ class H3AdaLN:
                     pass
 
         model, tbl, rep = _nodes.H3AdaLNRecord().run(
-            model, mode="strict" if strictness == "strict" else "lenient",
+            model,
+            mode="strict" if strictness == "strict" else "lenient",
             teacher_tag=model_tag, lora_tag=lora_tag)
 
         model._h3_pending_table = tbl
-        model._h3_pending_tags = (model_tag, lora_tag, scheduler_tag, record_name)
+        model._h3_pending_tags = dict(
+            model_tag=model_tag, lora_tag=lora_tag, pass_tag=pass_tag,
+            scheduler_tag=scheduler_tag, record_name=record_name)
         model._h3_rec_dm = dm
         model._h3_saved = False
         try:
@@ -248,64 +361,87 @@ class H3AdaLN:
                                lambda *a, **k: _finish_record(model))
         except Exception as e:
             logging.warning("H3AdaLN: cannot hook save-on-cleanup (%s: %s); the "
-                            "table will only exist in memory", type(e).__name__, e)
+                            "table will exist in memory only", type(e).__name__, e)
 
-        return (model, tbl, "\n".join([
+        preview = build_name(model_tag or "model", lora_tag or "none",
+                             scheduler_tag, 1, 12, 2, "<lora fp>", pass_tag)
+        return (model, tbl, "", "\n".join([
             rep,
             "",
             "=== H3AdaLN (record) ===",
-            "the table is written to models/%s/ when the prompt finishes" % FOLDER_KEY,
-            "name pattern     : {model}__{lora}__{scheduler}{steps}__sh{sv}-{sa}__{fp6}"
-            + TABLE_EXT,
-            "tags so far      : model=%r lora=%r scheduler=%r"
-            % (model_tag, lora_tag, scheduler_tag),
+            "saved at end of prompt -> models/{}/".format(FOLDER_KEY),
+            "name pattern : {}".format(preview),
+            "tags         : model={!r} lora={!r} pass={!r} scheduler={!r}".format(
+                model_tag, lora_tag, pass_tag, scheduler_tag),
+            "",
+            "Switch this node to mode=apply afterwards: table_source=auto picks",
+            "the table that was just recorded even if the dropdown has not",
+            "refreshed. No retyping, no extra nodes.",
         ]))
 
-    def _apply(self, model, table, table_text, strictness, table_in):
+    # -- apply --------------------------------------------------------
+    def _apply(self, model, table, table_text, table_source, strictness, table_in):
         dm = _nodes._dm_of(model)
         if table_in is not None:
-            tbl, src = table_in, "connected input"
+            tbl, src = table_in, "connected table_in"
         else:
-            tbl, src = _load_table(_resolve_name(table, table_text, "apply"))
+            name, why = _pick_table(table, table_text, table_source, "table")
+            tbl = _load(name)
+            src = "{} ({})".format(name, why)
         note = _check_model(tbl, dm, strictness == "strict")
         model, rep = _nodes.H3ExactAdaLNApply().run(
             model, tbl, "strict" if strictness == "strict" else "fallback")
-        return (model, tbl, "\n".join([
+        return (model, tbl, tbl.source or "", "\n".join([
             "=== H3AdaLN (apply) ===",
-            "table        : {} ({})".format(src, tbl.source or "(memory)"),
+            "table        : {}".format(src),
             note,
             rep,
         ]))
 
+    # -- hybrid / merge -----------------------------------------------
     def _hybrid(self, model, mode, table, table_b, table_text, table_b_text,
                 split, final_from, strictness, record_name, model_tag, lora_tag,
-                scheduler_tag):
-        a, _ia = _load_table(_resolve_name(table, table_text, "table A"))
-        b, _ib = _load_table(_resolve_name(table_b, table_b_text, "table B"))
-        merged, rep = _nodes.H3AdaLNMerge().run(a, b, split=split, final_from=final_from)
+                pass_tag, scheduler_tag):
+        name_a, why_a = _pick_table(table, table_text, "auto", "table A")
+        name_b, why_b = _pick_table(table_b, table_b_text, "auto", "table B")
+        a, b = _load(name_a), _load(name_b)
+        merged, rep = _nodes.H3AdaLNMerge().run(a, b, split=split,
+                                                final_from=final_from)
 
-        dm = _nodes._dm_of(model)
+        rows = len(merged.t_values)
         name = (record_name or "").strip()
         if not name:
-            rows = len(merged.t_values)
-            name = build_name(model_tag or "hybrid", lora_tag or "split%d" % split,
-                              scheduler_tag, max(rows - 1, 1),
-                              merged.meta.get("shift_v", 0), merged.meta.get("shift_a", 0),
-                              merged.meta.get("lora_fingerprint", "")[:6] or "merged")
-        path = _save_named(merged, name if name.endswith(TABLE_EXT) else name + TABLE_EXT)
+            name = build_name(model_tag or "hybrid",
+                              lora_tag or "split%d" % int(split), scheduler_tag,
+                              max(rows - 1, 1), merged.meta.get("shift_v", 0),
+                              merged.meta.get("shift_a", 0),
+                              (merged.meta.get("lora_fingerprint", "") or "")[:6],
+                              pass_tag)
+        if not name.lower().endswith(TABLE_EXT):
+            name += TABLE_EXT
+        merged.meta["model_tag"] = model_tag
+        merged.meta["pass_tag"] = pass_tag
+        merged.meta["t_rows"] = str(rows)
+        path = _save_table(merged, name)
+        _write_last({"name": name, "path": path, "created": time.time(),
+                     "mode": mode, "split": int(split)})
 
-        out = ["=== H3AdaLN (hybrid) ===", rep, "saved        : " + path]
+        out = ["=== H3AdaLN ({}) ===".format(mode),
+               "table A      : {} ({})".format(name_a, why_a),
+               "table B      : {} ({})".format(name_b, why_b),
+               rep,
+               "saved        : {}".format(path)]
         if mode == "hybrid":
-            note = _check_model(merged, dm, strictness == "strict")
+            note = _check_model(merged, _nodes._dm_of(model), strictness == "strict")
             model, arep = _nodes.H3ExactAdaLNApply().run(
                 model, merged, "strict" if strictness == "strict" else "fallback")
             out += [note, arep]
-        return (model, merged, "\n".join(x for x in out if x))
+        return (model, merged, name, "\n".join(x for x in out if x))
 
 
 # ---------------------------------------------------------------- save hook
 def _finish_record(model):
-    """ON_CLEANUP: write the recorded table with a name derived from the run."""
+    """ON_CLEANUP: write the recorded table under a name derived from the run."""
     tbl = getattr(model, "_h3_pending_table", None)
     if tbl is None or getattr(model, "_h3_saved", False):
         return
@@ -314,35 +450,46 @@ def _finish_record(model):
     except Exception as e:
         logging.error("H3AdaLN: nothing saved -- %s", e)
         return
+
     conflicts = int(tbl.meta.get("repeat_conflicts", "0") or 0)
     if conflicts:
         logging.error(
-            "H3AdaLN: refusing to save, %d timestep(s) produced different "
-            "modulation in the same run (max delta %s). This means the AdaLN "
-            "branch changed mid-run -- record again with one model + one LoRA.",
+            "H3AdaLN: refusing to save. %d timestep(s) produced different "
+            "modulation in the same run (max delta %s), so the AdaLN branch "
+            "changed mid-run -- record again with one model and one LoRA stack.",
             conflicts, tbl.meta.get("max_repeat_delta", "?"))
         return
-    model_tag, lora_tag, scheduler_tag, record_name = getattr(
-        model, "_h3_pending_tags", ("", "", "", ""))
+
+    tags = getattr(model, "_h3_pending_tags", {}) or {}
     dm = getattr(model, "_h3_rec_dm", None)
-    if record_name.strip():
-        name = record_name.strip()
-    else:
-        rows = len(tbl.t_values)
-        name = build_name(model_tag or "model", lora_tag or "none", scheduler_tag,
-                          max(rows - 1, 1), tbl.meta.get("shift_v", 0),
-                          tbl.meta.get("shift_a", 0),
-                          (tbl.meta.get("lora_fingerprint", "") or "nofp")[:6])
-    if not name.endswith(TABLE_EXT):
+    rows = len(tbl.t_values)
+    name = (tags.get("record_name") or "").strip()
+    if not name:
+        name = build_name(tags.get("model_tag") or "model",
+                          tags.get("lora_tag") or "none",
+                          tags.get("scheduler_tag"), max(rows - 1, 1),
+                          tbl.meta.get("shift_v", 0), tbl.meta.get("shift_a", 0),
+                          (tbl.meta.get("lora_fingerprint", "") or "")[:6],
+                          tags.get("pass_tag") or "")
+    if not name.lower().endswith(TABLE_EXT):
         name += TABLE_EXT
+
     if dm is not None:
         tbl.meta["model_fingerprint"] = model_fingerprint(dm)
-    tbl.meta["model_tag"] = model_tag
-    tbl.meta["lora_tag"] = lora_tag
-    tbl.meta["t_rows"] = str(len(tbl.t_values))
+    tbl.meta["model_tag"] = tags.get("model_tag", "")
+    tbl.meta["lora_tag"] = tags.get("lora_tag", "")
+    tbl.meta["pass_tag"] = tags.get("pass_tag", "")
+    tbl.meta["scheduler_tag"] = tags.get("scheduler_tag", "")
+    tbl.meta["t_rows"] = str(rows)
+    tbl.meta["created"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+
     try:
-        path = _save_named(tbl, name)
-        model._h3_saved = True
-        logging.info("H3AdaLN: saved %s (%d t rows)", path, len(tbl.t_values))
+        path = _save_table(tbl, name)
     except Exception as e:
         logging.error("H3AdaLN: save failed -- %s: %s", type(e).__name__, e)
+        return
+    model._h3_saved = True
+    _write_last({"name": name, "path": path, "created": time.time(),
+                 "t_rows": rows, "tags": tags})
+    logging.info("H3AdaLN: saved %s (%d t rows, %.0f MiB)", path, rows,
+                 os.path.getsize(path) / (1 << 20))

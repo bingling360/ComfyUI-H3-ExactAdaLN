@@ -89,9 +89,11 @@ recorder 已经在统计 `repeat_conflicts` 与 `max_repeat_delta`。
   final_from   [a | b]                           hybrid 用
   strictness   [strict | fallback]               与现有 Apply 语义一致
   table_text   STRING                            非空则覆盖下拉（应对下拉不刷新的版本）
+  table_source [auto | dropdown | last]          选表策略，auto 为默认（见 §4.1）
   record_name  STRING                            留空则自动命名
   model_tag    STRING                            record 时写进名字
   lora_tag     STRING                            record 时写进名字
+  pass_tag     STRING                            可选；一个工作流录两个模型时用来区分（见 §4.2）
   table_in     H3_ADALN_TABLE (可选)             同一次运行内做 A/B 时用
   after        * (可选)                          同上
 
@@ -111,14 +113,14 @@ recorder 已经在统计 `repeat_conflicts` 与 `max_repeat_delta`。
 ## 4. 自动命名
 
 ```
-{model}__{lora}__{scheduler}{steps}__sh{sv}-{sa}__{fp6}.h3adaln
+{model}__{lora}__{scheduler}{steps}__sh{sv}-{sa}__{fp6}.safetensors
 ```
 
 例：
 
 ```
-b25-49full-int8__dmad8x1.0__simple8__sh12-2__001c09.h3adaln
-fl2va-full-int8__none__euler20__sh12-2__e3a71b.h3adaln
+b25-49full-int8__dmad8x1.0__simple8__sh12-2__001c09.safetensors
+fl2va-full-int8__none__euler20__sh12-2__e3a71b.safetensors
 ```
 
 - 每段只保留 `[A-Za-z0-9._-]`，超长截断到 32 字符；
@@ -136,13 +138,47 @@ fl2va-full-int8__none__euler20__sh12-2__e3a71b.h3adaln
 下拉栏里的显示用 `folder_paths` 的 COMBO；为兼容「COMBO 只在启动时构建」的版本，
 额外保留 `table_text` 文本框，非空即覆盖。
 
+## 4.1 记录→推理的无缝衔接（table_source）
+
+麻烦点：刚录完就想把同一个节点切成 `apply` 用，但下拉栏可能还没刷新（ComfyUI 的
+COMBO 有的版本只在启动时构建），手打名字又违背「简单」的初衷。
+
+做法：**录完立刻把名字写进一个指针文件**，apply 时按策略解析。
+
+- 保存成功后写 `models/h3_exact_adaln/_last_table.json`：
+  `{"name": ..., "path": ..., "created": ..., "t_rows": ..., "tags": {...}}`，
+  原子替换写（`os.replace`），不会读到半个文件。
+- `table_source` 三档：
+  - `auto`（默认）：下拉项能解析就用它；解析不了就退回 `_last_table.json`；
+    两者都不可用才报错，并把候选列出来。
+  - `dropdown`：只认下拉项，旧行为，适合固定引用某张表。
+  - `last`：只认最近一次录制，适合「边调边用」。
+- `table_text` 始终最高优先级，用来兜底/指定绝对路径。
+
+实测（本地单测）：下拉项指向已删除的文件时，`auto` 会落到最近录制并说明原因；
+`dropdown` 则直接报错。这样「录完切模式就能跑」不需要任何额外操作。
+
+## 4.2 一个工作流里两个模型（二采 / 高低模）
+
+节点挂在哪个 MODEL 上，就只会看到流过那个 MODEL 的 forward——hook 是挂在
+`adaln_proj` 模块上的，天然不串台。所以二采换模型时：
+
+- 两个节点，各自挂各自的模型接口；
+- 各自填一个 `pass_tag`（如 `p1` / `p2`、`high` / `low`），它会进文件名和元数据，
+  两张表不会撞名；
+- apply 侧用 `model_fingerprint` 兜底：拿错表会直接报错，而不是悄悄出图。
+
+这个判定**不做自动推断**，全靠节点上的 `pass_tag`。同一模型的分段采样不需要
+tag：一张表覆盖两段 t 并集即可（§2.1）。
+
 ## 5. 保存时机：为什么不需要 `after`
 
 现在要 `after` 是因为「节点执行时表还是空的」。统一节点换一个思路：
 
 - 在 `record` 模式里注册 `CallbacksMP.ON_CLEANUP`，prompt 结束时统一落盘；
 - 落盘前做三件事：`rows > 0`、`repeat_conflicts` 为 0、名字确定；
-- 每个 prompt 只存一次（`_h3_saved` 标志），避免模型因显存被换出时重复写。
+- 每个 prompt 只存一次（`_h3_saved` 标志），避免模型因显存被换出时重复写；
+- 存盘成功后写 `_last_table.json`，供 §4.1 的 `auto` 使用。
 
 失败时**不要**静默：在 report 里写明「未保存：rows=0 / 存在冲突」。
 同一 prompt 内要 A/B（一边录一边用），再连 `table_in`——那是唯一需要连线的场景。
@@ -179,6 +215,16 @@ fl2va-full-int8__none__euler20__sh12-2__e3a71b.h3adaln
 5. SelfLift 的图：hooks 是否触发、t 是否可复现、冲突计数是否为 0；
 6. SequenceForge 的导演台图：同一模型被多处调用时，表是否仍逐位一致；
 7. 模型指纹：fl2va full 与 ref2va full 必须不同指纹。
+
+## 8.1 本轮新增、需要一起验的两条
+
+- **记录→推理无缝衔接**：录完后不改任何参数、只把 `mode` 切到 `apply`，看是否
+  自动选中刚录的那张表（`table_source=auto`，报告里会写
+  `last recorded (dropdown entry not on disk yet)`）。同时确认下拉栏是否已经
+  自己刷新了——如果刷新了，说明 COMBO 缓存不是问题，`table_text` 可以退化成
+  纯兜底。
+- **两个模型各录各的**：二采换模型时两个节点都给 `pass_tag`，确认生成的两个文件
+  名不同、且 apply 侧互相拿错表会报 `model fp` 不匹配而不是出图。
 
 ## 9. 已知不解决
 

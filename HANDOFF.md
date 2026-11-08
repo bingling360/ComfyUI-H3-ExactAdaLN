@@ -457,6 +457,21 @@ VERDICT: PASS - bitwise identical
   「does not exist (absolute paths are used as-is, with no search)」，
   不再误导成「在 diffusion_models 里没找到」。
 
+### 11.6c 统一节点 H3AdaLN（2026-11-09，实验性，已注册）
+
+一个节点五种模式：`apply / record / hybrid / merge / off`。表统一放
+`models/h3_exact_adaln/`，`record` 在 prompt 结束时（`ON_CLEANUP`）自动落盘，
+不需要 Save 节点，也不需要 `after` 连线。
+
+- **命名**：`{model}__{lora}__[pass__]{scheduler}{steps}__sh{sv}-{sa}__{fp6}.safetensors`，
+  不含 t 行数（同配置重录覆盖），行数进元数据。
+- **记录→推理无缝**：存盘后写 `_last_table.json`；`table_source=auto` 时下拉项
+  失效则自动退回最近录制，切个模式就能用。
+- **二采/高低模**：不做自动判定，两个节点各挂各的模型 + 各自的 `pass_tag`；
+  另有 `model_fingerprint` 兜底，拿错表直接报错。
+- 已知未验：`ON_CLEANUP` 时机、COMBO 是否刷新、二采与 SelfLift 的实际行为。
+  清单见 `docs/unified-node.md` §8 / §8.1。
+
 ### 11.7 尚未做
 
 - ~~b15-49 / b20-49 等其他切分的全量 teacher~~ 已出 b5/b20/b25/b30/b45，发布在 `binglingzhimeng/MiniMax-H3-b25-49-full`。
