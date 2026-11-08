@@ -1,72 +1,137 @@
-# ComfyUI-H3-ExactAdaLN 修复交接文档
+# ComfyUI-H3-ExactAdaLN 交接文档
 
-> **换机后从这三步开始**（状态截至 commit `f4065d9`，已完成 Phase 1–4）
+> **换机后从这里开始。** 本文件自包含，新对话请先完整读完再动手。
+> 所有结论都已实测或经源码核对，不要重复排查「已排除项」。
 >
-> 1. `git pull`（或 `git clone git@github.com:bingling360/ComfyUI-H3-ExactAdaLN.git`）—— 代码、5 个工作流、两个测试脚本、工作流生成器都已在仓库里，本文档即仓库根的 `HANDOFF.md`。
-> 2. 在实例上挂 `workflows/05_record_strict.json` 跑一次：`H3 Latent Compare` 必须是 `equal=True / max_abs=0 / VERDICT: PASS`。
-> 3. 把 `H3 Exact AdaLN Apply` 的 `mode` 改成 `off` 再跑：必须 `FAIL`（对照组）。
->
-> 结果与逐条落地方式见 **§7 执行结果**；本地已通过的 21 项数值/结构校验见 `tests/`。
-> 若第 2 步仍 FAIL，先看 Compare 的 `max_abs`：`0` 附近但非 0 → dtype/算术路径；`1e-2` 量级 → 表没被注入（看 Apply 报告里的 `exact matches` 与日志里的 `first injection confirmed`）。
+> 状态截至 `705a368`（2026-11-08）。`README.md` 是给用户看的用法说明，
+> 本文件是给下一个接手的开发者看的状态、流程与坑。
 
-> 本文件自包含。新对话请先完整读完，再动手。所有结论均已实测或经源码核对，不要重复排查"已排除项"。
+---
 
-## 0. 项目基本信息
+## 0. 换机速查
 
 | 项 | 值 |
 |---|---|
-| 插件仓库（本地） | `D:/Adaln/ComfyUI-H3-ExactAdaLN/`（git 仓库，远端 `git@github.com:bingling360/ComfyUI-H3-ExactAdaLN.git`，分支 `main`） |
-| 本地辅助生成器 | `D:/Adaln/tools/`（`build_workflows.py`、`build_strict.py`、`add_savelatent.py`、`cloud_fetch.sh`、`fetch_model.py`） |
-| 工作流输出目录 | `D:/Adaln/workflows/`（仓库内副本 `ComfyUI-H3-ExactAdaLN/workflows/`） |
-| ComfyUI 源码（本地，0.42.5） | `D:/ComfyUI_windows_portable/ComfyUI/` |
-| 云端 ComfyUI | 0.44.0 / PyTorch 2.9.1+cu130 / RTX 4080 SUPER 32GB，源码在实例 `/root/ComfyUI/`，插件 `/root/ComfyUI/custom_nodes/ComfyUI-H3-ExactAdaLN/` |
-| 当前 GitHub HEAD | `3e774d5` |
+| 仓库 | `https://github.com/bingling360/ComfyUI-H3-ExactAdaLN`（分支 `main`） |
+| 代码状态 | `705a368`（b25-49 支持 + FL2VA 录制工作流）；此后仅本文档有更新 |
+| 插件安装位置（实例） | `/root/ComfyUI/custom_nodes/ComfyUI-H3-ExactAdaLN/` |
+| 实例环境 | ComfyUI 0.44.0 / PyTorch 2.9.1+cu130 / Python 3.12.3 / RTX 4080 SUPER 32GB |
+| 本地开发目录 | 任意 clone 位置（本文档写作时为 `D:/Adaln/ComfyUI-H3-ExactAdaLN/`） |
+| 本地 ComfyUI（只为跑测试） | `D:/本地部署文件集合/comfyui/comfy shili/ComfyUI/ComfyUI`，版本 0.41.2，**低于插件要求的 0.42.5，且缺 `comfy_kitchen`，跑不了 `test_exact.py`** |
+| 实例 SSH | 主机/端口/密码由用户每次开机后提供，**不要写进仓库**（仓库是公开的） |
+| 部署约定 | 用户已授权可直接在实例上 `git pull` + 复制 `workflows/*.json` + 重启；未经授权时只推 GitHub |
+| 验收状态 | **已达成**：05 严格验证 PASS（bitwise）、off 对照 FAIL、b25-49 表级逐位 PASS |
 
-**用户最终目标**：在固定调度（或自定义 sigmas）下，让「剪枝版 MiniMax-H3 + 精确 AdaLN 表 + LoRA」的生成结果与「完整版 + 同一 LoRA」**逐位一致（bitwise）**，速度维持剪枝版水平；表要能 Save/Load 分享，并尽量适配 LoRA。
+**换机后的最小动作**：
 
-**用户操作约定**：只做本地开发 + 推 GitHub，不要把工作流或节点文件手动部署到云端实例；用户自己 pull / 挂工作流。
+```bash
+git clone https://github.com/bingling360/ComfyUI-H3-ExactAdaLN.git
+cd ComfyUI-H3-ExactAdaLN
+python tests/test_merge.py        # 纯 CPU，验证合并逻辑（需 torch/safetensors/numpy）
+```
+
+要跑真实模型，需要 ComfyUI 0.42.5+（实例上是 0.44.0）和「§7 模型清单」里的文件。
 
 ---
 
-## 1. 已完成的事实（不要重复验证）
+## 1. 项目目标与实现路径
 
-### 1.1 已跑通并确认的
+**目标**：在固定调度下，让「剪枝/hybrid MiniMax-H3 + 精确 AdaLN 表 + LoRA」与
+「完整 teacher + 同一 LoRA」的生成结果逐位一致（bitwise），速度维持剪枝版水平；
+表可 Save/Load 分享，并适配 LoRA。
 
-- Bake 节点能在 ComfyUI 0.44.0 上从完整模型（`QuantizedTensor` 量化权重）烘焙出表：51 个投影（`blocks.0..49` + `final_layer`）、17 个 t 行、314.5 MiB、fp32 存储。
-- Apply 节点确实在采样时注入了表：日志 `H3ExactAdaLN: first injection confirmed during sampling (blocks.0, 1 rows, indices=[0], max_dist=0.000e+00)`，8 步全程无 strict 报错。
-- `H3LatentCompare` 已支持 0.44 的 `NestedTensor`（视频+音频双流），能展开 `samples__part0/1` 出逐张量明细。
-- 严格验证工作流 `workflows/04_verify_strict.json`：同一次 prompt 内两条链共享 `RandomNoise`/`SIGMAS`/conditioning/`latent_image`，Bake 内存直连 Apply（无 Save/Load/上传），只用首发 3 个节点 + 核心节点，20 节点 27 连线，不缺节点。
+H3 有约 13B 参数（39%）在 AdaLN 分支里，其输出只依赖 timestep。剪枝版把这整条分支
+折叠成 8 维 curve 基（`adaln_t_table [1025, 8]` + 每块 `[96768, 8]` 系数）。
+8 维子空间装不下 2688 维的完整调制，所以必须**把每个 t 的最终调制值存成表**，
+运行时替换掉 AdaLN 的输出。
 
-### 1.2 已排除的差异来源（重要，别再查）
+两条产表路径：
+
+| | `H3 AdaLN Record`（精确） | `H3 Exact AdaLN Bake`（近似） |
+|---|---|---|
+| 时机 | 真实采样过程中 | 离线，不采样 |
+| 数值来源 | teacher 自己的 forward | 未 load 的 CPU 权重重算 |
+| 相对原生 | **逐位一致（构造保证）** | 否（差 1 个 bf16 ULP） |
+| 用途 | 任何要对比/发布的场景 | 便宜地探索 schedule |
+
+**结论：Record 是唯一精确路径，Bake 只用于快速探索。**
+
+---
+
+## 2. 节点清单（8 个）
+
+| 节点 | 输入 → 输出 | 说明 |
+|---|---|---|
+| `H3AdaLNRecord` | full MODEL (+LoRA) → MODEL, TABLE | 采样期只读 hook，`time_embedder` 取 t，`adaln_proj` 取原生输出 |
+| `H3ExactAdaLNBake` | full MODEL + sigmas → TABLE | 离线近似；支持 `splice` donor（plain float） |
+| `H3ExactAdaLNSave` | TABLE → 文件路径 | 像 Save Image，自动编号；镜像到 `input/` |
+| `H3ExactAdaLNLoad` | `table_name`（自由文本/子串/绝对路径）→ TABLE | 不用 COMBO（启动时缓存）也不支持上传控件 |
+| `H3AdaLNMerge` | 两张 TABLE + `split` + `final_from` → TABLE | **bX-49 专用**：0..split-1 取 A，split..49 取 B |
+| `H3ExactAdaLNApply` | pruned MODEL + TABLE → MODEL | `strict` / `fallback` / `off`；`off` 会先清理残留 hook |
+| `H3LatentCompare` | 两个 LATENT → 报告 | 支持 NestedTensor；拒绝同源输入（防假 PASS） |
+| `H3LatentSave` | LATENT → 文件 | 核心 `SaveLatent` 对 NestedTensor 会崩，必须用这个 |
+
+---
+
+## 3. 工作流清单（`workflows/`，全部由 `tools/build_*.py` 生成，不要手改）
+
+| 文件 | 用途 |
+|---|---|
+| `01_bake_exact_adaln.json` | Bake → Save（离线，仅供快速看效果） |
+| `02_verify_full_vs_pruned.json` | Load + Apply 的 A/B 验证（full vs pruned+表） |
+| `03_verify_save_latent.json` | 同 02，多两个 `H3LatentSave` 落盘交叉检查 |
+| `04_verify_strict.json` | 离线 Bake 路径的严格 A/B（**预期 FAIL，是根因证据**） |
+| `05_record_strict.json` | **Record 路径的严格验证**：A 录 + B 注入，Compare 必须 PASS |
+| `06_b25-49_hybrid.json` | 录 Ref2VA full + 与已有 FL2VA 表合并，一次运行产出 B 表与 hybrid 表 |
+| `07_merge_tables.json` | 纯 CPU 重合并（两张表都已落盘时用） |
+| `08_record_fl2va.json` | 录 FL2VA full 基准表（b25-49 的 0-24 半） |
+
+生成命令（需要 ComfyUI 的 `blueprints/Image to Video (MiniMax H3).json`，
+用 `COMFYUI_DIR` 或 `H3_BLUEPRINT` 指定）：
+
+```bash
+python tools/build_workflows.py   # 01, 02
+python tools/add_savelatent.py    # 03（从 02）
+python tools/build_strict.py      # 04
+python tools/build_record.py      # 05
+python tools/build_hybrid.py      # 06, 07, 08
+```
+
+工作流 JSON 在 `.gitattributes` 里强制 LF；在 Linux 上重生成后 `git status` 应为空。
+
+---
+
+## 4. 已验证的事实（不要重复排查）
+
+### 4.1 Record 路径已达成 bitwise
+
+实例 ComfyUI 0.44.0 / RTX 4080 SUPER，同一个 API prompt 连跑三次 `05_record_strict.json`：
+
+| 次序 | Apply `mode` | Compare | 注入日志 |
+|---|---|---|---|
+| 1 | `strict` | `PASS / max_abs=0`（90.83s） | `first injection confirmed` |
+| 2 | `off` | `FAIL`（video `3.349e+00`、audio `2.970e-01`） | **无**（残留 hook 已清） |
+| 3 | `strict`（off 之后） | `PASS / max_abs=0` | `first injection confirmed` |
+
+报告落盘 `output/h3_adaln/compare_*_145323 / 145341 / 145405.txt`。
+
+**关键**：第 2 次必须既 `FAIL` 又**没有**注入日志。若出现注入日志，说明对照组被上一次
+的 hook 污染（该问题已修：`mode=off` 现在先清理共享 `nn.Module` 上的 runtime）。
+
+### 4.2 已排除的差异来源
 
 | 排除项 | 证据 |
 |---|---|
-| 跨次运行非确定性 | 同 prompt 双链仍 FAIL；且开/关 `--disable-comfy-compiler` 两次结果**逐位相同** |
-| Comfy 编译器 / graph breaks | 加 `--disable-comfy-compiler` 后 `max_abs=3.556e+00 / mean_abs=1.449e-01 / PSNR=31.14 dB` 完全不变 |
-| 完整/剪枝模型的非 AdaLN 权重不同 | 两文件 829 个共同非 AdaLN 张量 shape/dtype 零差异；6 个 73 MiB 量化大权重（`blocks.*.mlp.fc2.weight`）完整字节 SHA256 全 SAME；norm/bias/scale/`comfy_quant` 抽样也全 SAME。权重逐字节相同 |
-| 表上传/Load/资产面板 | `H3ExactAdaLNLoad` 已改自由文本 `table_name`（文件名/子串/绝对路径），`H3ExactAdaLNSave` 已支持 NestedTensor；核心 `SaveLatent` 不兼容 H3 的 `NestedTensor`（没有 `.contiguous()`），已换掉 |
-| 核心 `SaveLatent` 崩溃 | 已定位为 NestedTensor，插件自带 `H3LatentSave` 解决 |
+| 跨次运行非确定性 | 同 prompt 双链仍 FAIL；开关 `--disable-comfy-compiler` 结果逐位相同 |
+| Comfy 编译器 / graph breaks | 加 `--disable-comfy-compiler` 后 `max_abs=3.556 / mean=0.1449 / 31.14 dB` 完全不变 |
+| 完整/剪枝模型的非 AdaLN 权重不同 | 829 个共同张量 shape/dtype 零差异；6 个 73 MiB 量化大权重 SHA256 全 SAME |
+| 表上传 / Load / 资产面板 | Load 改自由文本；Save 支持 NestedTensor；核心 `SaveLatent` 已换掉 |
+| 核心 `SaveLatent` 崩溃 | 已定位为 NestedTensor，插件自带 `H3LatentSave` |
 
-### 1.3 严格验证的当前结果（**尚未达成目标**）
+### 4.3 根因（离线 Bake 为什么永远不精确）
 
-同 prompt 双链、关编译器前后一致：
-
-```
-samples__part0: equal=False max_abs=3.556e+00 mean_abs=1.449e-01 mse=5.301e-02 psnr=31.14 dB
-samples__part1: equal=False max_abs=1.712e-01 mean_abs=1.901e-02 mse=6.989e-04 psnr=42.91 dB
-compared tensor pairs: 2
-VERDICT: FAIL - outputs differ
-```
-
-作为参照，完整模型**自己重跑两次**是 `video mean_abs=0.1685 / 29.11 dB`、`audio 0.0200 / 43.24 dB`。即剪枝+表的差异落在完整模型自身波动范围内，工程上已不可区分，但**不是 bitwise**。
-
----
-
-## 2. 根因（实测 + 源码，已闭环）
-
-### 2.1 决定性实测
-
-在云端实例用 `comfy.sd.load_diffusion_model(FULL)` 加载完整模型，用表里 `t_values`（17 个 t）重算 `blocks.0.adaln_proj.linear(F.silu(time_embedder(t).to(bf16)))`，与表 `blocks.0` 比：
+实测：在实例上用 `comfy.sd.load_diffusion_model(FULL)` 加载完整模型，用表里的 17 个 t
+重算 `blocks.0.adaln_proj.linear(F.silu(time_embedder(t).to(bf16)))`：
 
 | 对比 | equal | max_abs | mean_abs |
 |---|---|---|---|
@@ -74,184 +139,206 @@ VERDICT: FAIL - outputs differ
 | CUDA 权重状态 vs 表 | False | 0.015625 | 5.24e-4 |
 | CPU vs CUDA 互相 | False | 0.015625 | — |
 
-`max_abs=0.015625` = 一个 bf16 ULP。**表值与完整模型原生 AdaLN 输出本来就差约 5e-4**，经 8 步扩散放大即 latent 的 0.145。权重是 `QuantizedTensor`（`device=cpu`），CPU/CUDA 走 `comfy_kitchen` 不同 backend（eager 反量化 vs CUDA 量化 GEMM），数值不同。
+`0.015625` = 一个 bf16 ULP。权重是 `QuantizedTensor`（`device=cpu`），CPU/CUDA 走
+`comfy_kitchen` 不同 backend（eager 反量化 vs CUDA 量化 GEMM），数值不同。经 8 步扩散
+放大成 latent 的 `mean_abs≈0.145`（PSNR≈31 dB）。**靠离线独立 Bake 永远复现不了采样时的
+数值状态，所以改成记录式。**
 
-### 2.2 源码证据（本地 0.42.5 行号，0.44 对应逻辑相同）
+源码层面的具体问题（历史记录，已修）：
 
 | 位置 | 问题 |
 |---|---|
-| `ComfyUI-H3-ExactAdaLN/bake_engine.py:130/134` | **最根因**：在模型未经 `load_models_gpu`/`patch_model` 的状态下直接调 `dm.time_embedder(t_vals)` / `ap.linear(inp)`。Bake 测的是 CPU 原始权重 + eager 路径；采样时是 GPU 已 load/已 patch + 量化 GEMM |
-| `comfy/model_patcher.py:921-922` | `if key not in self.patches and not force_cast: return weight` —— 无 LoRA 的量化权重根本不反量化，"物化有效权重"承诺落空 |
-| `bake_engine.py:74` | `patch_weight_to_device(key, inplace_update=True)` 撞 `comfy/ops.py:1564` 的 `assert inplace_update is False`；量化 teacher + AdaLN LoRA 会失败（被 errors 吞掉）。`ops.py:1558` 还会 `requantize_from_float(scale="recalculate", stochastic_rounding=...)` |
-| `bake_engine.py:116/140` | `clone()` 共享底层 `nn.Module` 和 backup dict（`model_patcher.py:429-430,447,460`）；`unpatch_model()` 污染原 ModelPatcher，`CoreModelPatcher.unpatch_model`(`model_patcher.py:2159`) 还跳过基类恢复块 |
-| `ComfyUI-H3-ExactAdaLN/sigma_plan.py:78` | `round(float(t), 7)`，而 `comfy/ldm/minimax/model.py:743` 用未 round 的 `unique_t`；`TimeEmbedder` 的 `exp(-log(10000)*k/128)`(`model.py:143`) 放大误差 |
-| `ComfyUI-H3-ExactAdaLN/apply_engine.py:164` | 表转 `out_dtype=bf16` 注入，但 curve 模型 `adaln_dtype=torch.float32`(`model.py:496`)；`FinalLayer.mod`(`model.py:322`) 用 `scale.dtype` 决定乘加精度 → 不等价 |
-| `apply_engine.py:66/71` | curve keys 在 CPU、用 round 后的 t；运行时 `model.py:746` 用运行时 device + 未 round 的 t，lerp 公式一致但非逐位一致 |
-| `apply_engine.py:102-103,179` | `tol = max(1e-3, 2e-3*scale)` 偏宽松，只按 `maxd` 整体判定，t≈0.999/1.0 附近可能静默错行 |
-| `apply_engine.py:242-244` | `use_match=True` 时不注册 dit patch 兜底；假想"逐块混搭"模型下会静默半注入且 `summary()` 不反映 |
+| `bake_engine.py:130/134` | 在模型未经 `load_models_gpu`/`patch_model` 时直接调 `time_embedder`/`linear` |
+| `comfy/model_patcher.py:921-922` | 无 LoRA 的量化权重根本不反量化 |
+| `bake_engine.py:74` | `patch_weight_to_device(inplace_update=True)` 撞 `assert` |
+| `bake_engine.py:116/140` | `clone()` 共享 `nn.Module`，`unpatch_model()` 污染原 ModelPatcher |
+| `sigma_plan.py:78` | `round(float(t), 7)` 与 `model.py:743` 的未舍入 `unique_t` 不一致 |
+| `apply_engine.py:164` | 表转 bf16 注入，但 curve 模型 `adaln_dtype=fp32` |
 
-**形状/chunk 是对的**：`apply_engine.py:218-220` 的 `reshape(m*modalities, expand*hidden).chunk(expand)` 与 `model.py:227-228` 等价。问题全在数值来源与 dtype。
+### 4.4 t 集合与 shift 的关系
 
-**一句话**：靠"离线独立 Bake"永远复现不了采样时的量化数值状态，因此拿不到 bitwise。必须改成**记录式**。
+严格相等的**充要条件**是「运行时所有 t ⊆ 表的 t 集合」+「t→t_emb 映射一致」。
+`shift_v` / `shift_a` 相同既不充分也不必要：
 
----
-
-## 3. 另外两个调研结论
-
-### 3.1 b25-49 混合模型
-
-- **不是「full 块 + pruned 块」拼接**：是「以 FL2VA 为基底，把尾部 25 块的 `adaln_proj.linear.weight/bias` 换成 Ref2VA」的张量级权重选择（证据：`ComfyUI-minimaxH3-SequenceForge/README.md:184-202`、HF `jfar-z/MiniMax-H3-FL2VA-Ref2VA-Hybrid-NVFP4` 的 Merge Method）。`b15-49/b20-49/b25-49/b30-49` 是 0-based 闭区间替换块范围。
-- 基于 pruned base 的 hybrid 整个文件都是 curve 形态，`use_adaln_curves` 是**全局**（`model.py:493`），51 块全 8 维；`model_detection.py:418-428` 只靠 `adaln_t_table` key 判形态，看不见 hybrid。
-- **表技术上可用**（存的是最终调制值，与架构无关），`_build_match_keys` 在真 hybrid 上不会维度失配。
-- **但语义会错**：FL2VA full teacher 的表把 51 块全替换成 FL2VA 调制值，会抹掉 hybrid 尾部 ref2va 的参考条件能力。要正确支持，Bake 需加 `splice` 输入（照 HyperFlow `Create Curve Fit` 的 `FILE:FIRST-LAST` 格式，如 `...ref2va...safetensors:25-49`），烘焙时把指定区间 AdaLN 权重换成 donor 再算表，meta 记 splice 指纹。
-
-**已实现（`H3AdaLN Merge` + 工作流 06/07，2026-11-08）**：实测本地
-`minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors`（19.53 GiB，932 张量）——
-51 个 `adaln_proj.linear.weight` 全是 `[96768, 8]`、`adaln_t_table [1025, 8]`、
-**没有 `time_embedder`**。即整份文件都是 curve 形态，Record 跑不了，8 维曲线也装不下
-完整调制。精确做法是**两次 Record 再按块合并**：FL2VA full → A 表，Ref2VA full →
-B 表（同 steps/shift/分辨率/LoRA 强度），`split=25`、`final_from=a`：0-24 取 A、
-25-49 取 B、`final_layer` 取 A。每块仍是教师原生输出，逐块精确，不经过 8 维截断。
-工作流 `08_record_fl2va.json`（录基准 A 表）、`06_b25-49_hybrid.json`（一次运行：
-录 B + 合并 + 保存 B 表与 hybrid 表）和 `07_merge_tables.json`（纯 CPU 重合并）。Merge 校验 t 集合、投影集合、`out_dtype`、
-LoRA 指纹；旧版（keys-only）指纹表自动回退比较。本地 `tests/test_merge.py` 10 项全过。
-
-**实例验证（2026-11-08，0.44.0 / 4080 SUPER，b25-49 就在实例上）**：
-
-- FL2VA 表：75.3s 录成 `fl2va_dmad8_00001.safetensors`（15 行 / 51 投影 / 277.5 MiB，
-  fp `001c095c7e10a160`）；Ref2VA 表用当前版本重录 67.4s（`ref2va_dmad8_00001`）。
-- Merge 3.8s：报告 `blocks 0-24 <- fl2va`、`blocks 25-49 <- ref2va`、15 行、51 投影。
-- **表级校验**：`b25-49_hybrid_00001.safetensors` 的 0-24 块与 FL2VA 表、25-49 块与
-  Ref2VA 表、`final_layer` 与 FL2VA 表，15 行全部 `torch.equal`（逐位）。
-- `b25-49 + Apply(hybrid)`：`hooked modules 51`、`lora fp match`、
-  `first injection confirmed ... max_dist=0.000e+00`，生成 55.1s，latent 落盘。
-- 对照：同一 b25-49 注入 FL2VA 全表 vs hybrid 表 → video `max_abs=4.385 / mean_abs=0.470
-  / 22.42 dB`、audio `0.935 / 0.107 / 27.72 dB`。尾部 25 块的 ref2va 调制确实改变输出，
-  hybrid 表不是 FL2VA 表的等价物。
-- 途中修掉一个指纹边界：中间版本录的表（有 fp、无 keys 字段）现在先比 fp，再回退
-  keys-only；`tests/test_merge.py` 新增该用例。
-
-### 3.2 sigmas shift 不是必须的
-
-- **严格相等的充要条件 = 「运行时所有 t 值 ⊆ 表的 t 集合」+「t→t_emb 映射一致」**；`shift_v/shift_a` 参数相同既不充分也不必要。
-  - 不充分：shift 相同但 Bake 8 步 simple、运行时 10 步 ManualSigmas，t 集合不同照样失败。
-  - 不必要：把运行时 `SIGMAS` 接进 Bake 的 `sigmas` 输入，或用 `extra_t` 补齐实际 t，就能全命中。
-- ManualSigmas 绕开了 shift 对 sigma 网格的影响，但 `t_a = 1-time_shift_sigma(σ,shift_v,shift_a)`(`model.py:676`) 和 `audio_scale = shift/audio_shift`(`model_sampling.py:353`) 仍读 shift。
-- `ModelSamplingMiniMaxH3`(`nodes_minimax_h3.py:392-408`) 同时写 `set_parameters` 和 `transformer_options` 两处；`_auto_shifts` 只读 `model_sampling`，可能与 `model.py:672-673` 不一致。
+- 不充分：shift 相同，但 Bake 用 8 步 simple、运行时用 10 步 ManualSigmas，t 集合不同照样失败。
+- 不必要：把运行时的 `SIGMAS` 接进 Bake 的 `sigmas` 输入，或用 `extra_t` 补齐实际 t，就能全命中。
+- ManualSigmas 绕开了 shift 对 sigma 网格的影响，但 `t_a = 1-time_shift_sigma(σ, shift_v, shift_a)`
+  和 `audio_scale = shift / audio_shift` 仍然读 shift。
+- `_auto_shifts` 解析顺序：`transformer_options` → `dm.sigma_shift_*` → `model_sampling`，
+  与 `model.py:672-673` 对齐。
 
 ---
 
-## 4. 修复计划
+## 5. bX-49 混合模型（b25-49）完整流程
 
-### Phase 0 — 准备（不改逻辑）
+### 5.1 文件结构事实（实测）
 
-1. 读本文件 + `README.md` + 6 个 `.py`：`nodes.py`、`bake_engine.py`、`apply_engine.py`、`sigma_plan.py`、`table_io.py`、`latent_io.py`。
-2. 确认本地能跑静态测试：`D:/ComfyUI_windows_portable/python_embeded/python.exe` + `sys.path` 加 ComfyUI 根和插件目录；`py_compile` 全部 `.py`。
-3. 保持 `git` 干净，每个 Phase 单独 commit + push，`git -c gc.auto=0 -c maintenance.auto=false -C ... push origin main`。
+`minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors`（19.53 GiB，932 张量）：
 
-### Phase 1 — 消除确定性数值偏差（最高优先，独立可验收）
+- **没有 `time_embedder`**
+- 51 个 `adaln_proj.linear.weight` 全是 `[96768, 8]`（F16），`adaln_t_table [1025, 8]`
+- 配方（见 `_build_b25-49_w6a8.py`）：**fl2va_pruned 骨架 + ref2va_pruned 的 blocks 25-49
+  那 50 个 adaln 张量**，不是「full 块 + pruned 块」拼接
 
-**目标**：让表值 == 完整模型在采样状态下的原生 AdaLN 输出（逐位）。
+**所以 b25-49 整份文件都是 curve 形态，Record 跑不了，8 维也装不下完整调制。**
+不能靠「特判文件」自动还原；必须引入第二个 teacher。
 
-1. **新增 record 模式（核心）**，二选一实现：
-   - **推荐 A**：新增节点 `H3AdaLNRecord`（或给 `H3ExactAdaLNBake` 加 `mode="record"`）。它挂 51 个 `adaln_proj` 的**只读** forward hook，在**真实采样过程中**把每次原生输出按 t 记录：
-     - hook 拿到 `output`（`tuple` of 6 张表，每张 `[M*modalities, hidden]`）→ `torch.cat(output, dim=-1)` 得 `[M*modalities, expand*hidden]`，`reshape(M, 96768)` 得 raw 行；
-     - t 索引来源：用 `WrappersMP.DIFFUSION_MODEL` wrapper（参照 `model.py:623-628`）在 `_forward` 前从 `transformer_options["sigmas"]` + `sigma_plan.runtime_unique_t()` 算出本步 `unique_t`，存进 runtime state；**不要依赖 `patches_replace`**（SequenceForge 直接调 `comfy.sample.sample()` 时不触发）。
-     - 新 t 才写入，重复 t 校验一致性；跑完输出 `H3_ADALN_TABLE` → 接 `H3ExactAdaLNSave`。
-   - **备选 B**：修 `bake_engine.bake`，在算表前显式 `comfy.model_management.load_models_gpu([mp])` / `mp.load(device_to=...)`，并用 `patch_weight_to_device(key, device_to=<同一 device>, force_cast=True, inplace_update=False, return_weight=True)` 取有效权重后自己 `F.linear`。风险：仍可能与采样时 backend 不同，**不如 A 彻底**。
-2. 去掉 `sigma_plan.py:78` 的 `round(..., 7)`，让表 t 与 `model.py:709` 的 `unique_t` 用同一组未舍入 float（保留 `build_index` 的小容差匹配）。
-3. `out_dtype` 跟随目标模型：curve 用 `torch.float32`（`model.py:496`），full 用 bf16；至少保证 `FinalLayer` 的 `scale.dtype` 与原生一致。
-4. `_build_match_keys` 的 curve 分支改为在**运行时 device**、用**未 round 的 t** 计算；或更好：把 `[T,k]` key 矩阵随表保存（`table_io` 增加可选张量），Apply 直接用，与 Apply 端形态彻底解耦。
-5. 收紧 `_match_indices`：逐行校验距离、缩小 `tol`、错行时明确报错；`use_match=True` 时也注册 dit 兜底。
+### 5.2 正确做法：两个 full teacher 各录一张表，再按块合并
 
-**验收**：在实例上重跑 §2.1 的独立脚本，`record` 出来的表 vs 完整模型原生输出应为 `equal=True / max_abs=0`（CPU 与 CUDA 各验一次）。这一步不跑完整采样也能验。
+1. **FL2VA full**（有 `time_embedder`）+ 同一 LoRA，同一调度 → A 表
+   （`08_record_fl2va.json`，约 75s）
+2. **Ref2VA full** + 同一 LoRA、同一调度 → B 表
+   （`06_b25-49_hybrid.json` 的 B 链，约 67s）
+3. `H3AdaLNMerge`，`split=25`、`final_from=a`：
+   blocks 0-24 ← A，25-49 ← B，`final_layer` ← A
+4. 合并表 Apply 到 b25-49
 
-### Phase 2 — 端到端 bitwise 验证
+表只依赖 t，所以两次 Record 不必同一次运行、不必同 seed，只要 t 集合一致。
+每块仍是对应 teacher 的原生输出，逐块精确（不是 8 维近似）。
 
-1. 用 `04_verify_strict.json`（同 prompt 双链）改造：A 链挂 `H3AdaLNRecord`（只读），B 链 `Apply` 从**同一次执行**里拿到记录的表。
-   - 顺序问题：ComfyUI 按拓扑并行执行两个采样器。需让 B 链采样器的某个输入（例如 `latent_image`）经过一个 pass-through 节点依赖 A 链 latent 输出，强制 A 先完成、表填满，再跑 B。
-   - 备选：分两张工作流（Step1 A 链 record + Save；Step2 同 prompt 双链，B 链 Load 表）。因为 AdaLN 只依赖 t、与 noise 无关，跨次记录不影响表值；只要 t 集合一致即可。
-2. 验收：`H3LatentCompare` 报告 `samples__part0/1: equal=True max_abs=0`，`VERDICT: PASS - bitwise identical`。
-3. 对照：Apply `mode=off` 再跑，必须 `FAIL`。
+**为什么不能直接拿 FL2VA 全表套上去**：会把 25-49 块也变成 FL2VA 调制，抹掉 ref2va 的
+参考条件能力。数值上「更接近 full」，语义上是错的。对照实测（同一 b25-49）：
 
-### Phase 3 — 混合模型与 t 集合校验
+| 注入 | video | audio |
+|---|---|---|
+| hybrid 表 | 基线 | 基线 |
+| FL2VA 全表 | `max_abs=4.385 / mean=0.470 / 22.42 dB` | `0.935 / 0.107 / 27.72 dB` |
 
-1. `H3ExactAdaLNBake` 加 `splice` 字符串输入（`FILE:FIRST-LAST`），烘焙时按区间把 `adaln_proj.linear.{weight,bias}` 换成 donor，再算表；meta 记 splice + donor 指纹，Apply 的 fingerprint 校验扩展包含它。
-2. `ExactAdaLNRuntime.match_keys` 从单矩阵改成 `{dim: [T,dim]}` 字典，`register()` 读每个 `ap.linear.in_features` 绑定对应 key 集；`make_hook(key, keyset)` 去掉全局维度判断。
-3. Apply 改用「t 集合覆盖」校验：运行时算 `runtime_unique_t()` 与 `table.t_values` 做集合差，缺哪几行直接列出并拒绝，而不是等 `cdist` 失败。报错文案从 "different sigma schedule / shift" 改成 "t set mismatch — 某些 t 缺失"。
-4. `_auto_shifts` 优先读 `model_options["transformer_options"]["minimax_h3_sigma_shift_*"]`，回退 `dm.sigma_shift_*`，最后 `model_sampling`，与 `model.py:672-673` 对齐。
-5. 更新 README：Known limits、Status、混合模型章节、t 集合覆盖口径。
+差异显著，说明尾部 25 块的 ref2va 调制确实生效。
 
-### Phase 4 — 收尾
+### 5.3 实例验证结果（2026-11-08）
 
-1. 重新生成/校验所有工作流（`python tools/build_workflows.py`、`build_strict.py`），确保连线类型一致、无缺节点。
-2. 本地静态测试全过（节点 schema、表往返、NestedTensor 比对、record hook 数值、工作流 27 条连线）。
-3. commit + push；**不要部署到实例**，告诉用户 pull 即可。
+- FL2VA 表 75.3s → `fl2va_dmad8_00001.safetensors`（15 行 / 51 投影 / 277.5 MiB，
+  fp `001c095c7e10a160`）
+- Ref2VA 表 67.4s → `ref2va_dmad8_00001.safetensors`
+- Merge 3.8s → `b25-49_hybrid_00001.safetensors`
+- **表级校验**：0-24 == FL2VA、25-49 == Ref2VA、`final_layer` == FL2VA，
+  15 行全部 `torch.equal`
+- `b25-49 + Apply(hybrid)` 55.1s：`hooked modules 51`、`lora fp match`、
+  `first injection confirmed ... max_dist=0.000e+00`，latent 正常落盘
 
----
+### 5.4 注意事项
 
-## 5. 关键坑（新对话务必注意）
-
-- 本机 IPv6 黑洞：所有网络操作强制 IPv4（`curl -4`、Python patch `socket.getaddrinfo`），并 `unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY`。GitHub HTTPS 常不通，但 `git@github.com` SSH 通；推送用 `git -c gc.auto=0 -c maintenance.auto=false -C <repo> push origin main`。
-- 本机 Git Bash 缺部分 coreutils（`mkdir`/`head`/`grep` 等可能不可用），建目录/写文件用 Python 脚本。
-- 云端 ComfyUI 由 `/root/restart.sh` 启动（`nohup python main.py --listen 0.0.0.0 > comfyUI.log 2>&1 &` + `tail -f`）。长 SSH 命令容易卡住，用短连接 + 远程轮询；不要在同一条 SSH 里同时 `nohup` 重启和长轮询。
-- `comfy.sd.load_diffusion_model(path, model_options={}, disable_dynamic=False)` 返回 `ModelPatcher`，权重默认停在 CPU/offload，**必须显式 load 才是采样时状态**。
-- `H3LatentCompare` / `H3LatentSave` 必须处理 `comfy.nested_tensor.NestedTensor`（`.is_nested` + `.unbind()`），0.44 的 H3 LATENT 是 `{"samples": NestedTensor}`，不是普通 Tensor。
-- 核心 `SaveLatent` 对 NestedTensor 会崩（`nodes.py:558` `.contiguous()`），只能用插件的 `H3LatentSave`。
-- `H3ExactAdaLNLoad` 用自由文本 `table_name` + `table_path`；不要用 COMBO + `image_upload`（前者启动时缓存、后者只收图片格式）。
-- 表的 `out_dtype` 与 curve 模型 `adaln_dtype=fp32` 的关系是确定性偏差来源之一。
-- 用户已明确：**不要手动部署工作流/节点到实例**，只推 GitHub。
+- **必须有 Ref2VA full（34GB，带 `time_embedder`）**；只有 pruned 版无法还原。
+- 两表必须同 t 集合 / 同 LoRA / 同 strength / 同 `out_dtype`；Merge 会拒绝并列出缺失 t。
+- b25-49 是反量化后注入，目标量化档位不影响注入正确性；但 `out_dtype` 必须与 teacher 一致。
+- 端到端 bitwise 对照暂无：不存在现成的「混合 full teacher」。验证口径是表级逐块逐位 +
+  注入日志。要严格端到端，需在 FL2VA full 上把 25-49 的 AdaLN 权重 patch 成 Ref2VA 的再采样。
 
 ---
 
-## 6. 验收标准（最终）
+## 6. 代码结构与关键实现
 
-1. `04_verify_strict.json`（或 Phase 2 改造版）跑一次，Compare 报告 `equal=True`、`max_abs=0`、`VERDICT: PASS - bitwise identical`。
-2. Apply `mode=off` 对照必须为 `FAIL`。
-3. 同一张表可用于 full / curve / b25-49 hybrid（后者需 splice 正确），t 集合覆盖校验能列出缺失 t。
-4. 本地静态测试全过，仓库工作区干净，远端 HEAD = 本地 HEAD。
+```
+record_engine.py   采样期只读 hook（精确路径）
+bake_engine.py     离线重算 + splice donor
+apply_engine.py    运行时注入：t_emb 匹配 + sigma 兜底
+sigma_plan.py      float32 精确的 t 运算，镜像 model.py:671-751
+table_io.py        safetensors 容器 + merge_tables（bX-49 合并）
+nodes.py           8 个节点
+latent_io.py       H3LatentSave（NestedTensor）
+workflows/         01-08（生成，不手改）
+tests/             test_exact.py（21 项数值）/ test_workflows.py（结构）/ test_merge.py（10 项合并）
+tools/             工作流生成器 + 模型/对照辅助
+```
+
+几个容易踩的实现点：
+
+- **Apply 是 hook `AdalnProj` 的 forward**，直接返回 `chunk(expand)` 后的 6 个调制表，
+  所以表与目标模型是 full 还是 curve 无关。
+- **匹配是精确的**：key 是 t 的 float32 像（`struct.pack`），容差 `1e-6 × |keys|`，
+  远小于 1 个 bf16 ULP；不精确就报错，不静默吸附到相邻行。
+- **hook 按共享 `nn.Module` 跟踪**（`_h3_recorders` / `_h3_exact_runtimes`），
+  因为 `ModelPatcher.clone()` 不复制自定义属性但共享 `nn.Module`；不这样做会跨 prompt 累积。
+- **`mode=off` 先清理旧 runtime 再早退**，否则对照组会被上一次的 hook 污染。
+- **LoRA 指纹**：新表存权重摘要 + strength（`lora_fingerprint`）和 keys-only
+  （`lora_fingerprint_keys`）。比较顺序：先比 fp，再对旧表回退 keys。中间版本表
+  （有 fp、无 keys）靠 fp 相同通过。
+- 表 fp32 存储，回放时按记录的 `out_dtype` 转回（bf16 存储会引入 ~2.5e-2 相对误差）。
 
 ---
 
-## 7. 执行结果（已完成，`f4065d9`）
+## 7. 模型与文件清单（换机后要备齐）
 
-Phase 1–4 全部落地并推送。核心变化：**放弃"离线独立 Bake"，改为采样期记录。**
+| 角色 | 文件名 | 说明 |
+|---|---|---|
+| FL2VA full teacher | `minimax_h3_fl2va_int8_convrot.safetensors` | 有 `time_embedder`，b25-49 的 0-24 来源 |
+| Ref2VA full teacher | `minimax_h3_ref2va_int8_convrot.safetensors` | 有 `time_embedder`，25-49 来源；05 用的就是它 |
+| pruned target | `minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 05/02 的 B 链 |
+| hybrid target | `minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors` | 20GB，全 curve，无 time_embedder |
+| LoRA | `dmad_minimax_h3_8step_full_critic_comfyui.safetensors` | 8 步、shift 12/2、strength 1.0 |
+| 文本编码器 | `qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | |
+| 视频 VAE | `minimax_h3_video_vae_fp16.safetensors` | |
 
-| Plan 条目 | 落地方式 |
-| --- | --- |
-| Phase 1.1 record 模式 | 新模块 `record_engine.py` + 新节点 `H3AdaLNRecord`。hook `time_embedder` 直接拿 `t_vals`（行↔t 一一对应，不做任何重建），hook `adaln_proj.linear` 拿 raw 输出。**备选 B（修 bake 的 load/patch）没走**——它仍然依赖"手工选 kernel"，原理上拿不到逐位。 |
-| Phase 1.2 去 round | `sigma_plan.f32_image()` 存 t 的 float32 像，`bake_t_values` 精确去重，`round(t,7)` 删除 |
-| Phase 1.3 out_dtype | 改为**实测记录**（`recorder.out_dtype`）或 `teacher_out_dtype(dm)`（按 model.py:495 推），不再由 `compute_dtype` 下拉决定 |
-| Phase 1.4 运行时 device/未 round t | `_keys_for()` 懒构建，用 `t_emb` 自己的 device + dtype；`[T,k]` 随表保存改成**按 t_emb 宽度分发**（`{width: kind}`），更彻底 |
-| Phase 1.5 收紧匹配 | 容差 `1e-6*|keys|`（远小于 1 个 bf16 ulp），失败时列出缺哪些 t；`use_match=True` 时也有 `WrappersMP.DIFFUSION_MODEL` 兜底 |
-| Phase 2 端到端 | `workflows/05_record_strict.json`：A 链 record、B 链 apply，`after` 通配输入强制 A 先跑；Save 也接 `after` |
-| Phase 3.1 splice | `H3ExactAdaLNBake.splice = FILE:FIRST-LAST`，donor 必须是 plain float checkpoint，meta 记指纹 |
-| Phase 3.2/3.3 | 见上（按宽度分发 + t 集合覆盖报错） |
-| Phase 3.4 `_auto_shifts` | transformer_options → `dm.sigma_shift_*` → `model_sampling`，与 model.py:672 一致 |
-| Phase 4 | 5 个工作流重生成 + `tests/test_workflows.py` 结构校验；`tests/test_exact.py` 21 项数值校验全过；工作区干净，远端 HEAD = 本地 HEAD |
+已产出的表（实例 `output/h3_adaln/`）：
 
-**已本地证明的结论**（`tests/test_exact.py`，真实 `MiniMaxH3Model` 微型配置）：
-完整 teacher 与 curve student 共享全部非 AdaLN 权重，record 4 步后 apply，
-4/4 步 `torch.equal`、`max_dist=0.000e+00`、12 次精确 t_emb 命中；
-对照组（不注入）`max_abs=3.8e-01`。
+- `fl2va_dmad8_00001.safetensors`（A 表，FL2VA full）
+- `ref2va_dmad8_00001.safetensors`（B 表，Ref2VA full）
+- `b25-49_hybrid_00001.safetensors`（合并表，可直接分享）
+- `recorded_00001/00002.safetensors`（历史：05 在 Ref2VA full 上录的）
 
-**实例验收（2026-11-08，已完成）**：ComfyUI 0.44.0 / RTX 4080 SUPER 上用同一个
-API prompt（从 `/history` 取回）连跑三次 `05_record_strict.json`：
+---
 
-| 次序 | Apply `mode` | Compare | 注入日志 |
-|---|---|---|---|
-| 1 | `strict` | `PASS / max_abs=0`（90.83s） | `first injection confirmed` |
-| 2 | `off` | `FAIL / max_abs=3.349e+00`（video）、`2.970e-01`（audio） | 无 —— 上一次的 hook 已被清理 |
-| 3 | `strict`（off 之后） | `PASS / max_abs=0` | `first injection confirmed` |
+## 8. 关键坑（换机必看）
 
-报告落盘 `output/h3_adaln/compare_*_145323 / 145341 / 145405.txt`；修改前的首次
-PASS 日志备份在 `/root/comfyUI_pre_fix_PASS_20261108.log`。第 2/3 次证明「残留 hook
-导致对照组假 PASS」已修掉，且清理不会误伤后续 strict 运行。`04` 保留为 Bake
-离线路径的 A/B 对照（预期仍 FAIL，这正是根因证据）。
+1. **不要提交 SSH 凭据。** 仓库是公开的；主机的端口和密码每次开机都可能变，由用户提供。
+2. **GitHub 访问**：本机 IPv6 黑洞，`curl` 需 `-4`；schannel 吊销检查失败时加
+   `--ssl-no-revoke`。`git push` 走 HTTPS 可用（有 credential helper）。
+3. **`pkill` 会杀掉承载它的 SSH 会话**：`pkill -f "[m]ain.py --listen"` 会匹配到
+   `bash -c` 命令行里的同一串字符。用 `pkill -f "^python main.py"`，并且**kill 与
+   nohup 启动分成两条连接**，不要在同一条命令里既 kill 又 start。
+4. **`-py` 传远程绝对路径要 `MSYS_NO_PATHCONV=1`**，否则 Git Bash 会把 `/root/...`
+   改写成 Windows 路径；本地脚本路径写成 `D:/...` 形式。
+5. **重启 ComfyUI 会清空 `/history`**。要复现某个 prompt，先把 `/history` 里的
+   API prompt 存成文件（`/root/h3_05_prompt.json` 就是这么来的）。
+6. **05 的 teacher 是 Ref2VA full**，不是 FL2VA。06 的 A 表必须是 FL2VA（用 08 录），
+   别把两者搞混，否则合并出「全 Ref2VA」的表。
+7. **核心 `SaveLatent` 对 NestedTensor 会崩**（`nodes.py:558` `.contiguous()`），
+   用插件的 `H3LatentSave`。
+8. **`H3ExactAdaLNLoad` 用自由文本**，不要用 COMBO + `image_upload`（前者启动时缓存，
+   后者只收图片）。
+9. **表与 schedule 绑定**：换步数 / shift / 分辨率 / LoRA 强度都要重录；strict 会列出缺失 t。
+10. **本地 ComfyUI 0.41.2 跑不了 `test_exact.py`**（低于 0.42.5，且缺 `comfy_kitchen`）；
+    数值回归要在 0.44 实例上跑。本地能跑的是 `test_merge.py`（纯 CPU）和
+    `test_workflows.py` 的结构部分。
 
-**修复提交**：`274490e`（off 清理残留 hook、LoRA 指纹纳入权重与强度、hook 按
-共享 `nn.Module` 跟踪、Compare 拒绝同源输入、工作流 `widgets_values_named` /
-`properties.models` 同步、0 维 t 防崩）、`da62ef2`（工作流 JSON 统一 LF）。
-本地与实例均为 `da62ef2`；`tools/build_*.py` 重生成后 `git status` 为空
-（byte-for-byte）；`tests/test_workflows.py` 与 `tests/test_exact.py`（21 项）全过。
-5 个工作流已部署到实例 `user/default/workflows/`，ComfyUI 已重启加载新节点。
+---
+
+## 9. 复现与验证命令
+
+```bash
+# 结构：所有工作流 JSON、连线/槽位、widget 数量、命名参数一致性
+python tests/test_workflows.py
+
+# 数值：真实 MiniMaxH3Model 微型配置，teacher vs curve student（需要 ComfyUI）
+COMFYUI_DIR=/root/ComfyUI python tests/test_exact.py
+
+# 合并：分块、t 对齐、元数据往返、各种拒绝路径（纯 CPU）
+python tests/test_merge.py
+```
+
+实例上更新与重启：
+
+```bash
+cd /root/ComfyUI/custom_nodes/ComfyUI-H3-ExactAdaLN
+git -c gc.auto=0 -c maintenance.auto=false pull --ff-only origin main
+cp workflows/*.json /root/ComfyUI/user/default/workflows/
+
+pkill -f "^python main.py"      # 单独一条连接
+# 然后另开一条：
+cd /root/ComfyUI && (nohup python main.py --listen 0.0.0.0 > comfyUI.log 2>&1 < /dev/null &)
+```
+
+---
+
+## 10. 已知限制与未做项
+
+- 表是 (base 权重, LoRA 集合与强度, sigma 网格, shifts, packed layout) 的函数；
+  其中任何一项变化都要重录。
+- `out_dtype` 在产表时固定，必须与 teacher 推理 dtype 一致。
+- per-row `denoise_mask` 的 timestep 不被 Record 支持（Bake 可用 `extra_t` 覆盖）。
+- HyperFlow 式 `(t, r)` 端点条件不复现。
+- Python hook 到不了 C++ 引擎或绕过 `module.forward` 的融合 kernel。
+- bX-49 的端到端 bitwise 对照未做（见 §5.4）。
+- 低优先未修：跨次 schedule 预检、重复 t 只校验 canary `blocks.0`、`_cur_t` 非线程局部、
+  bake 的 splice 分支绕过 LoRA、`dit_patch` 通道未启用。
