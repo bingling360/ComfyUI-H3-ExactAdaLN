@@ -174,6 +174,15 @@ def test_legacy_fingerprint_compat():
     raise AssertionError("merge accepted two new tables with different weights")
 
 
+def test_mid_version_digest_only():
+    # A build in between stored the weight-aware digest but not the key digest.
+    # Identical digests must still merge (this is what the real instance hit).
+    a_new = make_table(TA, 1, fp="weight-aware", keys_fp="legacy-keys")
+    b_mid = make_table(TB, 2, fp="weight-aware")
+    m = table_io.merge_tables(a_new, b_mid, split=2)
+    assert m.meta["hybrid_split"] == "2"
+
+
 def test_node_schema():
     import nodes as h3
     spec = h3.H3AdaLNMerge.INPUT_TYPES()
@@ -196,6 +205,8 @@ check("merge: rejects a different LoRA stack", test_rejects_lora_mismatch)
 check("merge: rejects dtype / projection mismatch", test_rejects_dtype_and_projection_mismatch)
 check("merge: legacy key-only table still merges, new tables stay strict",
       test_legacy_fingerprint_compat)
+check("merge: digest-only (mid-version) table merges on identical digest",
+      test_mid_version_digest_only)
 check("merge: node schema and report", test_node_schema)
 
 print()

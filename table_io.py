@@ -192,17 +192,22 @@ def merge_tables(table_a, table_b, split=25, final_from="a"):
     fp_b = b.meta.get("lora_fingerprint", "")
     keys_a = a.meta.get("lora_fingerprint_keys", "")
     keys_b = b.meta.get("lora_fingerprint_keys", "")
+    same_fp = (not fp_a or not fp_b or fp_a == fp_b)
     if keys_a and keys_b:
-        fp_ok = (not fp_a or not fp_b or fp_a == fp_b)
+        # Both tables carry the weight-aware digest: compare it strictly, so a
+        # different LoRA with the same key set is still rejected.
+        fp_ok = same_fp
     else:
-        # At least one table predates the weight-aware digest; those store the
-        # key-name digest in `lora_fingerprint`, so compare on that level.
+        # One side predates the weight-aware digest. Accept an identical
+        # digest, otherwise fall back to the key-name digest (older tables
+        # store that value in `lora_fingerprint`).
         key_a, key_b = (keys_a or fp_a), (keys_b or fp_b)
-        fp_ok = (not key_a or not key_b or key_a == key_b)
+        fp_ok = same_fp or (not key_a or not key_b or key_a == key_b)
     if not fp_ok:
         raise RuntimeError(
-            "H3AdaLNMerge: LoRA fingerprint differs (A={} B={}); both tables must "
-            "be recorded with the same LoRA stack and strength".format(fp_a, fp_b))
+            "H3AdaLNMerge: LoRA fingerprint differs (A: fp={} keys={} | "
+            "B: fp={} keys={}); both tables must be recorded with the same "
+            "LoRA stack and strength".format(fp_a, keys_a, fp_b, keys_b))
 
     try:
         from . import sigma_plan

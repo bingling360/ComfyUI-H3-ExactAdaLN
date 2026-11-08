@@ -736,9 +736,8 @@ class H3ExactAdaLNApply:
         current_keys_fp, _ = _lora_key_fingerprint(model)
         baked_fp = table.meta.get("lora_fingerprint", "")
         baked_keys_fp = table.meta.get("lora_fingerprint_keys", "")
-        if baked_keys_fp:
-            fp_ok = (current_fp == baked_fp)
-        else:
+        fp_ok = (current_fp == baked_fp)
+        if not fp_ok and not baked_keys_fp:
             # Table written by an older build: only the key-name digest is
             # stored, so that is the strongest check it can support.
             fp_ok = bool(current_keys_fp) and current_keys_fp == baked_fp

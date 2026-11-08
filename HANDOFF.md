@@ -114,8 +114,22 @@ B 表（同 steps/shift/分辨率/LoRA 强度），`split=25`、`final_from=a`�
 25-49 取 B、`final_layer` 取 A。每块仍是教师原生输出，逐块精确，不经过 8 维截断。
 工作流 `06_b25-49_hybrid.json`（一次运行：录 B + 合并 + 保存 B 表与 hybrid 表）和
 `07_merge_tables.json`（纯 CPU 重合并）。Merge 校验 t 集合、投影集合、`out_dtype`、
-LoRA 指纹；旧版（keys-only）指纹表自动回退比较。本地 `tests/test_merge.py` 8 项全过；
-真实 b25-49 注入仍需 GPU 实例（需 Ref2VA full + b25-49 两个模型）。
+LoRA 指纹；旧版（keys-only）指纹表自动回退比较。本地 `tests/test_merge.py` 10 项全过。
+
+**实例验证（2026-11-08，0.44.0 / 4080 SUPER，b25-49 就在实例上）**：
+
+- FL2VA 表：75.3s 录成 `fl2va_dmad8_00001.safetensors`（15 行 / 51 投影 / 277.5 MiB，
+  fp `001c095c7e10a160`）；Ref2VA 表用当前版本重录 67.4s（`ref2va_dmad8_00001`）。
+- Merge 3.8s：报告 `blocks 0-24 <- fl2va`、`blocks 25-49 <- ref2va`、15 行、51 投影。
+- **表级校验**：`b25-49_hybrid_00001.safetensors` 的 0-24 块与 FL2VA 表、25-49 块与
+  Ref2VA 表、`final_layer` 与 FL2VA 表，15 行全部 `torch.equal`（逐位）。
+- `b25-49 + Apply(hybrid)`：`hooked modules 51`、`lora fp match`、
+  `first injection confirmed ... max_dist=0.000e+00`，生成 55.1s，latent 落盘。
+- 对照：同一 b25-49 注入 FL2VA 全表 vs hybrid 表 → video `max_abs=4.385 / mean_abs=0.470
+  / 22.42 dB`、audio `0.935 / 0.107 / 27.72 dB`。尾部 25 块的 ref2va 调制确实改变输出，
+  hybrid 表不是 FL2VA 表的等价物。
+- 途中修掉一个指纹边界：中间版本录的表（有 fp、无 keys 字段）现在先比 fp，再回退
+  keys-only；`tests/test_merge.py` 新增该用例。
 
 ### 3.2 sigmas shift 不是必须的
 
