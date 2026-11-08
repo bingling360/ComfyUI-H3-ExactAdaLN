@@ -140,6 +140,137 @@ def load_table(path, device="cpu"):
     return t_values, raw, meta
 
 
+def _block_index(key):
+    """'blocks.17' -> 17, 'final_layer' -> None, anything else -> None."""
+    if key == FINAL_KEY:
+        return None
+    if key.startswith(BLOCK_PREFIX):
+        try:
+            return int(key[len(BLOCK_PREFIX):])
+        except ValueError:
+            return None
+    return None
+
+
+def merge_tables(table_a, table_b, split=25, final_from="a"):
+    """Combine two recorded tables block-wise (the bX-49 hybrid recipe).
+
+    A `bX-49` checkpoint is not "full blocks + pruned blocks": the whole file
+    is curve-shaped, with `adaln_proj` of blocks X..49 taken from a second
+    teacher. Its own 8-wide curve cannot carry the teacher's full modulation,
+    so the exact table must be assembled from two records made on the two full
+    teachers: blocks 0..X-1 from `table_a`, blocks X..49 from `table_b`, and
+    `final_layer` from whichever side the checkpoint kept.
+
+    Both tables must have been recorded on the same timesteps and the same
+    LoRA stack; every block is still a row the corresponding teacher actually
+    produced, so replaying the merged table is exact per block.
+    """
+    a, b = table_a, table_b
+    a.finalize(required=True)
+    b.finalize(required=True)
+
+    split = int(split)
+    if not 0 <= split <= 50:
+        raise RuntimeError("H3AdaLNMerge: split must be 0..50, got {}".format(split))
+    final_from = str(final_from).lower()
+    if final_from not in ("a", "b"):
+        raise RuntimeError("H3AdaLNMerge: final_from must be 'a' or 'b'")
+
+    keys_a, keys_b = set(a.raw_by_key), set(b.raw_by_key)
+    if keys_a != keys_b:
+        raise RuntimeError(
+            "H3AdaLNMerge: projection sets differ -- only in A: {} | only in B: {}"
+            .format(sorted(keys_a - keys_b)[:6], sorted(keys_b - keys_a)[:6]))
+
+    if a.out_dtype != b.out_dtype:
+        raise RuntimeError(
+            "H3AdaLNMerge: out_dtype differs (A={} B={}); re-record both tables "
+            "with the same teacher dtype".format(a.out_dtype, b.out_dtype))
+
+    fp_a = a.meta.get("lora_fingerprint", "")
+    fp_b = b.meta.get("lora_fingerprint", "")
+    keys_a = a.meta.get("lora_fingerprint_keys", "")
+    keys_b = b.meta.get("lora_fingerprint_keys", "")
+    if keys_a and keys_b:
+        fp_ok = (not fp_a or not fp_b or fp_a == fp_b)
+    else:
+        # At least one table predates the weight-aware digest; those store the
+        # key-name digest in `lora_fingerprint`, so compare on that level.
+        key_a, key_b = (keys_a or fp_a), (keys_b or fp_b)
+        fp_ok = (not key_a or not key_b or key_a == key_b)
+    if not fp_ok:
+        raise RuntimeError(
+            "H3AdaLNMerge: LoRA fingerprint differs (A={} B={}); both tables must "
+            "be recorded with the same LoRA stack and strength".format(fp_a, fp_b))
+
+    try:
+        from . import sigma_plan
+    except ImportError:  # pragma: no cover - direct-file loading
+        import sigma_plan
+
+    index_b = {}
+    for i, t in enumerate(b.t_values):
+        index_b[sigma_plan.f32_image(t)] = i
+    order, missing = [], []
+    for t in a.t_values:
+        j = index_b.get(sigma_plan.f32_image(t))
+        if j is None:
+            missing.append(t)
+        else:
+            order.append(j)
+    if missing:
+        raise RuntimeError(
+            "H3AdaLNMerge: B is missing {} of A's timesteps (first: {}). "
+            "Record both tables on the same steps / scheduler / shifts / "
+            "resolution.".format(len(missing), ["{:.7f}".format(t) for t in missing[:4]]))
+    if len(order) != len(a.t_values) or len(set(order)) != len(order):
+        raise RuntimeError("H3AdaLNMerge: timestep alignment is not one-to-one")
+
+    index = torch.as_tensor(order, dtype=torch.long)
+    merged = {}
+    for key in a.raw_by_key:
+        block = _block_index(key)
+        use_b = (block is None and final_from == "b") or \
+                (block is not None and block >= split)
+        src = b if use_b else a
+        rows = src.raw_by_key[key]
+        if src is b:
+            rows = rows.index_select(0, index.to(rows.device))
+        if rows.shape != a.raw_by_key[key].shape:
+            raise RuntimeError(
+                "H3AdaLNMerge: {} shape mismatch A={} B={} -- the two teachers "
+                "are different architectures".format(
+                    key, tuple(a.raw_by_key[key].shape), tuple(rows.shape)))
+        merged[key] = rows.contiguous()
+
+    a_teacher = a.meta.get("teacher", "?")
+    b_teacher = b.meta.get("teacher", "?")
+    if split <= 0:
+        teacher = "hybrid: blocks 0-49 <- {}".format(b_teacher)
+    elif split >= 50:
+        teacher = "hybrid: blocks 0-49 <- {}".format(a_teacher)
+    else:
+        teacher = "hybrid: blocks 0-{} <- {} | blocks {}-49 <- {}".format(
+            split - 1, a_teacher, split, b_teacher)
+
+    meta = dict(a.meta)
+    meta.update({
+        "teacher": teacher,
+        "record_mode": "merged from two recorded tables (exact per block)",
+        "hybrid_split": str(split),
+        "hybrid_final_from": final_from,
+        "hybrid_source_a": a_teacher,
+        "hybrid_source_b": b_teacher,
+        "hybrid_lora_fp_a": keys_a or fp_a,
+        "hybrid_lora_fp_b": keys_b or fp_b,
+        "t_count": str(len(a.t_values)),
+        "out_dtype": a.out_dtype,
+        "format": FORMAT,
+    })
+    return AdaLNTable(a.t_values, merged, meta)
+
+
 def write_table_file(path, table):
     table.finalize(required=True)
     return save_table(path, table.t_values, table.raw_by_key,

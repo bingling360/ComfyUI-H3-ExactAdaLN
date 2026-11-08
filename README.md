@@ -102,6 +102,7 @@ packages. Verified against ComfyUI 0.44.0 / PyTorch 2.9.1 / RTX 4080 SUPER.
 | `H3 Exact AdaLN Bake` | full MODEL (+ LoRA), SIGMAS or steps/scheduler | `H3_ADALN_TABLE` | Offline approximation. Cheap, no sampling. |
 | `H3 Exact AdaLN Save Table` | `H3_ADALN_TABLE` | file path | Like **Save Image**: auto-numbered `.safetensors` under `output/h3_adaln/`, or into `models/h3_exact_adaln/`. Mirrors into `input/`. |
 | `H3 Exact AdaLN Load Table` | `table_name` (free text) / `table_path` | `H3_ADALN_TABLE` | Resolves a filename, substring, relative path or absolute path. Scans `input/`, `output/`, `models/h3_exact_adaln/`. |
+| `H3 AdaLN Merge` | two `H3_ADALN_TABLE` | `H3_ADALN_TABLE` | **bX-49 hybrids.** Blocks `0..split-1` from A, `split..49` from B, `final_layer` from A. Refuses mismatched t-sets / projections / dtype / LoRA. |
 | `H3 Exact AdaLN Apply` | pruned MODEL + `H3_ADALN_TABLE` | MODEL | Replaces all 51 AdaLN projections at runtime. `strict` / `fallback` / `off`. |
 | `H3 Latent Compare` | two LATENT | report | `equal`, `max_abs`, `PSNR`; PASS = bitwise identical. |
 | `H3 Latent Save` | LATENT | file | Saves H3's `NestedTensor` latents (stock `SaveLatent` cannot). |
@@ -155,6 +156,11 @@ bitwise identical as long as the schedule, shifts and layout match.
   chains, `after`-ordered: A records while it samples, B applies the recorded
   rows, Compare must print `equal=True / max_abs=0 / VERDICT: PASS`. Set
   `Apply.mode=off` and rerun for the negative control (must FAIL).
+- `workflows/06_b25-49_hybrid.json` — **bX-49 hybrid, one run.** Records the
+  Ref2VA full teacher, merges it with an existing FL2VA table (`split=25`),
+  and saves both the donor table and the hybrid table.
+- `workflows/07_merge_tables.json` — CPU-only merge of two saved tables, for
+  re-combining after either side was re-recorded.
 
 Defaults match the DMAD 8-step LoRA: 8 steps, `euler`, `simple`, strength 1.0,
 no CFG, video shift 12 / **audio shift 2**. Change the LoRA filename to your
@@ -271,6 +277,27 @@ with FL2VA modulation, which erases the reference-conditioning behaviour of the
 hybrid's tail blocks. Splice is what keeps that behaviour; without it the table
 is numerically fine but semantically wrong for a hybrid.
 
+### The exact path for bX-49
+
+A `b25-49` file is curve-shaped **everywhere** — 51 x `[96768, 8]`, one
+`adaln_t_table [1025, 8]`, no `time_embedder` — and the trailing blocks' AdaLN
+tensors come from a second teacher. So Record cannot run on it, and its 8-wide
+curve cannot carry either teacher's full modulation. The exact table is
+assembled from two records instead:
+
+1. record the **base** teacher (FL2VA full) on the schedule you will use → A;
+2. record the **tail donor** (Ref2VA full) on the same steps / shifts /
+   resolution → B;
+3. `H3 AdaLN Merge` with `split=25`, `final_from=a` → blocks 0–24 from A,
+   25–49 from B, `final_layer` from A.
+
+Every block is still a row its teacher actually produced, so replay is exact
+per block; the merge refuses mismatched timesteps, projection sets, out dtypes
+or LoRA stacks. Workflow `06_b25-49_hybrid.json` does steps 2–3 in one run
+(the base table is a `Load`), and `07_merge_tables.json` re-merges two saved
+tables on CPU. Both teachers must be **full** checkpoints; a pruned donor has
+already lost the information the table needs.
+
 ## Known limits
 
 - A table is a function of (base weights, LoRA set **and strengths**, sigma
@@ -297,6 +324,9 @@ python tests/test_workflows.py
 
 # numbers: real MiniMaxH3Model at tiny scale, full teacher vs curve student
 python tests/test_exact.py
+
+# merge: block split, t alignment, metadata round-trip, rejection paths (CPU)
+python tests/test_merge.py
 ```
 
 `test_exact.py` builds a full teacher and a curve student that shares every
@@ -315,9 +345,11 @@ apply_engine.py    runtime injection: t_emb matching + sigma fallback
 sigma_plan.py      float32-exact t arithmetic, mirrors model.py:671-751
 table_io.py        safetensors container, live (recording) tables
 nodes.py           the seven nodes
-workflows/         01 bake, 02/03 load+apply A/B, 04 offline strict, 05 record strict
-tests/             test_exact.py (numbers), test_workflows.py (graph structure)
-tools/             workflow generators + model fetch/compare helpers
+workflows/         01 bake, 02/03 load+apply A/B, 04 offline strict,
+                   05 record strict, 06 bX-49 hybrid, 07 merge only
+tests/             test_exact.py (numbers), test_merge.py (hybrid merge),
+                   test_workflows.py (graph structure)
+tools/             workflow generators (incl. build_hybrid.py) + fetch helpers
 HANDOFF.md         repair plan, root-cause evidence and per-phase status
 ```
 
@@ -328,6 +360,7 @@ python tools/build_workflows.py   # 01, 02
 python tools/add_savelatent.py    # 03 (from 02)
 python tools/build_strict.py      # 04
 python tools/build_record.py      # 05
+python tools/build_hybrid.py      # 06, 07
 ```
 
 They read node slot definitions from ComfyUI's own
@@ -345,6 +378,10 @@ tell whether a workflow was hand-edited.
   projections / 17 t rows / 314.5 MiB and the first injection was confirmed
   (`max_dist=0.000e+00`), yet the latents still differ — that measurement is
   what identified the offline path as the root cause and motivated Record.
+- bX-49 hybrid support: `H3 AdaLN Merge` assembles the table from two full
+  teachers (blocks 0..24 from FL2VA, 25..49 from Ref2VA). `tests/test_merge.py`
+  covers the split, t alignment, metadata round-trip and every rejection path
+  on CPU; the real 20 GiB b25-49 run still needs a GPU instance.
 - End-to-end on the 34 GB teacher is done: `05_record_strict.json` reports
   `equal=True / max_abs=0 / VERDICT: PASS`, `Apply.mode=off` reports `FAIL`
   with no injection log, and strict still passes after the control run. Root

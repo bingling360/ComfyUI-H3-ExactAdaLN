@@ -105,6 +105,18 @@ VERDICT: FAIL - outputs differ
 - **表技术上可用**（存的是最终调制值，与架构无关），`_build_match_keys` 在真 hybrid 上不会维度失配。
 - **但语义会错**：FL2VA full teacher 的表把 51 块全替换成 FL2VA 调制值，会抹掉 hybrid 尾部 ref2va 的参考条件能力。要正确支持，Bake 需加 `splice` 输入（照 HyperFlow `Create Curve Fit` 的 `FILE:FIRST-LAST` 格式，如 `...ref2va...safetensors:25-49`），烘焙时把指定区间 AdaLN 权重换成 donor 再算表，meta 记 splice 指纹。
 
+**已实现（`H3AdaLN Merge` + 工作流 06/07，2026-11-08）**：实测本地
+`minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors`（19.53 GiB，932 张量）——
+51 个 `adaln_proj.linear.weight` 全是 `[96768, 8]`、`adaln_t_table [1025, 8]`、
+**没有 `time_embedder`**。即整份文件都是 curve 形态，Record 跑不了，8 维曲线也装不下
+完整调制。精确做法是**两次 Record 再按块合并**：FL2VA full → A 表，Ref2VA full →
+B 表（同 steps/shift/分辨率/LoRA 强度），`split=25`、`final_from=a`：0-24 取 A、
+25-49 取 B、`final_layer` 取 A。每块仍是教师原生输出，逐块精确，不经过 8 维截断。
+工作流 `06_b25-49_hybrid.json`（一次运行：录 B + 合并 + 保存 B 表与 hybrid 表）和
+`07_merge_tables.json`（纯 CPU 重合并）。Merge 校验 t 集合、投影集合、`out_dtype`、
+LoRA 指纹；旧版（keys-only）指纹表自动回退比较。本地 `tests/test_merge.py` 8 项全过；
+真实 b25-49 注入仍需 GPU 实例（需 Ref2VA full + b25-49 两个模型）。
+
 ### 3.2 sigmas shift 不是必须的
 
 - **严格相等的充要条件 = 「运行时所有 t 值 ⊆ 表的 t 集合」+「t→t_emb 映射一致」**；`shift_v/shift_a` 参数相同既不充分也不必要。

@@ -19,6 +19,7 @@ Nodes (Save/Load behave like Save Image / Load Image):
   H3ExactAdaLNBake    full teacher MODEL + sigmas -> H3_ADALN_TABLE (offline)
   H3ExactAdaLNSave    H3_ADALN_TABLE -> shareable .safetensors in output/
   H3ExactAdaLNLoad    upload / pick a table file -> H3_ADALN_TABLE
+  H3AdaLNMerge        two recorded tables -> one bX-49 hybrid table
   H3ExactAdaLNApply   pruned MODEL + H3_ADALN_TABLE -> patched MODEL
   H3LatentCompare     verification: bitwise latent comparison
   H3LatentSave        NestedTensor-aware latent writer

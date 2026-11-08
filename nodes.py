@@ -164,6 +164,21 @@ def _adaln_lora_fingerprint(model):
         model, lambda k: "time_embedder" in k or "adaln_proj" in k)
 
 
+def _lora_key_fingerprint(model):
+    """Legacy key-name-only digest, kept for tables from older builds.
+
+    Those tables store this value in `lora_fingerprint`, so validating them
+    against the weight-aware digest would reject a perfectly valid table.
+    New tables stored by this build carry it as `lora_fingerprint_keys` and
+    are validated strictly.
+    """
+    patches = getattr(model, "patches", {}) or {}
+    keys = sorted(k for k in patches
+                  if "time_embedder" not in k and "adaln_proj" not in k)
+    digest = hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()[:16]
+    return digest, len(keys)
+
+
 def _dm_of(model):
     return getattr(getattr(model, "model", None), "diffusion_model", None)
 
@@ -264,12 +279,14 @@ class H3AdaLNRecord:
             pass
 
         fp, count = _lora_fingerprint(model)
+        keys_fp, _ = _lora_key_fingerprint(model)
         adaln_fp, _ = _adaln_lora_fingerprint(model)
         shift_v, shift_a = _auto_shifts(model)
         meta = {
             "teacher": teacher_tag or "(unspecified full checkpoint)",
             "lora_tag": lora_tag,
             "lora_fingerprint": fp,
+            "lora_fingerprint_keys": keys_fp,
             "lora_patch_count": str(count),
             "adaln_lora_fingerprint": adaln_fp,
             "sigmas": "[]",
@@ -395,11 +412,13 @@ class H3ExactAdaLNBake:
 
         dm = model.model.diffusion_model
         fingerprint, patch_count = _lora_fingerprint(model)
+        keys_fingerprint, _ = _lora_key_fingerprint(model)
         adaln_fingerprint, _ = _adaln_lora_fingerprint(model)
         meta = {
             "teacher": teacher_tag or "(unspecified full checkpoint)",
             "lora_tag": lora_tag,
             "lora_fingerprint": fingerprint,
+            "lora_fingerprint_keys": keys_fingerprint,
             "lora_patch_count": str(patch_count),
             "adaln_lora_fingerprint": adaln_fingerprint,
             "sigmas": json.dumps([float(s) for s in sigma_values]),
@@ -619,6 +638,67 @@ class H3ExactAdaLNLoad:
         return {"ui": {"text": [report]}, "result": (table, report)}
 
 
+class H3AdaLNMerge:
+    """Assemble the exact table for a bX-49 hybrid from two recorded tables.
+
+    A `bX-49` checkpoint is curve-shaped everywhere (51 x `[96768, 8]`, no
+    `time_embedder`), with blocks X..49 taken from a second teacher. Record
+    cannot run on it, and its 8-wide curve cannot carry the teachers' full
+    modulation -- so record each full teacher separately, then merge:
+    blocks 0..X-1 from A, blocks X..49 from B. Every block stays a row its
+    teacher actually produced, so replay is exact per block.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "table_a": (TABLE_TYPE, {
+                    "tooltip": "Base teacher record (e.g. FL2VA full)."}),
+                "table_b": (TABLE_TYPE, {
+                    "tooltip": "Tail donor record (e.g. Ref2VA full)."}),
+                "split": ("INT", {
+                    "default": 25, "min": 0, "max": 50, "step": 1,
+                    "tooltip": "First block taken from table_b. b25-49 -> 25."}),
+                "final_from": (["a", "b"], {
+                    "default": "a",
+                    "tooltip": "Which table supplies final_layer. bX-49 keeps "
+                               "the base teacher's final layer -> 'a'."}),
+            },
+            "optional": {
+                "after": ("*", {"tooltip": _AFTER_DOC}),
+            },
+        }
+
+    RETURN_TYPES = (TABLE_TYPE, "STRING")
+    RETURN_NAMES = ("table", "report")
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, table_a, table_b, split=25, final_from="a", after=None):
+        merged = table_io.merge_tables(
+            table_a, table_b, split=split, final_from=final_from)
+        source_a = merged.meta.get("hybrid_source_a", "?")
+        source_b = merged.meta.get("hybrid_source_b", "?")
+        seg_a = "blocks 0-{}".format(split - 1) if split > 0 else "blocks (none)"
+        seg_b = "blocks {}-49".format(split) if split < 50 else "blocks (none)"
+        report = "\n".join([
+            "=== H3 AdaLN merge (bX-49 hybrid) ===",
+            "{} : A = {}".format(seg_a, source_a),
+            "{} : B = {}".format(seg_b, source_b),
+            "final_layer    : {}".format("A" if final_from == "a" else "B"),
+            "t rows         : {}".format(len(merged.t_values)),
+            "projections    : {}".format(merged.projections()),
+            "out dtype      : {}".format(merged.out_dtype),
+            "table size     : {:.1f} MiB".format(merged.size_bytes() / (1 << 20)),
+            "lora fp        : A={} / B={}".format(
+                merged.meta.get("hybrid_lora_fp_a", "?"),
+                merged.meta.get("hybrid_lora_fp_b", "?")),
+        ])
+        logging.info("%s", report)
+        return (merged, report)
+
+
 class H3ExactAdaLNApply:
     """Replace all 51 AdaLN projections with rows from a loaded table."""
 
@@ -653,8 +733,15 @@ class H3ExactAdaLNApply:
         dm = model.model.diffusion_model
         arch = "pruned/curve" if getattr(dm, "use_adaln_curves", False) else "full"
         current_fp, current_count = _lora_fingerprint(model)
+        current_keys_fp, _ = _lora_key_fingerprint(model)
         baked_fp = table.meta.get("lora_fingerprint", "")
-        fp_ok = (current_fp == baked_fp)
+        baked_keys_fp = table.meta.get("lora_fingerprint_keys", "")
+        if baked_keys_fp:
+            fp_ok = (current_fp == baked_fp)
+        else:
+            # Table written by an older build: only the key-name digest is
+            # stored, so that is the strongest check it can support.
+            fp_ok = bool(current_keys_fp) and current_keys_fp == baked_fp
         teacher_ok = (not expected_teacher) or (
             expected_teacher in table.meta.get("teacher", ""))
         adaln_baked = table.meta.get("adaln_lora_fingerprint", "")
@@ -704,7 +791,9 @@ class H3ExactAdaLNApply:
             "provenance     : {}".format(table.meta.get("record_mode", "offline bake")),
             "target arch    : {}".format(arch),
             "hooked modules : {}".format(n),
-            "lora fp        : {} ({})".format(current_fp, "match" if fp_ok else "MISMATCH"),
+            "lora fp        : {} ({}){}".format(
+                current_fp, "match" if fp_ok else "MISMATCH",
+                "" if baked_keys_fp else " [legacy table: keys-only check]"),
             "adaln lora fp  : {} / {} ({})".format(
                 adaln_baked or "(none)", adaln_current or "(none)",
                 "match" if adaln_ok else "MISMATCH"),
@@ -887,6 +976,7 @@ NODE_CLASS_MAPPINGS = {
     "H3ExactAdaLNBake": H3ExactAdaLNBake,
     "H3ExactAdaLNSave": H3ExactAdaLNSave,
     "H3ExactAdaLNLoad": H3ExactAdaLNLoad,
+    "H3AdaLNMerge": H3AdaLNMerge,
     "H3ExactAdaLNApply": H3ExactAdaLNApply,
     "H3LatentCompare": H3LatentCompare,
     "H3LatentSave": latent_io.H3LatentSave,
@@ -897,6 +987,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ExactAdaLNBake": "H3 Exact AdaLN Bake (offline, approximate)",
     "H3ExactAdaLNSave": "H3 Exact AdaLN Save Table",
     "H3ExactAdaLNLoad": "H3 Exact AdaLN Load Table",
+    "H3AdaLNMerge": "H3 AdaLN Merge (bX-49 hybrid)",
     "H3ExactAdaLNApply": "H3 Exact AdaLN Apply (pruned base)",
     "H3LatentCompare": "H3 Latent Compare (verification)",
     "H3LatentSave": "H3 Latent Save (NestedTensor)",
