@@ -211,6 +211,16 @@ def _resolve_checkpoint(name):
     return None
 
 
+def _clear_time_embedder_patch(model):
+    """Undo a previous `time_embedder_from` swap on this ModelPatcher."""
+    prev = getattr(model, "_h3_te_object_patch", None)
+    if prev is not None:
+        model.add_object_patch(prev[0], prev[1])
+        model._h3_te_object_patch = None
+        return True
+    return False
+
+
 def _patch_time_embedder(model, name):
     """Substitute another checkpoint's `time_embedder.*` into this MODEL.
 
@@ -220,6 +230,9 @@ def _patch_time_embedder(model, name):
     the donor's embedding, which is *not* what those blocks see inside a hybrid.
     Swapping the embedding in first makes the recording identical to recording
     the assembled hybrid directly -- without needing the 34 GB file.
+
+    Returns `(n_tensors, module_or_None, mode)` where mode is "module" for the
+    exact path and "weights" for the bf16 fallback (not bitwise).
     """
     path = _resolve_checkpoint(name)
     if not path:
@@ -231,12 +244,10 @@ def _patch_time_embedder(model, name):
         from safetensors import safe_open
     except Exception as e:  # pragma: no cover
         raise RuntimeError("H3AdaLNRecord: safetensors unavailable: %s" % e)
-    def _read(name):
-        with safe_open(path, framework="pt", device="cpu") as f:
-            return {k.split("time_embedder.", 1)[1]: f.get_tensor(k)
-                    for k in f.keys() if "time_embedder." in k}
 
-    tensors = _read(path)
+    with safe_open(path, framework="pt", device="cpu") as f:
+        tensors = {k.split("time_embedder.", 1)[1]: f.get_tensor(k)
+                   for k in f.keys() if "time_embedder." in k}
     if not tensors:
         raise RuntimeError(
             "H3AdaLNRecord: {} contains no `time_embedder.*` tensors -- it is a "
@@ -247,24 +258,34 @@ def _patch_time_embedder(model, name):
     # `patch_weight_to_device`, which casts to lora_compute_dtype (bf16) and
     # would round the donor's fp32 embedding -- that alone moves the modulation
     # by ~1e-1 and is exactly what a bitwise match cannot tolerate.
+    swapped = None
     try:
         import copy as _copy
         live = model.get_model_object("diffusion_model.time_embedder")
         fresh = _copy.deepcopy(live)
         own = fresh.state_dict()
-        moved = 0
+        bad = [k for k in tensors if k not in own or tuple(own[k].shape) != tuple(tensors[k].shape)]
+        if bad:
+            # A partial swap would silently mix two embeddings -- refuse.
+            raise RuntimeError(
+                "H3AdaLNRecord: {} does not match this teacher's time_embedder "
+                "({} of {} tensors differ in name/shape: {})".format(
+                    os.path.basename(path), len(bad), len(tensors), ", ".join(bad[:4])))
         for k, t in tensors.items():
-            if k in own and own[k].shape == t.shape:
-                own[k] = t.to(own[k].dtype)
-                moved += 1
-        if moved:
-            fresh.load_state_dict(own, strict=False)
-            model.add_object_patch("diffusion_model.time_embedder", fresh)
-            if model.get_model_object("diffusion_model.time_embedder") is fresh:
-                return moved, fresh
+            own[k] = t.to(own[k].dtype)
+        fresh.load_state_dict(own, strict=False)
+        model.add_object_patch("diffusion_model.time_embedder", fresh)
+        if model.get_model_object("diffusion_model.time_embedder") is not fresh:
+            raise RuntimeError("object patch did not take effect")
+        model._h3_te_object_patch = ("diffusion_model.time_embedder", live)
+        swapped = fresh
     except Exception as e:
-        logging.warning("H3AdaLNRecord: object patch failed (%s: %s); falling back "
-                        "to weight patches", type(e).__name__, e)
+        logging.warning("H3AdaLNRecord: exact time_embedder swap failed (%s: %s); "
+                        "falling back to weight patches, which round to bf16 and "
+                        "are NOT bitwise", type(e).__name__, e)
+
+    if swapped is not None:
+        return len(tensors), swapped, "module"
 
     patches = {}
     for k, t in tensors.items():
@@ -283,7 +304,7 @@ def _patch_time_embedder(model, name):
             "H3AdaLNRecord: time_embedder_from={!r} was read ({} tensors) but the "
             "model accepted none of the keys -- its time_embedder is not exposed "
             "to weight patches in this ComfyUI build.".format(name, len(tensors)))
-    return len(applied), None
+    return len(applied), None, "weights"
 
 
 def _clear_registered(model, attr):
@@ -377,11 +398,29 @@ class H3AdaLNRecord:
         if dm is None:
             raise RuntimeError("H3AdaLNRecord: expected a ComfyUI MODEL (ModelPatcher) "
                                "for MiniMax-H3")
+        prev = getattr(model, "_h3_recorder", None)
+        if prev is not None and not getattr(prev, "t_values", None):
+            logging.warning("H3AdaLNRecord: a previous Record node on this MODEL "
+                            "had not finished; only one recorder can be live per "
+                            "model, so it is being replaced (its table stays empty)")
         _clear_registered(model, "_h3_recorders")
 
-        te_patch, te_module = 0, None
+        _clear_time_embedder_patch(model)
+        te_patch, te_module, te_mode = 0, None, ""
         if (time_embedder_from or "").strip():
-            te_patch, te_module = _patch_time_embedder(model, time_embedder_from)
+            # A LoRA that patches time_embedder cannot survive the module swap:
+            # its delta is applied to the original module, which the swap then
+            # replaces. Refuse instead of recording a table that silently lost it.
+            te_keys = [k for k in (getattr(model, "patches", {}) or {})
+                       if "time_embedder" in k]
+            if te_keys:
+                raise RuntimeError(
+                    "H3AdaLNRecord: this MODEL carries {} LoRA patch(es) on "
+                    "time_embedder ({}). time_embedder_from would silently drop "
+                    "them -- record the donor without that LoRA, or clear "
+                    "time_embedder_from.".format(
+                        len(te_keys), ", ".join(sorted(te_keys)[:3])))
+            te_patch, te_module, te_mode = _patch_time_embedder(model, time_embedder_from)
 
         recorder = record_engine.AdaLNRecorder(model, dm, mode=mode, tag=teacher_tag,
                                                te_override=te_module)
@@ -419,6 +458,7 @@ class H3AdaLNRecord:
         if te_patch:
             meta["time_embedder_from"] = time_embedder_from.strip()
             meta["time_embedder_tensors"] = str(te_patch)
+            meta["time_embedder_patch"] = te_mode
         table = table_io.AdaLNTable([], {}, meta, recorder=recorder)
 
         report = "\n".join([
@@ -428,8 +468,10 @@ class H3AdaLNRecord:
             "lora fp        : {} ({} non-AdaLN keys)".format(fp, count),
             "shift_v / a    : {} / {}".format(shift_v, shift_a),
         ] + ([
-            "time_embedder  : PATCHED from {!r} ({} tensors)".format(
-                meta["time_embedder_from"], te_patch),
+            "time_embedder  : PATCHED from {!r} ({} tensors, {})".format(
+                meta["time_embedder_from"], te_patch,
+                "module swap - exact" if te_mode == "module"
+                else "weight patch - bf16, NOT bitwise"),
         ] if te_patch else []) + [
             "",
             "The table is EMPTY until the sampler runs. Anything that reads it",
@@ -818,6 +860,12 @@ class H3AdaLNMerge:
             "lora fp        : A={} / B={}".format(
                 merged.meta.get("hybrid_lora_fp_a", "?"),
                 merged.meta.get("hybrid_lora_fp_b", "?")),
+            "time_embedder  : A={} / B={}{}".format(
+                merged.meta.get("hybrid_te_from_a") or "(own)",
+                merged.meta.get("hybrid_te_from_b") or "(own)",
+                "" if (split <= 0 or merged.meta.get("hybrid_te_from_b"))
+                else "  <-- tail uses the donor's own embedding: this is the OLD "
+                     "recipe and differs from a real bX-49 hybrid"),
         ])
         logging.info("%s", report)
         return (merged, report)

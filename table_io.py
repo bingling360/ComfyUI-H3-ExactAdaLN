@@ -267,6 +267,11 @@ def merge_tables(table_a, table_b, split=25, final_from="a"):
         "hybrid_final_from": final_from,
         "hybrid_source_a": a_teacher,
         "hybrid_source_b": b_teacher,
+        # Audit trail for the bX-49 recipe: a donor recorded with the base
+        # teacher's embedding is a *different* table from the donor recorded
+        # as-is, and only the former matches the assembled hybrid.
+        "hybrid_te_from_a": a.meta.get("time_embedder_from", ""),
+        "hybrid_te_from_b": b.meta.get("time_embedder_from", ""),
         "hybrid_lora_fp_a": keys_a or fp_a,
         "hybrid_lora_fp_b": keys_b or fp_b,
         "t_count": str(len(a.t_values)),

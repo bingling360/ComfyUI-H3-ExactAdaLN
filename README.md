@@ -331,6 +331,22 @@ would run through `patch_weight_to_device`, be cast to `lora_compute_dtype`
 (bf16) and stay there, while the real model keeps the embedding in fp32 —
 that alone moves the modulation by ~1e-1.
 
+Edge cases the node refuses or repairs instead of getting quietly wrong:
+
+- donor tensors that do not match the teacher's `time_embedder` in name or shape
+  (a *partial* swap would mix two embeddings) -> hard error;
+- a donor with no `time_embedder.*` at all (a pruned file) -> hard error;
+- a MODEL that already carries a LoRA patch on `time_embedder` -> hard error,
+  because the module swap would drop that LoRA's timestep delta;
+- two Record nodes on the same MODEL: only one recorder can be live, the
+  second replaces the first (and the first table stays empty);
+- re-running Record without `time_embedder_from` after one that used it: the
+  previous swap is undone first, so the second table is the donor's native one.
+
+If the module swap is impossible in a given ComfyUI build the node falls back
+to weight patches and says so in the report — that path rounds the embedding to
+bf16 and is **not** bitwise.
+
 If the merged table and the hybrid disagree, the numbers are large enough to
 see: applying the old merged table to the pruned b25-49 and comparing against
 the full hybrid gives `psnr=22.20 dB` (video) / `31.10 dB` (audio), while the

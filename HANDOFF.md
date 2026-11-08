@@ -397,6 +397,20 @@ VERDICT: PASS - bitwise identical
   否则采样时报 `blocks.0 fired before time_embedder`。`AdaLNRecorder` 因此新增
   `te_override` 参数。
 
+护栏（2026-11-08 晚补，均实测过）：
+
+| 情况 | 行为 |
+|---|---|
+| 供体张量名字/形状对不上 | 硬报错（**部分替换会混两个嵌入**，绝不允许） |
+| 供体没有 `time_embedder.*`（pruned 文件） | 硬报错，提示不能当嵌入源 |
+| 模型上已有 `time_embedder` 的 LoRA patch | 硬报错（模块替换会把这部分 delta 丢掉） |
+| 同一个 MODEL 上挂两个 Record | 只保留最后一个（前者表为空），日志告警 |
+| 先带 `time_embedder_from` 录过、再不带地录 | 先撤销上次的模块替换，第二次录到的是供体原生值（实测 50/50 对得上 `t3_ref`） |
+| 模块替换不可用，退回 weight patch | 报告里写明 `weight patch - bf16, NOT bitwise`，不再假装是精确路径 |
+
+合并表新增 `hybrid_te_from_a` / `hybrid_te_from_b` 两个元数据；如果 split>0
+而 B 没带嵌入覆盖，Merge 的报告会明确标出「这是老配方」。
+
 ### 11.4 pruned b25-49 的真实构成（逐张量核对）
 
 `minimax_h3_hybrid_fl2va_ref2va_b25-49-int8`：
