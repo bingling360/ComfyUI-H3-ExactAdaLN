@@ -323,6 +323,12 @@ class H3AdaLN:
                 "table_in": (TABLE_TYPE, {"tooltip":
                         "Optional. Connect a table produced earlier in the SAME "
                         "prompt (A/B verification); otherwise the picker wins."}),
+                "after": ("*", {"tooltip":
+                        "Ordering-only input. Connect the other chain's LATENT "
+                        "when doing record -> apply inside one prompt with a "
+                        "sampler that has no `after` socket of its own (e.g. "
+                        "SelfLift / director chains): it forces that chain to "
+                        "finish sampling before this node consumes the table."}),
             },
         }
 
@@ -335,7 +341,10 @@ class H3AdaLN:
     def run(self, model, mode, table="", table_b="", table_source="auto",
             table_text="", table_b_text="", split=25, final_from="a",
             strictness="strict", record_name="", model_tag="", lora_tag="",
-            pass_tag="", scheduler_tag="", table_in=None):
+            pass_tag="", scheduler_tag="", table_in=None, after=None):
+        # `after` is intentionally unused: ComfyUI only needs the edge to order
+        # the graph, so a record chain can finish before an apply chain reads
+        # the (in-memory) table in samplers that expose no `after` socket.
         mode = (mode or "apply").lower()
         if mode == "off":
             _nodes._clear_registered(model, "_h3_exact_runtimes")

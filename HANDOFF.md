@@ -575,6 +575,54 @@ SelfLift 特有的。已把 `H3AdaLN` 插进两份 UI 工作流（YZ 版插在
 成品工作流：`D:/下载/导演台二采+自定义sigmas (2)_H3AdaLN.json`
 （22 节点，一采/二采各插一个 `H3AdaLN`，已填好 `table_text` 与 `pass_tag`）。
 
+### 11.6g SelfLift 源码排查：残差与插件无关（2026-11-09）
+
+读 `comfyui-SelfLift` 源码定位 §11.6d 的 ~30 dB 残差。
+
+**SelfLift 在两段采样之间插入了一个转换点**（`nodes.py:229`
+`progressive_sample`），流程是：
+
+1. 低分辨率段 `comfy.samplers.sample(low_model, ..., sigmas[:k+1])`；
+2. 取最后一次评估的 x0 作为 clean endpoint（Eq.3，最后一次 Euler 更新被丢弃）；
+3. `paired_lifts()`：要么走 VAE decode → 放大 → encode，要么走**外部
+   学习式上采样器** `LatentResizer3D`（`h3_upscaler.py`，12 个 3D ResBlock，
+   `eval()` 关掉 dropout）。YZ 工作流是 `rho=0` +
+   `h3_upscaler_lms_v0.1.safetensors`，因此走后者、跳过 VAE 往返；
+4. `artifact_aware_consistency_lift()`（rho=0 时直接返回 z_lat）；
+5. `prepare_noise(z0_high, seed+1)` 重加噪 + `noise_scaling` + `_euler_step`
+   重建状态（`comfy/sample.py:27` 用局部 `torch.manual_seed`，确定性）；
+6. 高分辨率段 `comfy.samplers.sample(high_model, resume_noise=全零, ...,
+   sigmas[k:])`。
+
+`low_model`/`high_model` 只在有 noise_mask 时才 `clone()`；YZ 没有 mask，
+所以两条链都直接挂在传入的 MODEL 上，hook 不会丢。`model_hires=None` 时
+高段沿用同一个模型 —— 这也是为什么一张 3 行表能覆盖两段。
+
+**定位实验**：临时把 `_debug_dump` 改成保存原始张量（已恢复源码），
+在干净环境重新录表并跑「A 链全量原生 / B 链剪枝+表」同 prompt 双链：
+
+| 转换点张量 | shape | A vs B |
+|---|---|---|
+| `z0_low`（低段 clean endpoint） | (1,24,2,4,8) | **逐位一致** |
+| `z_lat`（学习式上采样器输出） | (1,24,2,9,16) | **逐位一致** |
+| `z0_high`（校正后终点） | (1,24,2,9,16) | **逐位一致** |
+
+即低段模型输出、独立上采样器网络、校正结果全一致；分叉只发生在
+**转换点之后**（重加噪 + 高分辨率段）。而表在高段也是 102/102 精确注入、
+0 回退、0 native 步。同模型双链在干净环境下逐位 PASS，排除了双链非确定。
+
+**结论**：残差不在表的覆盖范围。最合理的解释是同 prompt 里
+34GB 全量模型与 20GB 剪枝模型的显存换页路径不同，int8 反量化在高分辨率
+网格下差 1 ulp，被 SelfLift 的转换点/高段放大成 ~30 dB。这是
+「SelfLift + 双模型 + 显存状态」的组合效应，**不是插件 bug，也不需要为它
+改插件**。判断表是否生效应看注入日志（`exact matches` / `native steps`），
+而不是最终 latent 的 PSNR —— 后者会被转换点之后的非 AdaLN 路径污染。
+
+**做了一处适配**：`H3AdaLN` 加回 `after` 排序输入（仅用于拓扑排序，不参与
+计算）。SelfLift / 导演台这类采样器没有自己的 `after` 接口，用它可以把
+「同一个 prompt 内录表 → 紧接着用表」的两条链强制排序，让 `table_in`
+直连可靠工作，避免跨 prompt 时显存状态不同带来的额外扰动。
+
 ### 11.7 尚未做
 
 - ~~b15-49 / b20-49 等其他切分的全量 teacher~~ 已出 b5/b20/b25/b30/b45，发布在 `binglingzhimeng/MiniMax-H3-b25-49-full`。

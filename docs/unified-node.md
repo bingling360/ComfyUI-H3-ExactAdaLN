@@ -95,7 +95,8 @@ recorder 已经在统计 `repeat_conflicts` 与 `max_repeat_delta`。
   lora_tag     STRING                            record 时写进名字
   pass_tag     STRING                            可选；一个工作流录两个模型时用来区分（见 §4.2）
   table_in     H3_ADALN_TABLE (可选)             同一次运行内做 A/B 时用
-  after        * (可选)                          同上
+  after        * (可选)                          仅排序：另一条链的 LATENT，
+                                                 让无 after 接口的采样器也能同 prompt 录用
 
 输出
   model        MODEL
@@ -259,6 +260,22 @@ tag：一张表覆盖两段 t 并集即可（§2.1）。
 验证注意：`H3SeamlessChainSampler` 的 IMAGE 输出是占位全零，真实 latent 在
 `output/h3_projects/<存档目录>/seg_000.pt`；且导演台按目录缓存分段，
 换模型不重算 —— 比对前要换新目录、删 `h3chain_state.json`、重启清缓存。
+
+## 8.4 SelfLift 类二段采样器的边界（2026-11-09）
+
+SelfLift 在两段之间做 clean endpoint → 学习式 latent 上采样器
+`LatentResizer3D`（或 VAE 往返）→ 重加噪 → 高分辨率段。实测把这些中间
+张量 dump 出来，A/B 两条链在转换点**之前**全部逐位一致，分叉只发生在
+转换点**之后**；而表在两段都是 102/102 精确注入、0 回退。
+
+所以表能做的已经全做了。剩余 ~30 dB 是转换点之后的非 AdaLN 路径
+（同 prompt 双模型显存换页导致 int8 反量化差 1 ulp 并被放大），不是表失效。
+**不要把最终 latent 的 PSNR 当作表是否生效的判据**，看注入日志的
+`exact matches` / `native steps` 才是。
+
+加了 `after` 排序输入：把另一条链的 LATENT 接进来，可强制
+「同 prompt 录表 → 用表」的顺序，让 `table_in` 直连在这类无 after 接口的
+采样器上可靠工作。
 
 ## 9. 已知不解决
 
