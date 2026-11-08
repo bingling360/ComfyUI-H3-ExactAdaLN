@@ -463,6 +463,8 @@ tests/             test_exact.py (numbers), test_merge.py (hybrid merge),
                    test_workflows.py (graph structure)
 tools/             workflow generators (incl. build_hybrid.py) + fetch helpers
 HANDOFF.md         repair plan, root-cause evidence and per-phase status
+docs/unified-node.md  one-node design: record + apply + merge, t-keyed tables
+h3_unified.py      experimental unified node (not registered yet)
 ```
 
 The workflow JSONs are **generated**, never hand-edited:
