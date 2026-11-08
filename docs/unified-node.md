@@ -240,6 +240,26 @@ tag：一张表覆盖两段 t 并集即可（§2.1）。
   （不加表是 27.24 dB / 25.70 dB）。表有效但不完整 —— 残差来自
   SelfLift 的高/低分辨率机制，尚待定位。
 
+## 8.3 导演台二采的分表验证（2026-11-09）
+
+`导演台二采+自定义sigmas (2).json`：一采 b25-49、二采 ref2va（不同模型），
+各自 ManualSigmas，提示词内嵌在采样器的导演台状态 JSON 中。
+
+两个 `H3AdaLN` 节点各挂各的模型链，用 `pass_tag=p1/p2` 分别录出两张表：
+指纹不同（full 教师不同）、t 集合不重叠（一采 0~.83、二采 .65~.94）、
+0 冲突。同一 prompt 双链对照：
+
+- 有表：`video` / `audio` 都 `equal=True, psnr=inf`（注入 2 次）；
+- 无表：14.37 dB / 16.25 dB；
+- 交叉表：strict 直接报 `t-set mismatch`（一采 t=0 不在 p2 表）。
+
+即：分表机制正确且必要；`_last_table.json` 在多 pass 录制时会被覆盖，
+应用侧必须用 `table_text` 显式指定。
+
+验证注意：`H3SeamlessChainSampler` 的 IMAGE 输出是占位全零，真实 latent 在
+`output/h3_projects/<存档目录>/seg_000.pt`；且导演台按目录缓存分段，
+换模型不重算 —— 比对前要换新目录、删 `h3chain_state.json`、重启清缓存。
+
 ## 9. 已知不解决
 
 - 运行中改 AdaLN LoRA：仍要求重录（检测到冲突就拒绝保存）。

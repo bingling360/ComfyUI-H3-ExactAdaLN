@@ -526,6 +526,55 @@ SelfLift 特有的。已把 `H3AdaLN` 插进两份 UI 工作流（YZ 版插在
 `模型` 总线前，DMAD 版插在 `ModelAttentionBackend` 之后），
 成品在 `D:/下载/*_H3AdaLN.json`。
 
+### 11.6f 导演台二采（不同模型 + 自定义 sigmas）→ 分表机制验证通过（2026-11-09）
+
+`导演台二采+自定义sigmas (2).json`：20 节点，一采 `b25-49-int8`、
+二采 `ref2va_pruned_int8_convrot`（**两个不同模型**），各自 `ManualSigmas`
+（一采 `1,0.86,0.55,0`、二采 `0.35,0.2084,0`），提示词内嵌在
+`H3SeamlessChainSampler` 的「导演台状态」JSON 里，没有 CLIPTextEncode 节点。
+（用户先给的 (1) 版二采是 `ref2va_pruned_w4a8_mixed`，没有对应全量教师，
+因此换成 (2) 版验证。）
+
+**两个节点各挂各的模型链，各自 `pass_tag` 造表**：
+
+| 表 | 教师 | t 行数 | model fp | lora fp | pass_tag | t 集合 |
+|---|---|---|---|---|---|---|
+| `seq_p1_lowres` | b25-49 full | 5 | `e8008a9690aa` | `86c8f90a…` | p1 | 0, .14, .45, .494, .831 |
+| `seq_p2_lowres` | ref2va full | 4 | `03845c348585` | `001c095c…` | p2 | .65, .792, .881, .938 |
+
+两表指纹不同、t 集合不重叠、0 冲突 —— 证明 hook 不会串台，
+**一采/二采确实各采各的**。两个 `record` 节点在同一 prompt 里都触发了
+`ON_CLEANUP` 并各自落盘。注意 `_last_table.json` 会被后写的覆盖，
+所以多 pass 应用时必须用 `table_text` 显式指定，不能靠 `auto/last`。
+
+**结果（同 prompt 双链，A 链两个全量教师原生，B 链两个剪枝基座 + 各自表）**：
+
+| 组合 | video | audio | 注入 |
+|---|---|---|---|
+| 有表 | `equal=True psnr=inf` | `equal=True psnr=inf` | 2 次 |
+| 无表（mode=off） | 14.37 dB | 16.25 dB | 0 次 |
+| 交叉表（一采用 p2、二采用 p1） | strict 报错 `t-set mismatch`（一采 t=0 不在 p2 表） | — | — |
+
+说明分表不仅「能工作」，而且**必要**：两个 pass 的 t 集合不重叠，
+互换会被 t-set 校验挡住。这也进一步收窄了 §11.6d 的结论 ——
+普通的「一采 + 二采 + 不同模型」不是问题，残差确实是 SelfLift 特有机制。
+
+**两个验证路上的坑（重要）**：
+
+1. `H3SeamlessChainSampler` 的 `图像` 输出在「自动保存=分段」模式下是
+   **全零占位张量**，真实 latent 写到
+   `output/h3_projects/<存档目录>/seg_000.pt`。拿 IMAGE 输出比较会得到
+   假的 `equal=True`。
+2. 导演台按「存档目录」缓存分段，且有全局 `h3chain_state.json`；
+   换模型/换表不会让它重算。跨 prompt 比较会读到旧结果（同样是假 PASS）。
+   **必须每次用全新目录名 + 删 `h3chain_state.json` + 重启 ComfyUI 清内存缓存**，
+   并比较 `seg_000.pt` 里的 `video` / `audio` 两个张量。
+3. `BlockSparseAttention` 是动态 COMBO（widget 值与 API 输入不一一对应），
+   构造 API prompt 时两条链同等跳过；它只是注意力性能优化，不影响 A/B 判定。
+
+成品工作流：`D:/下载/导演台二采+自定义sigmas (2)_H3AdaLN.json`
+（22 节点，一采/二采各插一个 `H3AdaLN`，已填好 `table_text` 与 `pass_tag`）。
+
 ### 11.7 尚未做
 
 - ~~b15-49 / b20-49 等其他切分的全量 teacher~~ 已出 b5/b20/b25/b30/b45，发布在 `binglingzhimeng/MiniMax-H3-b25-49-full`。
