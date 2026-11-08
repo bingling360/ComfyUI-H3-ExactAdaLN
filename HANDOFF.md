@@ -209,6 +209,23 @@ Phase 1–4 全部落地并推送。核心变化：**放弃"离线独立 Bake"�
 4/4 步 `torch.equal`、`max_dist=0.000e+00`、12 次精确 t_emb 命中；
 对照组（不注入）`max_abs=3.8e-01`。
 
-**待用户在实例上验收**：跑 `05_record_strict.json`，看 Compare 是否
-`equal=True / max_abs=0 / VERDICT: PASS`；再把 Apply `mode=off` 跑一次应为 FAIL。
-`04` 保留为 Bake 离线路径的 A/B 对照（预期仍 FAIL，这正是根因证据）。
+**实例验收（2026-11-08，已完成）**：ComfyUI 0.44.0 / RTX 4080 SUPER 上用同一个
+API prompt（从 `/history` 取回）连跑三次 `05_record_strict.json`：
+
+| 次序 | Apply `mode` | Compare | 注入日志 |
+|---|---|---|---|
+| 1 | `strict` | `PASS / max_abs=0`（90.83s） | `first injection confirmed` |
+| 2 | `off` | `FAIL / max_abs=3.349e+00`（video）、`2.970e-01`（audio） | 无 —— 上一次的 hook 已被清理 |
+| 3 | `strict`（off 之后） | `PASS / max_abs=0` | `first injection confirmed` |
+
+报告落盘 `output/h3_adaln/compare_*_145323 / 145341 / 145405.txt`；修改前的首次
+PASS 日志备份在 `/root/comfyUI_pre_fix_PASS_20261108.log`。第 2/3 次证明「残留 hook
+导致对照组假 PASS」已修掉，且清理不会误伤后续 strict 运行。`04` 保留为 Bake
+离线路径的 A/B 对照（预期仍 FAIL，这正是根因证据）。
+
+**修复提交**：`274490e`（off 清理残留 hook、LoRA 指纹纳入权重与强度、hook 按
+共享 `nn.Module` 跟踪、Compare 拒绝同源输入、工作流 `widgets_values_named` /
+`properties.models` 同步、0 维 t 防崩）、`da62ef2`（工作流 JSON 统一 LF）。
+本地与实例均为 `da62ef2`；`tools/build_*.py` 重生成后 `git status` 为空
+（byte-for-byte）；`tests/test_workflows.py` 与 `tests/test_exact.py`（21 项）全过。
+5 个工作流已部署到实例 `user/default/workflows/`，ComfyUI 已重启加载新节点。

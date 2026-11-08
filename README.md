@@ -345,9 +345,10 @@ tell whether a workflow was hand-edited.
   projections / 17 t rows / 314.5 MiB and the first injection was confirmed
   (`max_dist=0.000e+00`), yet the latents still differ — that measurement is
   what identified the offline path as the root cause and motivated Record.
-- Remaining: one run of `05_record_strict.json` on the 34 GB teacher, plus the
-  `mode=off` control. Root cause, evidence and per-phase status live in
-  [`HANDOFF.md`](HANDOFF.md).
+- End-to-end on the 34 GB teacher is done: `05_record_strict.json` reports
+  `equal=True / max_abs=0 / VERDICT: PASS`, `Apply.mode=off` reports `FAIL`
+  with no injection log, and strict still passes after the control run. Root
+  cause, evidence and the verification log live in [`HANDOFF.md`](HANDOFF.md).
 
 ## Related work
 
