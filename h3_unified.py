@@ -235,10 +235,32 @@ def _save_table(table, name):
     return path
 
 
+def _is_pruned_base(dm):
+    """A curve-shaped base has no time_embedder and carries adaln_t_table."""
+    if dm is None:
+        return False
+    if bool(getattr(dm, "use_adaln_curves", False)):
+        return True
+    return (getattr(dm, "adaln_t_table", None) is not None
+            and getattr(dm, "time_embedder", None) is None)
+
+
 def _check_model(table, dm, strict):
+    """Only compare fingerprints when the target still computes its own AdaLN.
+
+    The primary use of the pack is `record on the FULL teacher -> apply to a
+    PRUNED/curve base`. Those two checkpoints deliberately have different
+    adaln_proj shapes ([96768,2688] vs [96768,8]), so an equality check here
+    would reject the very workflow the node exists for. On a pruned base the
+    stored rows *replace* the curve entirely, so the target's own AdaLN weights
+    are irrelevant.
+    """
     want = table.meta.get("model_fingerprint", "")
     if not want:
         return "model fp     : (table has none; recorded before fingerprints existed)"
+    if _is_pruned_base(dm):
+        return ("model fp     : teacher={} (target is a pruned/curve base; its "
+                "own AdaLN is replaced by the table)".format(want))
     got = model_fingerprint(dm)
     if want == got:
         return "model fp     : {} (match)".format(got)

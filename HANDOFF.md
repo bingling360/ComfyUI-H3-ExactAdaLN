@@ -472,6 +472,39 @@ VERDICT: PASS - bitwise identical
 - 已知未验：`ON_CLEANUP` 时机、COMBO 是否刷新、二采与 SelfLift 的实际行为。
   清单见 `docs/unified-node.md` §8 / §8.1。
 
+### 11.6d YZ 终极篇工作流 / SelfLift 实测（2026-11-09）
+
+把 `H3AdaLN` 插进 `YZ-MiniMax H3 终极篇-文武双全.json`（103 节点、
+Get/Set 虚拟总线、SelfLiftH3Sampler），插在 `模型` 总线之前
+（ModelPreviewOverrideKJ → H3AdaLN → SetNode #39）。
+由于参考媒体文件不在实例上，而 `MiniMaxH3ReferenceToVideo` 的 ref_* 全是
+optional，模拟时裁成 18 节点的采样主干（256x144 / 5 帧 / 4 步），两条链共用
+conditioning / sigmas / seed。
+
+**跑通的**：
+- `record` 在 `ON_CLEANUP` 落盘（3 个 t 行、55 MiB、0 冲突、2 次 forward），
+  `_last_table.json` 写对；切成 `apply` + `table_source=last` 零改动直接读到。
+- **SelfLift 两段连续采样被一张表完整覆盖**：102 次注入
+  （51 投影 × 2 次 forward），索引 `[0]` 与 `[1,2]`，`exact matches=102`、
+  `match failures=0`、`native steps=0`、`max_dist=0`。这回答了 §2.3。
+- 指纹检查修掉一个真 bug：full 教师与 pruned 基座的 adaln_proj 形状不同，
+  相等检查会误杀主路径；现在只对 full 目标比较。
+
+**没达到的**：full 原生 vs pruned+表 **不是逐位一致**。
+对照测量（同 prompt 双链、同 seed）：
+
+| 组合 | video PSNR | audio PSNR |
+|---|---|---|
+| 全量原生 vs 剪枝原生（都不加表） | 27.24 dB | 25.70 dB |
+| 全量原生 vs 剪枝 + 表 | 36.05 dB | 29.10 dB |
+
+表把差距拉近 6~9 dB，但仍有 ~30 dB 残差。注入本身是完美的，所以残差在
+**非 AdaLN 路径**：这份 pruned b25-49 与本仓库合成的全量 teacher 在这套
+工作流（ReferenceToVideo 条件、int8 VAE/CLIP、shift 12/3、显存换出）下
+并非逐位同源。此前 §11.1 的 05 工作流能逐位 PASS，是因为那边用
+MiniMaxH3ImageToVideo + shift 12/2 + 单模型压力更小的显存状态。
+这是模型对/精度问题，不是表能修的部分。
+
 ### 11.7 尚未做
 
 - ~~b15-49 / b20-49 等其他切分的全量 teacher~~ 已出 b5/b20/b25/b30/b45，发布在 `binglingzhimeng/MiniMax-H3-b25-49-full`。
