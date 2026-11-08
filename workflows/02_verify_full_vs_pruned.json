@@ -62,8 +62,7 @@
         "ver": "0.33.0",
         "models": [
           {
-            "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
             "directory": "text_encoders"
           }
         ]
@@ -74,7 +73,7 @@
         "default"
       ],
       "widgets_values_named": {
-        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
         "type": "minimax",
         "device": "default"
       },
@@ -121,8 +120,7 @@
         "ver": "0.33.0",
         "models": [
           {
-            "name": "minimax_h3_audio_vae_fp32.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
+            "name": "minimax_h3_video_vae_fp16.safetensors",
             "directory": "vae"
           }
         ]
@@ -131,7 +129,7 @@
         "minimax_h3_video_vae_fp16.safetensors"
       ],
       "widgets_values_named": {
-        "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+        "vae_name": "minimax_h3_video_vae_fp16.safetensors"
       },
       "title": "共享视频 VAE"
     },
@@ -245,10 +243,10 @@
         39
       ],
       "widgets_values_named": {
-        "prompt": "Vaporwave title sequence look: pink and blue gradient palette, VHS tracking artifacts, Greek statue motifs, chrome palm trees, RGB chromatic aberration, lo-fi retro atmosphere, mood languid and nostalgic.\n\nTimeline:\n[0s-1s] VHS static opens the frame, the title \"COMFYUI\" appears with RGB split and a slight horizontal jitter.\n[1s-2.5s] Hard cut, a Greek plaster bust close-up, pink-purple gradient sky, a pixelated sun.\n[2.5s-4s] Clean \"STARRING\" credits appear, \"LATENT\" and \"CONTROLNET\" each shown exactly once.\n[4s-5s] Final card \"DIRECTED BY COMFYUI\" holds, one VHS tracking glitch settling into stability.\n\nHard cuts only, transitions landing with tape jumps, no push-ins, no dissolves.\n\nAudio: lo-fi vaporwave score, slow drum machine with soft bass, VHS tape-noise sample joins at 2.5s, melody fading for the last 1s.\n\nAll text must be clearly legible, do not misspell English, no Chinese characters, do not repeat names or job titles, no soft dissolves, no subtitle bars.",
-        "width": 1344,
-        "height": 768,
-        "length": 73
+        "prompt": "A lone figure walking slowly through a neon-lit street at night, steady camera, shallow depth of field",
+        "width": 832,
+        "height": 480,
+        "length": 39
       },
       "title": "共享 conditioning + latent"
     },
@@ -348,7 +346,7 @@
         "euler"
       ],
       "widgets_values_named": {
-        "sampler_name": "res_multistep"
+        "sampler_name": "euler"
       },
       "title": "共享 sampler"
     },
@@ -402,8 +400,7 @@
         "ver": "0.33.0",
         "models": [
           {
-            "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "name": "minimax_h3_ref2va_int8_convrot.safetensors",
             "directory": "diffusion_models"
           }
         ]
@@ -413,7 +410,7 @@
         "default"
       ],
       "widgets_values_named": {
-        "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "unet_name": "minimax_h3_ref2va_int8_convrot.safetensors",
         "weight_dtype": "default"
       },
       "title": "A: FULL 34GB"
@@ -474,8 +471,7 @@
         "ver": "0.33.0",
         "models": [
           {
-            "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-            "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "name": "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
             "directory": "loras"
           }
         ]
@@ -485,8 +481,8 @@
         1.0
       ],
       "widgets_values_named": {
-        "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-        "strength_model": 1
+        "lora_name": "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
+        "strength_model": 1.0
       },
       "title": "A: DMAD 8-step"
     },
@@ -610,8 +606,8 @@
       ],
       "widgets_values_named": {
         "scheduler": "simple",
-        "steps": 4,
-        "denoise": 1
+        "steps": 8,
+        "denoise": 1.0
       },
       "title": "共享 sigma 网格（8 步）"
     },
@@ -778,8 +774,7 @@
         "ver": "0.33.0",
         "models": [
           {
-            "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
             "directory": "diffusion_models"
           }
         ]
@@ -789,7 +784,7 @@
         "default"
       ],
       "widgets_values_named": {
-        "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
         "weight_dtype": "default"
       },
       "title": "B: PRUNED 21GB"
@@ -850,8 +845,7 @@
         "ver": "0.33.0",
         "models": [
           {
-            "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-            "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "name": "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
             "directory": "loras"
           }
         ]
@@ -861,8 +855,8 @@
         1.0
       ],
       "widgets_values_named": {
-        "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-        "strength_model": 1
+        "lora_name": "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
+        "strength_model": 1.0
       },
       "title": "B: DMAD 8-step"
     },

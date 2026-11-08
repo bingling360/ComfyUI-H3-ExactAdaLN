@@ -58,6 +58,23 @@ def check_graph(path, d):
         if ins[dslot].get("link") != lid:
             problems.append("link {} not set on target input".format(lid))
     for n in d["nodes"]:
+        # Newer frontends may read the named-widget / asset metadata instead of
+        # the positional array. Both must describe the same run.
+        widgets = n.get("widgets_values") or []
+        named = n.get("widgets_values_named")
+        if isinstance(named, dict):
+            for i, value in enumerate(list(named.values())[:len(widgets)]):
+                if value != widgets[i]:
+                    problems.append(
+                        "node {} ({}) widgets_values_named[{}]={!r} != "
+                        "widgets_values[{}]={!r}".format(
+                            n["id"], n.get("type"), i, value, i, widgets[i]))
+                    break
+        for m in ((n.get("properties") or {}).get("models") or []):
+            if isinstance(m, dict) and m.get("name") not in widgets:
+                problems.append(
+                    "node {} ({}) properties.models name {!r} is not a widget "
+                    "value".format(n["id"], n.get("type"), m.get("name")))
         for i, inp in enumerate(n.get("inputs") or []):
             lid = inp.get("link")
             if lid is not None and not any(

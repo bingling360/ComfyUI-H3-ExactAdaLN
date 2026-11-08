@@ -116,7 +116,7 @@ class AdaLNRecorder:
         if not inputs or not torch.is_tensor(inputs[0]):
             return
         t = inputs[0].detach()
-        if t.ndim != 1 and t.numel() != max(t.shape):
+        if t.ndim != 1:
             t = t.reshape(-1)
         self._cur_t = t.reshape(-1).to(torch.float32).cpu().tolist()
         self._cur_forward += 1

@@ -97,19 +97,110 @@ def _parse_float_list(text):
     return out
 
 
-def _lora_fingerprint(model):
-    """Stable id of the non-AdaLN LoRA target set.
+def _patch_bytes(h, value, depth=0):
+    """Fold one LoRA patch entry into a digest without cloning whole weights.
 
-    AdaLN / time_embedder keys exist on the full teacher but are absent on a
-    pruned base, so they are excluded: the remaining key sets must match
-    between the record/bake chain and the apply chain.
+    ComfyUI stores patches as nested tuples whose first element is normally
+    the strength and whose later elements hold the up/down tensors. Sampling
+    only a handful of values is enough to notice a different LoRA file or a
+    changed strength, while staying cheap on a 34 GB model.
     """
-    keys = sorted(
-        k for k in getattr(model, "patches", {}).keys()
-        if "time_embedder" not in k and "adaln_proj" not in k
-    )
-    digest = hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()[:16]
-    return digest, len(keys)
+    if depth > 3:
+        return
+    if torch.is_tensor(value):
+        h.update("{}|{}|{}".format(tuple(value.shape), value.dtype,
+                                   value.numel()).encode())
+        try:
+            sample = value.detach().flatten()[:8].float().cpu().tolist()
+            h.update(repr([round(float(x), 6) for x in sample]).encode())
+        except Exception:
+            pass
+    elif isinstance(value, dict):
+        for k in sorted(value, key=str):
+            _patch_bytes(h, k, depth + 1)
+            _patch_bytes(h, value[k], depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value[:12]:
+            _patch_bytes(h, item, depth + 1)
+    elif isinstance(value, (int, float, str, bool, type(None))):
+        h.update(repr(value).encode())
+    else:
+        h.update(repr(type(value).__name__).encode())
+
+
+def _patch_set_digest(model, predicate):
+    patches = getattr(model, "patches", {}) or {}
+    keys = sorted(k for k in patches if predicate(k))
+    h = hashlib.sha256()
+    for key in keys:
+        h.update(key.encode())
+        try:
+            entries = patches.get(key, [])
+            for entry in entries[:12]:
+                _patch_bytes(h, entry)
+        except Exception:
+            pass
+    return h.hexdigest()[:16], len(keys)
+
+
+def _lora_fingerprint(model):
+    """Digest of the LoRA stack shared by the teacher and the pruned base.
+
+    AdaLN / time_embedder patch keys are kept out of the primary fingerprint:
+    they exist on the full teacher but are dropped by ComfyUI on a pruned
+    base, so requiring them to match would reject every valid table. They are
+    tracked separately by `_adaln_lora_fingerprint`.
+
+    Unlike the old key-name-only digest, this one includes patch strengths and
+    a sample of the patch weights: swapping the LoRA file or changing
+    `strength_model` must invalidate a recorded table.
+    """
+    return _patch_set_digest(
+        model, lambda k: "time_embedder" not in k and "adaln_proj" not in k)
+
+
+def _adaln_lora_fingerprint(model):
+    return _patch_set_digest(
+        model, lambda k: "time_embedder" in k or "adaln_proj" in k)
+
+
+def _dm_of(model):
+    return getattr(getattr(model, "model", None), "diffusion_model", None)
+
+
+def _clear_registered(model, attr):
+    """Remove hooks left on this shared diffusion module by earlier prompts.
+
+    ModelPatcher.clone() does not copy arbitrary attributes but it DOES share
+    the underlying nn.Module. Track registrations on the module itself, or a
+    later prompt (including an `off` control) can inherit a stale injector.
+    """
+    dm = _dm_of(model)
+    if dm is None:
+        return
+    for obj in list(getattr(dm, attr, []) or []):
+        try:
+            obj.remove()
+        except Exception:
+            pass
+    try:
+        setattr(dm, attr, [])
+    except Exception:
+        pass
+
+
+def _track_registered(model, attr, obj):
+    dm = _dm_of(model)
+    if dm is None:
+        return
+    try:
+        bucket = getattr(dm, attr, None)
+        if bucket is None:
+            bucket = []
+            setattr(dm, attr, bucket)
+        bucket.append(obj)
+    except Exception:
+        pass
 
 
 def _comfy_version():
@@ -155,20 +246,15 @@ class H3AdaLNRecord:
     CATEGORY = CATEGORY
 
     def run(self, model, mode="strict", teacher_tag="", lora_tag="", after=None):
-        dm = getattr(getattr(model, "model", None), "diffusion_model", None)
+        dm = _dm_of(model)
         if dm is None:
             raise RuntimeError("H3AdaLNRecord: expected a ComfyUI MODEL (ModelPatcher) "
                                "for MiniMax-H3")
-
-        old = getattr(model, "_h3_recorder", None)
-        if old is not None:
-            try:
-                old.remove()
-            except Exception:
-                pass
+        _clear_registered(model, "_h3_recorders")
 
         recorder = record_engine.AdaLNRecorder(model, dm, mode=mode, tag=teacher_tag)
         n = recorder.register()
+        _track_registered(model, "_h3_recorders", recorder)
         model._h3_recorder = recorder
         try:
             import comfy.patcher_extension
@@ -178,12 +264,14 @@ class H3AdaLNRecord:
             pass
 
         fp, count = _lora_fingerprint(model)
+        adaln_fp, _ = _adaln_lora_fingerprint(model)
         shift_v, shift_a = _auto_shifts(model)
         meta = {
             "teacher": teacher_tag or "(unspecified full checkpoint)",
             "lora_tag": lora_tag,
             "lora_fingerprint": fp,
             "lora_patch_count": str(count),
+            "adaln_lora_fingerprint": adaln_fp,
             "sigmas": "[]",
             "shift_v": str(float(shift_v)),
             "shift_a": str(float(shift_a)),
@@ -307,11 +395,13 @@ class H3ExactAdaLNBake:
 
         dm = model.model.diffusion_model
         fingerprint, patch_count = _lora_fingerprint(model)
+        adaln_fingerprint, _ = _adaln_lora_fingerprint(model)
         meta = {
             "teacher": teacher_tag or "(unspecified full checkpoint)",
             "lora_tag": lora_tag,
             "lora_fingerprint": fingerprint,
             "lora_patch_count": str(patch_count),
+            "adaln_lora_fingerprint": adaln_fingerprint,
             "sigmas": json.dumps([float(s) for s in sigma_values]),
             "shift_v": str(float(shift_v)),
             "shift_a": str(float(shift_a)),
@@ -552,6 +642,10 @@ class H3ExactAdaLNApply:
     CATEGORY = CATEGORY
 
     def run(self, model, table, mode, expected_teacher="", after=None):
+        # Also runs for `off`: a previous strict run may have left hooks on the
+        # shared nn.Module. Without this the negative control would keep
+        # injecting the old table and could report a false PASS.
+        _clear_registered(model, "_h3_exact_runtimes")
         if mode == "off":
             return (model, "H3ExactAdaLNApply: mode=off, model untouched (A/B control)")
 
@@ -563,11 +657,20 @@ class H3ExactAdaLNApply:
         fp_ok = (current_fp == baked_fp)
         teacher_ok = (not expected_teacher) or (
             expected_teacher in table.meta.get("teacher", ""))
+        adaln_baked = table.meta.get("adaln_lora_fingerprint", "")
+        adaln_current, _ = _adaln_lora_fingerprint(model)
+        # A pruned base legitimately has no AdaLN patches (ComfyUI drops them),
+        # so only compare when both sides actually carry an AdaLN LoRA.
+        adaln_ok = not (adaln_baked and adaln_current) or adaln_baked == adaln_current
 
         problems = []
         if not fp_ok:
             problems.append("LoRA fingerprint mismatch: table={} model={} ({} vs {} non-AdaLN keys)".format(
                 baked_fp, current_fp, table.meta.get("lora_patch_count", "?"), current_count))
+        if not adaln_ok:
+            problems.append("AdaLN/timestep LoRA fingerprint mismatch: "
+                            "table={} model={} -- re-record with this teacher LoRA".format(
+                                adaln_baked, adaln_current))
         if not teacher_ok:
             problems.append("teacher mismatch: expected {!r}, table has {!r}".format(
                 expected_teacher, table.meta.get("teacher", "")))
@@ -586,6 +689,7 @@ class H3ExactAdaLNApply:
         runtime = apply_engine.ExactAdaLNRuntime(
             table.t_values, table.raw_by_key, table.meta, dm, mode=mode)
         n = runtime.register(model)
+        _track_registered(model, "_h3_exact_runtimes", runtime)
         model._h3_exact_runtime = runtime
         try:
             import comfy.patcher_extension
@@ -601,6 +705,9 @@ class H3ExactAdaLNApply:
             "target arch    : {}".format(arch),
             "hooked modules : {}".format(n),
             "lora fp        : {} ({})".format(current_fp, "match" if fp_ok else "MISMATCH"),
+            "adaln lora fp  : {} / {} ({})".format(
+                adaln_baked or "(none)", adaln_current or "(none)",
+                "match" if adaln_ok else "MISMATCH"),
             "teacher        : {}".format(table.meta.get("teacher", "?")),
             "out dtype      : {}".format(table.out_dtype),
             "t rows         : {}".format(len(table.t_values)),
@@ -681,8 +788,15 @@ class H3LatentCompare:
             return {k.split("/", 1)[1] if k.startswith(side + "/") else k: v
                     for k, v in d.items()}
 
-        ta = strip_side(collect(latent_a, "a"), "a")
-        tb = strip_side(collect(latent_b, "b"), "b")
+        raw_a = collect(latent_a, "a")
+        raw_b = collect(latent_b, "b")
+        ta = strip_side(raw_a, "a")
+        tb = strip_side(raw_b, "b")
+        # A self-comparison is always bitwise equal. Refuse to call that PASS:
+        # the two chains in a verification graph must produce distinct tensors.
+        same_source = latent_a is latent_b or (
+            bool(raw_a) and
+            {id(v) for v in raw_a.values()} == {id(v) for v in raw_b.values()})
         def describe(obj):
             if isinstance(obj, dict):
                 items = [(k, type(v).__name__,
@@ -730,7 +844,13 @@ class H3LatentCompare:
             all_equal = all_equal and eq
             compared += 1
         lines.append("compared tensor pairs: {}".format(compared))
-        if compared == 0:
+        if same_source:
+            lines.append("WARNING: both LATENT inputs resolve to the same tensor "
+                         "objects -- check the wiring")
+        if same_source:
+            verdict = ("INCONCLUSIVE - both LATENT inputs resolve to the same "
+                       "tensor objects; a self-comparison always looks bitwise")
+        elif compared == 0:
             verdict = ("INCONCLUSIVE - no latent tensors were compared; "
                        "check the two LATENT inputs")
         elif all_equal:

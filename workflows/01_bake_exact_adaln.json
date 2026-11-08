@@ -52,8 +52,7 @@
         "ver": "0.33.0",
         "models": [
           {
-            "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "name": "minimax_h3_ref2va_int8_convrot.safetensors",
             "directory": "diffusion_models"
           }
         ]
@@ -63,7 +62,7 @@
         "default"
       ],
       "widgets_values_named": {
-        "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "unet_name": "minimax_h3_ref2va_int8_convrot.safetensors",
         "weight_dtype": "default"
       },
       "title": "FULL teacher (34GB, 不剪枝)"
@@ -124,8 +123,7 @@
         "ver": "0.33.0",
         "models": [
           {
-            "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-            "url": "https://huggingface.co/lightx2v/Minimax-h3-Turbo/resolve/main/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            "name": "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
             "directory": "loras"
           }
         ]
@@ -135,8 +133,8 @@
         1.0
       ],
       "widgets_values_named": {
-        "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-        "strength_model": 1
+        "lora_name": "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
+        "strength_model": 1.0
       },
       "title": "DMAD 8-step (与验证完全相同)"
     },
@@ -211,8 +209,8 @@
       ],
       "widgets_values_named": {
         "scheduler": "simple",
-        "steps": 4,
-        "denoise": 1
+        "steps": 8,
+        "denoise": 1.0
       },
       "title": "与验证相同的 scheduler + 8 步"
     },

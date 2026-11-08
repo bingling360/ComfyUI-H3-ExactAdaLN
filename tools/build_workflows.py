@@ -71,6 +71,47 @@ def templates():
     return {n["type"]: copy.deepcopy(n) for n in sg["nodes"]}
 
 
+def sync_widget_metadata(node, widgets):
+    """Keep named-widget / asset metadata in sync with `widgets_values`.
+
+    The blueprint ships its own checkpoint, step count and sampler. Overwriting
+    only `widgets_values` leaves `widgets_values_named` and `properties.models`
+    pointing at the original files; newer frontends may read those instead of
+    the positional array, which silently changes what the workflow runs.
+    """
+    if widgets is None:
+        return node
+    named = node.get("widgets_values_named")
+    old_named = dict(named) if isinstance(named, dict) else {}
+    if isinstance(named, dict):
+        for i, key in enumerate(list(named)):
+            if i < len(widgets):
+                named[key] = widgets[i]
+    props = node.get("properties")
+    models = props.get("models") if isinstance(props, dict) else None
+    if isinstance(models, list):
+        for m in models:
+            if not isinstance(m, dict) or "name" not in m:
+                continue
+            old = m.get("name")
+            replacement = None
+            if isinstance(named, dict):
+                for key, value in old_named.items():
+                    if value == old:
+                        replacement = named.get(key)
+                        break
+            if replacement is None and widgets and isinstance(widgets[0], str) \
+                    and widgets[0].endswith((".safetensors", ".sft", ".ckpt",
+                                             ".pt", ".gguf")):
+                replacement = widgets[0]
+            if isinstance(replacement, str) and replacement:
+                m["name"] = replacement
+                # The URL still points at the blueprint's asset; offering it
+                # for a different checkpoint is worse than not offering it.
+                m.pop("url", None)
+    return node
+
+
 class Graph:
     def __init__(self, tpl):
         self.tpl = tpl
@@ -99,6 +140,7 @@ class Graph:
         n["size"] = n.get("size") or [280, 120]
         if widgets is not None:
             n["widgets_values"] = widgets
+            sync_widget_metadata(n, widgets)
         if title:
             n["title"] = title
         self.nodes.append(n)
