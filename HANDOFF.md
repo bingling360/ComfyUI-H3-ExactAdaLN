@@ -222,8 +222,8 @@ python tools/build_hybrid.py      # 06, 07, 08
 - **必须有 Ref2VA full（34GB，带 `time_embedder`）**；只有 pruned 版无法还原。
 - 两表必须同 t 集合 / 同 LoRA / 同 strength / 同 `out_dtype`；Merge 会拒绝并列出缺失 t。
 - b25-49 是反量化后注入，目标量化档位不影响注入正确性；但 `out_dtype` 必须与 teacher 一致。
-- 端到端 bitwise 对照暂无：不存在现成的「混合 full teacher」。验证口径是表级逐块逐位 +
-  注入日志。要严格端到端，需在 FL2VA full 上把 25-49 的 AdaLN 权重 patch 成 Ref2VA 的再采样。
+- ~~端到端 bitwise 对照暂无~~ **已补（2026-11-08 晚，见 §11）**：已构建并发布全量 b25-49
+  hybrid teacher，端到端跑出 `max_abs=0.000e+00 / psnr=inf`。
 
 ---
 
@@ -339,6 +339,99 @@ cd /root/ComfyUI && (nohup python main.py --listen 0.0.0.0 > comfyUI.log 2>&1 < 
 - per-row `denoise_mask` 的 timestep 不被 Record 支持（Bake 可用 `extra_t` 覆盖）。
 - HyperFlow 式 `(t, r)` 端点条件不复现。
 - Python hook 到不了 C++ 引擎或绕过 `module.forward` 的融合 kernel。
-- bX-49 的端到端 bitwise 对照未做（见 §5.4）。
 - 低优先未修：跨次 schedule 预检、重复 t 只校验 canary `blocks.0`、`_cur_t` 非线程局部、
   bake 的 splice 分支绕过 LoRA、`dit_patch` 通道未启用。
+
+---
+
+## 11. 全量 b25-49 teacher、time_embedder 坑、LoRA 兼容性（2026-11-08 晚）
+
+### 11.1 已发布的全量混合模型
+
+`binglingzhimeng/MiniMax-H3-b25-49-full`（HF，34,038,892,334 B，
+`sha256=35a57db8…8f84f`）：FL2VA full 整机 + Ref2VA full 的 blocks 25-49
+`adaln_proj`（4 张量/块，共 100 个）。做法是「复制基座 + 原地打补丁」，尺寸不变，
+所以 `data_offsets` 与基座完全一致。校验：100/100 替换张量 == Ref 源字节，
+其余 25.63 GiB 逐字节 == FL 源，HF 上 LFS oid 与本地 sha256 一致。
+
+**端到端验证（同 LoRA、8 步 simple、shift 12/2、832x480x39）**：
+
+```
+A: full b25-49 hybrid (native)
+B: pruned b25-49 + table recorded on A
+samples__part0 / part1: equal=True max_abs=0.000e+00 psnr=inf
+VERDICT: PASS - bitwise identical
+```
+
+### 11.2 关键坑：两个 teacher 的 time_embedder 并不相同
+
+`fl2va_int8_convrot` 与 `ref2va_int8_convrot` 的 `time_embedder.proj_out.weight`
+最大差 **0.104**（`proj_in` 0.071）。所以老配方「FL 表 + Ref 表合并」在尾部
+（blocks 25-49）拿到的是 `W_ref @ e_ref(t)`，而真正的 b25-49 吃的是
+`W_ref @ e_FL(t)`。实测差异：
+
+| 尾部来源 | blocks 25-49 与全量模型的最大偏移 |
+|---|---|
+| Ref 原生录制（老配方） | 0.09 – 0.19 |
+| Ref + FL 的 time_embedder（新配方） | **0**（25/25 逐位） |
+
+端到端：老合并表注入 pruned vs 全量模型 = `22.20 dB` / `31.10 dB`。
+
+### 11.3 新配方：`H3AdaLNRecord.time_embedder_from`
+
+不用 34 GB 合并文件也能得到目标 A：
+
+1. `08` 录 FL2VA full → A 表；
+2. 录 Ref2VA full 时把 `time_embedder_from` 填成 FL 的 checkpoint → B' 表；
+3. `H3AdaLNMerge`（`split=25`、`final_from=a`）。
+
+实测：B' 的 blocks 25-49 与全量模型录出的表 **25/25 逐位一致**，
+模拟合并 `A + B'` 与全量表 **51/51 全等**。
+
+实现要点（两个都必须，缺一就会静默失败）：
+
+- **不能用 weight patch**。`patch_weight_to_device` 会把权重降到
+  `lora_compute_dtype`（bf16），而真模型里 embedding 是 fp32，单这一项就带来 ~1e-1 偏移。
+  必须 `add_object_patch("diffusion_model.time_embedder", deepcopy(...))` 整体换模块。
+- **hook 要挂到换上去的那个模块**。object patch 之后 `dm.time_embedder` 仍是旧对象，
+  否则采样时报 `blocks.0 fired before time_embedder`。`AdaLNRecorder` 因此新增
+  `te_override` 参数。
+
+### 11.4 pruned b25-49 的真实构成（逐张量核对）
+
+`minimax_h3_hybrid_fl2va_ref2va_b25-49-int8`：
+
+- blocks 0-24 `adaln_proj` == `fl2va_pruned`（逐位）
+- blocks 25-49 == `ref2va_pruned`（逐位）
+- `adaln_t_table` == `fl2va_pruned`（逐位），当前无 `time_embedder`
+
+即「基座身体 + 供体尾部旋钮」，这也说明目标 A 才是它的忠实数版本。
+注意：它自己的曲线输出反而更接近老合并表（18/18 采样行更近，mean abs
+0.003 vs 0.008）—— 因为拿基座的坐标表去喂供体的 8 维尾部权重本身就是近似。
+
+### 11.5 LoRA 兼容性（扫了实例上 104 个唯一 H3 LoRA）
+
+| 类别 | 数量 | 输入宽 | 结论 |
+|---|---|---|---|
+| 无 adaln / time_embedder 键 | 87（84%） | — | 一张表通吃 |
+| 只碰 `adaln_proj` | 7（7%） | 8（curve 形态） | 能装 pruned，会真改调制 → 要单独录 |
+| 只碰 `adaln_proj` | 10（10%） | 2688（full 形态） | 装 pruned 时被丢弃 → 想保留其 AdaLN 效果要在教师侧录 |
+| 只碰 `time_embedder` | 0 | — | — |
+
+规律：**加速/蒸馏类**（turbo、4 步、8 步 Acc、dmd）全都带 AdaLN 键；
+风格/动作/特效/滑块类全都不带。DMAD 8 步 LoRA 属干净的一类。
+
+跨 LoRA 实测：用 DMAD 8 步录的表，配 turbo 8 步跑 pruned，对照全量 + turbo 原生
+`equal=True / psnr=inf`。
+
+### 11.6 Apply 的 strict 判定已放宽
+
+非 AdaLN 的 LoRA 指纹不再让 `strict` 硬失败（只报告「differs - harmless」），因为
+调制只由 `adaln_proj` / `time_embedder` 决定。仍然硬失败：AdaLN/时间步指纹不匹配、
+显式 `expected_teacher` 不匹配、t 集合不匹配。此前跨 LoRA 场景只能用 `mode=fallback`。
+
+### 11.7 尚未做
+
+- b15-49 / b20-49 等其他切分的全量 teacher（`minimax-h3-other/` 里有对应的 pruned 版）。
+- `tools/build_hybrid.py` 还没把 `time_embedder_from` 写进生成的 `06_b25-49_hybrid.json`。
+- 模型卡里已写明「与老合并表不是同一目标」及全部实测数字。

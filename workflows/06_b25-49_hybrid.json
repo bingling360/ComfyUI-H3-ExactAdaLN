@@ -624,7 +624,8 @@
       "widgets_values": [
         "strict",
         "ref2va full int8_convrot",
-        "dmad8_s1.0"
+        "dmad8_s1.0",
+        "minimax_h3_fl2va_int8_convrot.safetensors"
       ],
       "inputs": [
         {
@@ -660,7 +661,7 @@
           "links": []
         }
       ],
-      "title": "记录 B 表（Ref2VA 原生 AdaLN）"
+      "title": "记录 B 表（Ref2VA 旋钮 + FL 时间嵌入）"
     },
     {
       "id": 11,
@@ -961,7 +962,7 @@
       "mode": 0,
       "properties": {},
       "widgets_values": [
-        "b25-49 混合表 = A(0-24) + B(25-49)\n• b25-49 整份文件都是 8 维 curve 形态（51 个 [96768,8]，\n  没有 time_embedder），不能直接 Record；它后 25 块的\n  adaln_proj 来自 Ref2VA。\n• 这里用 Ref2VA full 现录一张表（B 链），再和已有的\n  FL2VA 表（A，Load 节点）按块拼接。\n• 两张表必须同 t 集合：同 8 步 / simple / shift 12,2 /\n  同分辨率 / 同 LoRA 强度。Merge 会校验，缺 t 直接报错。\n• final_layer 取 A —— b25-49 的 final 来自 FL2VA 骨架。\n• 产物 b25-49_hybrid_*.safetensors 用 Apply 注入 b25-49：\n  0-24 块与 FL2VA full 逐位一致，25-49 块与 Ref2VA full 逐位\n  一致，都是教师原生输出，不经过 8 维截断。\n• 只有 Ref2VA full 才有完整信息；只有 pruned 版无法还原。\n• A 表文件名按需改；Merge 的 after 接采样器，保证录完再合并。"
+        "b25-49 混合表 = A(0-24) + B(25-49)\n• b25-49 整份文件都是 8 维 curve 形态（51 个 [96768,8]，\n  没有 time_embedder），不能直接 Record；它后 25 块的\n  adaln_proj 来自 Ref2VA。\n• 这里用 Ref2VA full 现录一张表（B 链），再和已有的\n  FL2VA 表（A，Load 节点）按块拼接。\n• Record 的 time_embedder_from 必须填 FL2VA 的 checkpoint：\n  尾部块在混合模型里吃的是 FL 的 t_emb，不是 Ref 自己的。\n  留空会让 25-49 偏移 0.09~0.19（实测）。\n• 两张表必须同 t 集合：同 8 步 / simple / shift 12,2 /\n  同分辨率 / 同 LoRA 强度。Merge 会校验，缺 t 直接报错。\n• final_layer 取 A —— b25-49 的 final 来自 FL2VA 骨架。\n• 产物 b25-49_hybrid_*.safetensors 用 Apply 注入 b25-49：\n  0-24 块与 FL2VA full 逐位一致，25-49 块与 Ref2VA full 逐位\n  一致，都是教师原生输出，不经过 8 维截断。\n• 只有 Ref2VA full 才有完整信息；只有 pruned 版无法还原。\n• A 表文件名按需改；Merge 的 after 接采样器，保证录完再合并。"
       ],
       "inputs": [],
       "outputs": [],

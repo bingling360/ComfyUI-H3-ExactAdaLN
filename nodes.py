@@ -183,6 +183,109 @@ def _dm_of(model):
     return getattr(getattr(model, "model", None), "diffusion_model", None)
 
 
+def _resolve_checkpoint(name):
+    """Absolute path for a checkpoint name/substring/path in diffusion_models."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    if os.path.isabs(name) and os.path.exists(name):
+        return name
+    try:
+        import folder_paths
+        files = folder_paths.get_filename_list("diffusion_models")
+    except Exception:
+        return None
+    hits = [f for f in files if f == name]
+    if not hits:
+        hits = [f for f in files if name.lower() in f.lower()]
+    if len(hits) == 1:
+        try:
+            return folder_paths.get_full_path("diffusion_models", hits[0])
+        except Exception:
+            return None
+    if len(hits) > 1:
+        raise RuntimeError(
+            "H3AdaLNRecord: time_embedder_from={!r} is ambiguous, it matches {} "
+            "checkpoints: {}. Use a longer substring or the full name.".format(
+                name, len(hits), ", ".join(sorted(hits)[:6])))
+    return None
+
+
+def _patch_time_embedder(model, name):
+    """Substitute another checkpoint's `time_embedder.*` into this MODEL.
+
+    A bX-49 hybrid takes the base teacher's body (and its `time_embedder`) and
+    only the tail blocks' `adaln_proj` from the donor. AdaLN modulation is
+    `adaln_proj(time_embedder(t))`, so recording the donor teacher as-is gives
+    the donor's embedding, which is *not* what those blocks see inside a hybrid.
+    Swapping the embedding in first makes the recording identical to recording
+    the assembled hybrid directly -- without needing the 34 GB file.
+    """
+    path = _resolve_checkpoint(name)
+    if not path:
+        raise RuntimeError(
+            "H3AdaLNRecord: time_embedder_from={!r} was not found under "
+            "ComfyUI/models/diffusion_models (absolute paths are accepted too)."
+            .format(name))
+    try:
+        from safetensors import safe_open
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("H3AdaLNRecord: safetensors unavailable: %s" % e)
+    def _read(name):
+        with safe_open(path, framework="pt", device="cpu") as f:
+            return {k.split("time_embedder.", 1)[1]: f.get_tensor(k)
+                    for k in f.keys() if "time_embedder." in k}
+
+    tensors = _read(path)
+    if not tensors:
+        raise RuntimeError(
+            "H3AdaLNRecord: {} contains no `time_embedder.*` tensors -- it is a "
+            "pruned/curve checkpoint, which cannot donate an embedding."
+            .format(os.path.basename(path)))
+
+    # Preferred: swap the whole module. Weight patches go through
+    # `patch_weight_to_device`, which casts to lora_compute_dtype (bf16) and
+    # would round the donor's fp32 embedding -- that alone moves the modulation
+    # by ~1e-1 and is exactly what a bitwise match cannot tolerate.
+    try:
+        import copy as _copy
+        live = model.get_model_object("diffusion_model.time_embedder")
+        fresh = _copy.deepcopy(live)
+        own = fresh.state_dict()
+        moved = 0
+        for k, t in tensors.items():
+            if k in own and own[k].shape == t.shape:
+                own[k] = t.to(own[k].dtype)
+                moved += 1
+        if moved:
+            fresh.load_state_dict(own, strict=False)
+            model.add_object_patch("diffusion_model.time_embedder", fresh)
+            if model.get_model_object("diffusion_model.time_embedder") is fresh:
+                return moved, fresh
+    except Exception as e:
+        logging.warning("H3AdaLNRecord: object patch failed (%s: %s); falling back "
+                        "to weight patches", type(e).__name__, e)
+
+    patches = {}
+    for k, t in tensors.items():
+        tail = "time_embedder." + k
+        # ComfyUI's BaseModel state dict is namespaced under `diffusion_model.`
+        # (the same prefix LoRA files use). Register both spellings and let
+        # add_patches keep whichever one the live model actually has.
+        patches[tail] = ("set", (t,))
+        patches["diffusion_model." + tail] = ("set", (t,))
+    before = set(getattr(model, "patches", {}) or {})
+    model.add_patches(patches, 1.0)
+    applied = [k for k in (getattr(model, "patches", {}) or {})
+               if k not in before and "time_embedder." in k]
+    if not applied:
+        raise RuntimeError(
+            "H3AdaLNRecord: time_embedder_from={!r} was read ({} tensors) but the "
+            "model accepted none of the keys -- its time_embedder is not exposed "
+            "to weight patches in this ComfyUI build.".format(name, len(tensors)))
+    return len(applied), None
+
+
 def _clear_registered(model, attr):
     """Remove hooks left on this shared diffusion module by earlier prompts.
 
@@ -251,6 +354,14 @@ class H3AdaLNRecord:
                                                       "metadata, e.g. the checkpoint name."}),
                 "lora_tag": ("STRING", {"default": "",
                                         "tooltip": "Free-form note about the LoRA stack."}),
+                "time_embedder_from": ("STRING", {"default": "",
+                        "tooltip": "Optional checkpoint whose `time_embedder.*` "
+                                   "weights are substituted into this teacher "
+                                   "before recording. Use it to record the tail "
+                                   "half of a bX-49 hybrid from the donor teacher "
+                                   "alone: AdaLN modulation is adaln_proj(t_emb), "
+                                   "and a hybrid's tail blocks see the *base* "
+                                   "teacher's embedding, not the donor's."}),
                 "after": ("*", {"tooltip": _AFTER_DOC}),
             },
         }
@@ -260,14 +371,20 @@ class H3AdaLNRecord:
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, model, mode="strict", teacher_tag="", lora_tag="", after=None):
+    def run(self, model, mode="strict", teacher_tag="", lora_tag="",
+            time_embedder_from="", after=None):
         dm = _dm_of(model)
         if dm is None:
             raise RuntimeError("H3AdaLNRecord: expected a ComfyUI MODEL (ModelPatcher) "
                                "for MiniMax-H3")
         _clear_registered(model, "_h3_recorders")
 
-        recorder = record_engine.AdaLNRecorder(model, dm, mode=mode, tag=teacher_tag)
+        te_patch, te_module = 0, None
+        if (time_embedder_from or "").strip():
+            te_patch, te_module = _patch_time_embedder(model, time_embedder_from)
+
+        recorder = record_engine.AdaLNRecorder(model, dm, mode=mode, tag=teacher_tag,
+                                               te_override=te_module)
         n = recorder.register()
         _track_registered(model, "_h3_recorders", recorder)
         model._h3_recorder = recorder
@@ -299,6 +416,9 @@ class H3AdaLNRecord:
             "comfyui_version": _comfy_version(),
             "format": table_io.FORMAT,
         }
+        if te_patch:
+            meta["time_embedder_from"] = time_embedder_from.strip()
+            meta["time_embedder_tensors"] = str(te_patch)
         table = table_io.AdaLNTable([], {}, meta, recorder=recorder)
 
         report = "\n".join([
@@ -307,6 +427,10 @@ class H3AdaLNRecord:
             "teacher        : {}".format(meta["teacher"]),
             "lora fp        : {} ({} non-AdaLN keys)".format(fp, count),
             "shift_v / a    : {} / {}".format(shift_v, shift_a),
+        ] + ([
+            "time_embedder  : PATCHED from {!r} ({} tensors)".format(
+                meta["time_embedder_from"], te_patch),
+        ] if te_patch else []) + [
             "",
             "The table is EMPTY until the sampler runs. Anything that reads it",
             "(Save / Apply / summary) must execute after sampling -- connect the",
@@ -749,10 +873,12 @@ class H3ExactAdaLNApply:
         # so only compare when both sides actually carry an AdaLN LoRA.
         adaln_ok = not (adaln_baked and adaln_current) or adaln_baked == adaln_current
 
+        # A table stores `adaln_proj(time_embedder(t))`. Neither of those two
+        # modules is touched by a LoRA that only patches attention / MLP, so a
+        # different non-AdaLN LoRA cannot invalidate a recorded table -- verified
+        # bitwise (record with LoRA A, apply with LoRA B, latent diff 0). Only
+        # the AdaLN / timestep patches, and an explicitly requested teacher, can.
         problems = []
-        if not fp_ok:
-            problems.append("LoRA fingerprint mismatch: table={} model={} ({} vs {} non-AdaLN keys)".format(
-                baked_fp, current_fp, table.meta.get("lora_patch_count", "?"), current_count))
         if not adaln_ok:
             problems.append("AdaLN/timestep LoRA fingerprint mismatch: "
                             "table={} model={} -- re-record with this teacher LoRA".format(
@@ -791,7 +917,7 @@ class H3ExactAdaLNApply:
             "target arch    : {}".format(arch),
             "hooked modules : {}".format(n),
             "lora fp        : {} ({}){}".format(
-                current_fp, "match" if fp_ok else "MISMATCH",
+                current_fp, "match" if fp_ok else "differs - harmless, AdaLN is unaffected",
                 "" if baked_keys_fp else " [legacy table: keys-only check]"),
             "adaln lora fp  : {} / {} ({})".format(
                 adaln_baked or "(none)", adaln_current or "(none)",

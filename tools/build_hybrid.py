@@ -19,6 +19,10 @@ from build_workflows import (  # noqa: E402
 
 # The base half of a bX-49 hybrid comes from the FL2VA full teacher.
 FL2VA = "minimax_h3_fl2va_int8_convrot.safetensors"
+# The donor must be recorded with the base teacher's embedding, otherwise the
+# tail rows carry the donor's own t_emb and drift from the assembled hybrid by
+# ~0.1 (max) -- measured; see HANDOFF 11.2.
+TE_BASE = FL2VA
 # Table recorded on the FL2VA full teacher by 08_record_fl2va.json.
 BASE_TABLE = "fl2va_dmad8_00001.safetensors"
 BASE_TAG = "fl2va full int8_convrot"
@@ -66,8 +70,8 @@ def build_hybrid(tpl):
         "H3AdaLNRecord", (450, 560),
         inputs=[("model", "MODEL"), ("after", "*")],
         outputs=[("model", "MODEL"), ("table", TABLE_TYPE), ("report", "STRING")],
-        widgets=["strict", DONOR_TAG, LORA_TAG],
-        title="记录 B 表（Ref2VA 原生 AdaLN）", size=[340, 220])
+        widgets=["strict", DONOR_TAG, LORA_TAG, TE_BASE],
+        title="记录 B 表（Ref2VA 旋钮 + FL 时间嵌入）", size=[340, 220])
     guider = g.add("BasicGuider", (450, 850))
     samp = g.add("SamplerCustomAdvanced", (450, 990), None,
                  "B: Ref2VA latent（只为填表）")
@@ -105,6 +109,9 @@ def build_hybrid(tpl):
         "  adaln_proj 来自 Ref2VA。\n"
         "• 这里用 Ref2VA full 现录一张表（B 链），再和已有的\n"
         "  FL2VA 表（A，Load 节点）按块拼接。\n"
+        "• Record 的 time_embedder_from 必须填 FL2VA 的 checkpoint：\n"
+        "  尾部块在混合模型里吃的是 FL 的 t_emb，不是 Ref 自己的。\n"
+        "  留空会让 25-49 偏移 0.09~0.19（实测）。\n"
         "• 两张表必须同 t 集合：同 8 步 / simple / shift 12,2 /\n"
         "  同分辨率 / 同 LoRA 强度。Merge 会校验，缺 t 直接报错。\n"
         "• final_layer 取 A —— b25-49 的 final 来自 FL2VA 骨架。\n"

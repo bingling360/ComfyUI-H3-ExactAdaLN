@@ -62,9 +62,13 @@ def _dtype_name(dtype):
 class AdaLNRecorder:
     """Live, read-only capture of AdaLN rows keyed by the float32 timestep."""
 
-    def __init__(self, model, dm, mode="strict", tag=""):
+    def __init__(self, model, dm, mode="strict", tag="", te_override=None):
         self.model = model
         self.dm = dm
+        # Set when the caller swapped `time_embedder` for another checkpoint's
+        # (see H3AdaLNRecord.time_embedder_from). The hook must land on the
+        # object the forward will actually run, not on the original module.
+        self.te_override = te_override
         self.mode = mode
         self.tag = tag
         self.rows = {}          # t -> {projection key: [F] fp32 cpu}
@@ -84,7 +88,7 @@ class AdaLNRecorder:
 
     # -- registration ----------------------------------------------------
     def register(self):
-        te = getattr(self.dm, "time_embedder", None)
+        te = self.te_override if self.te_override is not None else getattr(self.dm, "time_embedder", None)
         if te is None or not hasattr(te, "register_forward_hook"):
             raise RuntimeError(
                 "H3AdaLNRecord: this checkpoint has no `time_embedder` -- it is a "
@@ -211,7 +215,7 @@ class AdaLNRecorder:
                     "H3AdaLNRecord: {} is missing rows for {} timestep(s) (interrupted "
                     "run?). Nothing was saved.".format(key, len(missing)))
             raw[key] = torch.stack([self.rows[t][key] for t in t_values]).contiguous()
-        te = getattr(self.dm, "time_embedder", None)
+        te = self.te_override if self.te_override is not None else getattr(self.dm, "time_embedder", None)
         t_embed_dim = int(getattr(getattr(te, "proj_out", None), "out_features", 0) or 0)
         extra = {
             "record_mode": "observed during sampling",

@@ -283,22 +283,113 @@ is numerically fine but semantically wrong for a hybrid.
 
 A `b25-49` file is curve-shaped **everywhere** — 51 x `[96768, 8]`, one
 `adaln_t_table [1025, 8]`, no `time_embedder` — and the trailing blocks' AdaLN
-tensors come from a second teacher. So Record cannot run on it, and its 8-wide
-curve cannot carry either teacher's full modulation. The exact table is
-assembled from two records instead:
+tensors come from a second teacher. Record cannot run on it, and its 8-wide
+curve cannot carry either teacher's full modulation. Two ways out, and they are
+**not** the same target.
 
-1. record the **base** teacher (FL2VA full) on the schedule you will use → A;
-2. record the **tail donor** (Ref2VA full) on the same steps / shifts /
-   resolution → B;
-3. `H3 AdaLN Merge` with `split=25`, `final_from=a` → blocks 0–24 from A,
-   25–49 from B, `final_layer` from A.
+#### A. Record the assembled hybrid (exact, one pass)
 
-Every block is still a row its teacher actually produced, so replay is exact
-per block; the merge refuses mismatched timesteps, projection sets, out dtypes
-or LoRA stacks. `08_record_fl2va.json` does step 1, `06_b25-49_hybrid.json`
-does steps 2–3 in one run (the base table is a `Load`), and
-`07_merge_tables.json` re-merges two saved tables on CPU. Both teachers must be **full** checkpoints; a pruned donor has
-already lost the information the table needs.
+Point Record at a full bX-49 checkpoint — a full model whose body is the base
+teacher's and whose blocks X..49 `adaln_proj` come from the donor, i.e. exactly
+the same recipe as the pruned file. One recording run, no merge, and the table
+reproduces that model **bitwise**. A ready-made `b25-49` int8 teacher:
+[`binglingzhimeng/MiniMax-H3-b25-49-full`](https://huggingface.co/binglingzhimeng/MiniMax-H3-b25-49-full).
+
+Measured end to end (both chains, same LoRA, 8 steps, `simple`, shift 12/2):
+
+```
+A: full b25-49 hybrid (native)
+B: pruned b25-49 + table recorded on A
+samples__part0: equal=True max_abs=0.000e+00 psnr=inf
+samples__part1: equal=True max_abs=0.000e+00 psnr=inf
+VERDICT: PASS - bitwise identical
+```
+
+#### B. Two teachers + `time_embedder_from` (same target, no merged file)
+
+If you do not want a second 34 GB checkpoint, record the donor teacher with the
+base teacher's embedding swapped in first:
+
+1. record the **base** teacher (FL2VA full) → A;
+2. record the **tail donor** (Ref2VA full) with
+   `time_embedder_from = <base teacher file>` → B';
+3. `H3 AdaLN Merge`, `split=25`, `final_from=a`.
+
+Why the extra input is mandatory: AdaLN output is `adaln_proj(t_emb)`, and the
+tail blocks of a hybrid see the **base** teacher's `t_emb`. The two official
+teachers do not share a `time_embedder` (`proj_out.weight` differs by up to
+`0.104`), so recording the donor as-is bakes the donor's embedding into the
+table. Measured against the assembled hybrid:
+
+| tail source | max abs delta on blocks 25-49 |
+|---|---|
+| donor recorded as-is (old recipe) | 0.09 – 0.19 |
+| donor + `time_embedder_from` (this recipe) | **0** (25/25 projections bitwise) |
+
+`time_embedder_from` swaps the whole module, not the weights: a weight patch
+would run through `patch_weight_to_device`, be cast to `lora_compute_dtype`
+(bf16) and stay there, while the real model keeps the embedding in fp32 —
+that alone moves the modulation by ~1e-1.
+
+If the merged table and the hybrid disagree, the numbers are large enough to
+see: applying the old merged table to the pruned b25-49 and comparing against
+the full hybrid gives `psnr=22.20 dB` (video) / `31.10 dB` (audio), while the
+table from A gives `inf`.
+
+#### What the shipped b25-49 actually is
+
+Verified tensor by tensor on `minimax_h3_hybrid_fl2va_ref2va_b25-49-int8`:
+blocks 0–24 `adaln_proj` are byte-identical to `fl2va_pruned`, blocks 25–49 to
+`ref2va_pruned`, and `adaln_t_table` to `fl2va_pruned`. So the file is
+"base body + donor tail" in the literal sense — which is why recipe A is the
+faithful one.
+
+Note that its own curve output happens to sit *closer* to the old merged table
+than to the assembled hybrid (mean abs 0.003 vs 0.008 on blocks 25/30/35/40/45/49,
+18 of 18 sampled rows): reusing the base teacher's coordinate table for the
+donor's 8-wide tail weights is itself an approximation. Neither table equals the
+pruned file's raw output — the plugin exists precisely because that output is
+not exact.
+
+Both teachers must be **full** checkpoints; a pruned donor has already lost the
+information the table needs.
+
+## Which LoRAs need a fresh table
+
+A table stores `adaln_proj(time_embedder(t))`. Only two module groups can change
+that: `time_embedder` and `adaln_proj`. Every other LoRA — attention, MLP,
+norms — leaves the modulation untouched, so **one table serves all of them**.
+
+Scanned 104 unique MiniMax-H3 LoRAs on a working node:
+
+| keys touching AdaLN | count | shape | consequence |
+|---|---|---|---|
+| none | 87 (84 %) | — | table reusable as-is |
+| `adaln_proj` only | 7 (7 %) | `lora_A` in-width **8** (curve form) | applies to the pruned base, really changes modulation -> re-record |
+| `adaln_proj` only | 10 (10 %) | in-width **2688** (full form) | dropped by ComfyUI on a pruned base -> record with it on the teacher to keep its AdaLN effect |
+| `time_embedder` | 0 | — | — |
+
+In practice the split is by *kind*, not by author: every acceleration /
+distillation LoRA in the scan (turbo, 4-step, 8-step Acc, dmd) carries AdaLN
+keys, because it was trained against the whole denoising trajectory. Styling,
+motion, effect and slider LoRAs carried none, and the DMAD 8-step LoRA
+(`dmad_minimax_h3_8step_full_critic_comfyui`) is among the clean ones.
+
+Measured, not inferred — table recorded with LoRA *X*, applied to the pruned
+base running a different LoRA *Y*:
+
+```
+A: full hybrid + turbo 8-step LoRA (native)
+B: pruned + turbo 8-step LoRA + table recorded with the DMAD 8-step LoRA
+samples__part0: equal=True max_abs=0.000e+00 psnr=inf
+samples__part1: equal=True max_abs=0.000e+00 psnr=inf
+```
+
+Because of that, `H3 Exact AdaLN Apply` no longer fails `strict` on a non-AdaLN
+LoRA mismatch — it reports it as harmless and keeps going. `strict` still
+refuses on an **AdaLN/timestep** fingerprint mismatch, on an explicit
+`expected_teacher` mismatch, and on a t-set mismatch. Before this change the
+cross-LoRA case above could only be run with `mode=fallback`.
 
 ## Known limits
 
