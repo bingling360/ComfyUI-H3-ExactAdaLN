@@ -10,6 +10,9 @@ modulation exactly, so that
 
 ## Why
 
+> **New here?** Start with [the complete node guide](docs/NODE_GUIDE.md) for the unified `H3AdaLN` node (record / apply / hybrid / merge / off), the naming scheme, five worked recipes, and a checklist of pitfalls found during the 2026-11-08/09 verification runs.
+
+
 H3 puts ~13B parameters (39%) into AdaLN branches whose output depends only on
 the timestep. Comfy-Org's pruned checkpoints fold that whole branch into a
 small curve basis. The rank-8 truncation is mathematically exact (SVD residual
@@ -111,7 +114,9 @@ A saved table is **self-contained**: its safetensors header carries the
 teacher, provenance (record vs bake), LoRA fingerprint, sigma grid, shifts,
 out dtype and ComfyUI version. Copy the file anywhere to share it; the
 receiving side just Loads it. `strict` mode refuses a table recorded with a
-different LoRA stack.
+different **AdaLN / timestep** LoRA stack; a different non-AdaLN LoRA is
+harmless and no longer blocks reuse (verified bitwise). See
+[the node guide](docs/NODE_GUIDE.md) for the unified `H3AdaLN` node.
 
 ## Quick start
 
@@ -455,7 +460,7 @@ bake_engine.py     offline recomputation + splice donors
 apply_engine.py    runtime injection: t_emb matching + sigma fallback
 sigma_plan.py      float32-exact t arithmetic, mirrors model.py:671-751
 table_io.py        safetensors container, live (recording) tables
-nodes.py           the seven nodes
+nodes.py           the eight stable nodes
 workflows/         01 bake, 02/03 load+apply A/B, 04 offline strict,
                    05 record strict, 06 bX-49 hybrid, 07 merge only,
                    08 record FL2VA base
@@ -464,7 +469,8 @@ tests/             test_exact.py (numbers), test_merge.py (hybrid merge),
 tools/             workflow generators (incl. build_hybrid.py) + fetch helpers
 HANDOFF.md         repair plan, root-cause evidence and per-phase status
 docs/unified-node.md  one-node design: record + apply + merge, t-keyed tables
-h3_unified.py      experimental unified node (not registered yet)
+docs/NODE_GUIDE.md    full node tutorial + lessons learned + pitfall checklist
+h3_unified.py      unified H3AdaLN node (registered from __init__.py)
 ```
 
 The workflow JSONs are **generated**, never hand-edited:

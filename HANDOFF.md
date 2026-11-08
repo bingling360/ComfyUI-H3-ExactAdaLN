@@ -668,3 +668,67 @@ AdaLN 注入全部一致，输出仍不同 —— 剩下只能归因于 **ComfyU
   object patch 是否会绕过 cast 未测，遇到异常优先怀疑这条。
 - ~~`tools/build_hybrid.py` 还没把 `time_embedder_from` 写进生成的 06~~ 已补。
 - 模型卡里已写明「与老合并表不是同一目标」及全部实测数字。
+
+---
+
+## 12. 经验教训清单（2026-11-08/09，换机必读）
+
+完整教程见 `docs/NODE_GUIDE.md`。这里只列最容易再踩的坑。
+
+### 12.1 表与模型
+
+- 表是 `t -> modulation` 的纯函数，**按模型分表，不按 pass 分表**。
+  同一模型的多段采样共用一张表（t 并集）。
+- 不同模型才用两个节点 + `pass_tag`；两段 t 集合不重叠时表不能互换
+  （交叉表会被 strict 的 t-set 校验挡住）。
+- 87/104 的 H3 LoRA 不碰 AdaLN，一张表通吃；加速蒸馏类才需重录。
+  非 AdaLN 指纹不匹配**不**该让 strict 失败（已修）。
+- 录 donor 教师必须 `time_embedder_from`，且必须整体换模块；weight patch
+  会降到 bf16 造成 ~1e-1 偏差。hook 要挂替换后的模块。
+- 全量教师与剪枝基座的 adaln_proj 形状不同，指纹相等检查会误杀主路径（已修）。
+- 表内部 fp32 存、按教师原生 bf16 注入；改成按目标 fp32 注入反而更差
+  （10.21 dB vs 17.76 dB）。**别再改 dtype**。
+- 每行 ~19.7 MiB；多尺度流程行数多时注意磁盘。
+
+### 12.2 验证方法（血的教训）
+
+- **负对照必需**：`mode=off` 必须 FAIL，否则 PASS 不可信。
+- **ComfyUI 缓存会造假 PASS**：看 `first injection confirmed` 计数，
+  为 0 就是没重跑。换 seed / 重启 / 改无关 widget。
+- **判据是注入日志**（`exact matches` / `native steps`），不是最终 latent PSNR。
+- 导演台 `图像` 输出是全零占位，真实 latent 在
+  `output/h3_projects/<存档目录>/seg_000.pt`；按目录缓存，换模型不重算。
+  比对前要全新目录 + 删 `h3chain_state.json` + 重启。
+- UI 工作流 ≠ API prompt：Get/Set 是前端虚拟总线；动态 COMBO 节点
+  （`BlockSparseAttention`）widget 与 API 输入不对应。
+  `MiniMaxH3ReferenceToVideo` 的 `ref_*` 全是 optional，可裁掉缺失素材。
+- 对照链必须共享 conditioning / noise / sigmas / seed。
+- 改第三方源码做诊断要备份并恢复，改动后重启 ComfyUI。
+
+### 12.3 边界
+
+- SelfLift 残差：单链独立运行逐阶段 dump 证明转换点前逐位一致，
+  分叉只在高段 forward；backbone / comfy_quant / weight_scale 全部一致，
+  表 102/102 精确注入。归因 34GB full（offload）vs 20GB pruned（全驻留）
+  的执行路径差异，**不是插件能适配的**；试过 dtype 跟随、关 sigma wrapper
+  都无效或更差。**不要再往这个方向改注入逻辑。**
+- 失真的是「全量 vs 剪枝双链逐位一致」这个验收指标；实际出片只跑剪枝链，
+  表正常工作。
+- `_last_table.json` 多 pass 录制会被覆盖 → 应用侧用 `table_text` 显式指定。
+- `after` 输入只排序不参与计算，给无 after 接口的采样器做同 prompt 录用。
+
+### 12.4 今天修掉的真 bug
+
+| Bug | 修法 |
+|---|---|
+| 指纹相等检查误杀 full→pruned 主路径 | 只对 full 目标比较 |
+| 部分 `time_embedder` 替换会混两个嵌入 | 全量匹配校验，不匹配硬报错 |
+| 上次 object patch 残留到下次录制 | 进节点先撤销 |
+| 降级 weight patch 却报「PATCHED」 | report 明写 `NOT bitwise` |
+| 多 Record 节点静默顶掉前一个 | 日志告警 |
+| 合并表丢失嵌入来源元数据 | 新增 `hybrid_te_from_a/b` |
+
+### 12.5 发布物
+
+- GitHub：`bingling360/ComfyUI-H3-ExactAdaLN`，教程 `docs/NODE_GUIDE.md`。
+- HF：`binglingzhimeng/MiniMax-H3-b25-49-full`（b5/b20/b25/b30/b45 五份全量教师）。
