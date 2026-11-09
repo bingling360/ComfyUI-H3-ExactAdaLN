@@ -537,6 +537,54 @@ check("resolve: two models each find their own declared table",
       test_two_models_resolve_their_own_tables)
 check("resolve: the fingerprint follows the AdaLN branch",
       test_base_fingerprint_tracks_the_adaln_branch)
+def test_base_fingerprint_survives_fp16_to_bf16_cast():
+    """ComfyUI may run fp16 checkpoint weights in bf16; the lookup must survive."""
+    import copy
+    from safetensors.torch import save_file
+
+    class Proj(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(8, 16)
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.adaln_proj = Proj()
+
+    class DM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([Block(), Block()])
+            self.final_layer = Block()
+            self.use_adaln_curves = True
+            self.adaln_t_table = torch.randn(1025, 8)
+
+    def cast(dm, dtype):
+        for m in dm.modules():
+            for _n, p in m.named_parameters(recurse=False):
+                p.data = p.data.to(dtype)
+        dm.adaln_t_table = dm.adaln_t_table.to(dtype)
+
+    torch.manual_seed(5)
+    a = DM()
+    cast(a, torch.float16)
+    b = copy.deepcopy(a)
+    cast(b, torch.bfloat16)  # what ComfyUI actually exposes at compute time
+
+    assert H.base_fingerprint(a) == H.base_fingerprint(b), \
+        "a fp16/bf16 cast changed the base fingerprint"
+
+    path = os.path.join(TABLE_DIR, "dtype_probe.safetensors")
+    sd = {k: v.detach().contiguous() for k, v in a.state_dict().items()}
+    sd["adaln_t_table"] = a.adaln_t_table.contiguous()
+    save_file(sd, path)
+    assert H.base_fingerprint_from_file(path) == H.base_fingerprint(b), \
+        "file-side and model-side base fingerprints differ"
+
+
+check("base fp: identical across fp16 file / bf16 model",
+      test_base_fingerprint_survives_fp16_to_bf16_cast)
 check("picker: (auto) first, then the files on disk", test_choices_put_auto_first)
 check("record: pins 0.999/1.0 through the model's own batch",
       test_record_pins_the_reference_rows)

@@ -298,17 +298,25 @@ def _find_named(name):
 
 
 # ---------------------------------------------------------------- identity
-def _f32_bytes(tensor):
+def _f32_bytes(tensor, round_to_bf16=False):
     """Canonical float32 bytes, so a value read from a file and the same value
-    read from the loaded module hash identically."""
+    read from the loaded module hash identically.
+
+    `round_to_bf16` is used by the *base* fingerprint: checkpoint weights are
+    stored as fp16 but ComfyUI may run them in bf16, and fp16 -> bf16 drops
+    mantissa bits. Rounding both sides to bf16 precision first makes the two
+    byte streams equal without hiding real differences between checkpoints.
+    """
     try:
         flat = tensor.detach().reshape(-1).to(device="cpu", dtype=torch.float32)
+        if round_to_bf16:
+            flat = flat.to(torch.bfloat16).to(torch.float32)
         return flat.contiguous().numpy().tobytes()
     except Exception:
         return b"?"
 
 
-def _weight_head(weight, n=256):
+def _weight_head(weight, n=256, round_to_bf16=False):
     """A few numbers that are stable across loads and cheap to read.
 
     Only the first row is touched: `adaln_proj.linear.weight` is
@@ -323,7 +331,7 @@ def _weight_head(weight, n=256):
         return b"-"
     try:
         row = weight[0] if weight.dim() >= 2 else weight
-        return _f32_bytes(row[:n])
+        return _f32_bytes(row[:n], round_to_bf16)
     except Exception:
         try:
             return repr((tuple(weight.shape), str(weight.dtype))).encode()
@@ -331,12 +339,12 @@ def _weight_head(weight, n=256):
             return b"?"
 
 
-def _file_head(handle, key, n=256):
+def _file_head(handle, key, n=256, round_to_bf16=False):
     """The same bytes `_weight_head` produces, read straight out of a file."""
     try:
         sl = handle.get_slice(key)
         vec = sl[0] if len(sl.get_shape()) >= 2 else sl[0:n]
-        return _f32_bytes(vec[:n])
+        return _f32_bytes(vec[:n], round_to_bf16)
     except Exception:
         return b"-"
 
@@ -390,13 +398,13 @@ def base_fingerprint(dm):
         bool(getattr(dm, "use_adaln_curves", False)), len(blocks)).encode())
     tbl = getattr(dm, "adaln_t_table", None)
     if torch.is_tensor(tbl) and tbl.ndim == 2:
-        h.update(_f32_bytes(tbl[:4]))
+        h.update(_f32_bytes(tbl[:4], round_to_bf16=True))
     picks = [blocks[0], blocks[len(blocks) // 2], blocks[-1]] if blocks else []
     picks.append(getattr(dm, "final_layer", None))
     for owner in picks:
         linear = getattr(getattr(owner, "adaln_proj", None), "linear", None)
-        h.update(_weight_head(getattr(linear, "weight", None)))
-        h.update(_weight_head(getattr(linear, "bias", None)))
+        h.update(_weight_head(getattr(linear, "weight", None), round_to_bf16=True))
+        h.update(_weight_head(getattr(linear, "bias", None), round_to_bf16=True))
     fp = h.hexdigest()[:12]
     try:
         dm._h3_base_fp = fp
@@ -424,12 +432,15 @@ def base_fingerprint_from_file(path):
         h.update("curve={};blocks={};".format(
             "adaln_t_table" in keys, blocks).encode())
         if "adaln_t_table" in keys:
-            h.update(_f32_bytes(f.get_slice("adaln_t_table")[0:4]))
+            h.update(_f32_bytes(f.get_slice("adaln_t_table")[0:4],
+                                round_to_bf16=True))
         picks = [0, blocks // 2, blocks - 1] if blocks else []
         for i in picks + ["final_layer"]:
             prefix = "blocks.{}".format(i) if isinstance(i, int) else "final_layer"
-            h.update(_file_head(f, prefix + ".adaln_proj.linear.weight"))
-            h.update(_file_head(f, prefix + ".adaln_proj.linear.bias"))
+            h.update(_file_head(f, prefix + ".adaln_proj.linear.weight",
+                                round_to_bf16=True))
+            h.update(_file_head(f, prefix + ".adaln_proj.linear.bias",
+                                round_to_bf16=True))
         return h.hexdigest()[:12]
 
 
