@@ -596,13 +596,24 @@ tell whether a workflow was hand-edited.
   loaded module). `tests/test_exact.py` passes 21/21 against the real
   `MiniMaxH3Model` at tiny scale, including record → apply bitwise and the
   `mode=off` control.
-- End-to-end on a real checkpoint is still open: the local box only has a
-  *pruned* b25-49 (20 GB) with 6 GB VRAM and no full teacher, so `record` has
-  never run against a full model. Reading that checkpoint's AdaLN tensors
-  directly confirms the assumptions the plugin makes (`adaln_t_table [1025,8]`,
-  no `time_embedder`, 51 × `[96768,8]` fp16 projections), and injecting its own
-  rows at real width is bitwise with `max_dist=0`. Checklist in
-  [`HANDOFF.md`](HANDOFF.md) §0.1.
+- **v2 end-to-end on the cloud instance (2026-11-09, ComfyUI 0.44.0 /
+  RTX 4080 SUPER 32 GB): PASS.** A two-chain A/B prompt used the new node on
+  the real 34 GB `minimax_h3_ref2va_int8_convrot` teacher and the 20 GB
+  `minimax_h3_ref2va_pruned_int8_convrot` base at **256×128 / 5 frames**, 8
+  steps, `euler/simple`, DMAD 8-step LoRA, shift 12/2:
+  `VERDICT: PASS - bitwise identical` on both the video and audio latent
+  (`max_abs=0`), `exact matches=408` (51 × 8), `match failures=0`,
+  `native steps=0`. The table landed as `h3_full_03692f_bf16.safetensors`
+  (17 t rows, 314 MiB) with `target_base` stamped and the pinned `0.999` /
+  `1.0` rows present. A **second, separate prompt** with only the pruned base
+  and `table=(auto)` (no `table_in`) resolved `declared for this model` and
+  produced the same 408 exact matches — i.e. cross-prompt lookup works with no
+  picker. That run also confirmed the smallest recommended recording size is
+  usable. See [`HANDOFF.md`](HANDOFF.md) §0.1 for the full log.
+- The local box only has a *pruned* b25-49 (20 GB) with 6 GB VRAM and no full
+  teacher; it is used for the CPU/structural suites and for reading real
+  checkpoint headers (`adaln_t_table [1025,8]`, no `time_embedder`,
+  51 × `[96768,8]` fp16 projections).
 
 ## Related work
 

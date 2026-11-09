@@ -496,6 +496,24 @@ apply 侧能查的只有「基座指纹 + AdaLN LoRA 指纹」。**基座本身�
 （`declared for this model` / `only table without a target` / `picked`），
 加上表头里的 `target_name`。
 
+### 7.10 权重 fp16 / 计算 bf16，指纹要能跨过去
+
+录表侧用 `base_fingerprint_from_file()` 读的是检查点里的 **F16** 权重；
+apply 侧 `base_fingerprint(dm)` 读的是 ComfyUI 加载后的模块 —— 在
+`int8_convrot` 检查点上日志会写 `model weight dtype torch.bfloat16`。
+fp16→bf16 会丢尾数，两侧字节流不同，结果就是**明明录了表却报
+「N 张表都没声明归属」**。
+
+插件现在把基座指纹的每个分量先舍入到 bf16 精度再哈希，两侧一致；
+教师身份指纹不受影响。这个坑在 2026-11-09 的云实例实测里首次暴露并修复
+（见 HANDOFF §0.1）。症状回顾：换过精度/量化格式后如果自动查找突然失效，
+先看日志里的权重 dtype，再看表头 `target_base` 与当前模型指纹是否一致。
+
+另外注意：**目录里有多个剪枝基座时** `for_model=(auto)` 不会瞎猜，
+它不写 `target_base` 并在日志里列出所有候选；这时在 `for_model` 里显式选一个，
+否则 apply 会退回「唯一候选」规则。云实例上就是这种情况（多个基座），
+实测用了显式指定。
+
 ---
 
 ## 8. FAQ

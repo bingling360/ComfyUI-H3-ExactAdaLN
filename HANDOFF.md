@@ -78,23 +78,52 @@ python tests/test_merge.py        # 纯 CPU，验证合并逻辑（需 torch/saf
 | 项 | 结果 |
 |---|---|
 | `tests/test_exact.py`（真实 `MiniMaxH3Model`，小尺寸，CPU） | 21/21 PASS，含 record→apply 逐位一致 + `mode=off` 负对照不通过 |
-| `tests/test_runtime.py`（真实进程、真实 `ModelPatcher.cleanup()`） | 7/7 PASS：注册目录、**文件/模块指纹一致**、录制落盘（含 `target_base`）、换 schedule 合并、按指纹找表、off 清理、hybrid 合并注入 |
+| `tests/test_runtime.py`（真实进程、真实 `ModelPatcher.cleanup()`） | 11/11 PASS：注册目录、文件/模块指纹一致、录制落盘（含 `target_base`）、换 schedule 合并、自动认基座、pin 行逐位一致、缺行提示、apply/清理、hybrid 合并注入 |
 | 真实 b25-49 int8 检查点结构 | 曲线形态：`adaln_t_table [1025,8]` F32，无 `time_embedder`，51 个 `adaln_proj` 权重 `[96768,8]` **F16**（不是量化张量），`final_layer` 为 `[10752,8]` |
 | 真实权重/真实宽度注入自检 | 51 投影全挂、`torch.equal=True`、`max_dist=0.000e+00`、0 失败；5 行表 92.5 MiB（≈18.5 MiB/行） |
 | 指纹在真实权重上 | `model_fingerprint` 1 ms；`base_fingerprint` 0.46 ms（fp16 行只有 8 个数），两次加载一致，只改 25-49 块也能区分 |
 | 同一基座的两个量化版本（int8 / w4a8） | `adaln_proj` 都是 `[96768,8] F16`、`adaln_t_table` 都是 `[1025,8] F32` → 同一个 `target_base`，一张表通吃 |
 
-**仍未验证（受本机硬件限制）**：
+**云实例实测通过（2026-11-09，ComfyUI 0.44.0 / torch 2.9.1+cu130 /
+RTX 4080 SUPER 32GB）**：
 
-- 真实 20GB 模型的完整推理：16GB 内存 + 6GB 显存只能靠 mmap/offload，
-  跑一次要流式搬运 20GB/步；而且本机没有**全量教师**，
-  `record` 的完整链路（含 `time_embedder` 取 t）只在 tiny 配置上验过。
-- 真机上的 `ON_CLEANUP` 时机由 ComfyUI 触发（本机是直接调 `cleanup()`，
-  走的是同一段代码，但没有经过队列）。
-- 首次真实录制的耗时：身份指纹 + 合并写盘（见下）。
+```
+A 链 UNETLoader(minimax_h3_ref2va_int8_convrot, 34GB 全量教师)
+   + DMAD 8-step LoRA + MiniMaxH3SigmaShift(12/2)
+   + H3AdaLN(mode=record, for_model=ref2va_pruned_int8_convrot, fill_reference_row=True)
+B 链 UNETLoader(minimax_h3_ref2va_pruned_int8_convrot, 20GB 剪枝基座)
+   + 同 LoRA + 同 shift + H3AdaLN(mode=apply, table_in=A, after=A latent)
+共享 CLIP / VAE / MiniMaxH3ImageToVideo(256x128, 5 帧) / BasicScheduler(8, simple)
+```
 
-下一次开机（有全量教师时）按这个顺序验：`mode=record` 跑一次 → 控制台
-`saved ...` → 切 `apply` → 看 `apply stats` 的 `native steps=0`。
+- `H3LatentCompare`：**`VERDICT: PASS - bitwise identical`**，
+  `samples__part0` / `samples__part1` 均 `equal=True max_abs=0.000e+00`；
+- `apply stats`：`t rows=17`、`exact matches=408`（51 投影 × 8 步）、
+  `match failures=0`、`native steps=0`；
+- 录制日志：`51 projections hooked`、`extra rows: t=0.999 / t=1.000 pre-computed`、
+  `for base: ... (fp ...) → saved h3_full_03692f_bf16.safetensors (17 rows, 314 MiB)`；
+- 表头实读：`target_base` 已写、51 个投影、`out_dtype=torch.bfloat16`、
+  t 集含 `0.999000013` 与 `1.000000000`；
+- **第二个独立 prompt**（只有剪枝基座，`table=(auto)`、无 `table_in`）：
+  report 显示 `apply · declared for this model`，`exact matches=408`、
+  `match failures=0`、`native steps=0` —— 跨 prompt 自动查表成立；
+- 离线四套测试在实例上全绿：`test_simple` / `test_merge` /
+  `test_workflows` / `test_exact` + `test_runtime` 11/11。
+
+**实测中发现并修掉的两个 bug**：
+
+1. `fill_reference_row` 已把 `0.999` 行写进表，却仍打印「缺行」警告 ——
+   `f32_image(0.999)=0.999000013` 与常量 `0.999` 差 1.3e-8，而检查用了
+   1e-9 容差。改为按 `f32_image` 比较、容差 1e-6（commit `f314319`）。
+2. 首次跨 prompt 查找失败：报「9 张表都没声明归属」。根因是 **AdaLN 权重
+   文件为 F16，而 ComfyUI 以 bf16 计算**，fp16→bf16 丢尾数，导致
+   `base_fingerprint_from_file`（录制侧）与 `base_fingerprint(dm)`（应用侧）
+   不同。修复：基座指纹统一先舍入到 bf16 精度，两侧字节流一致；教师身份指纹
+   不受影响（commit `22b61a1`），并加回归测试。重录后自动查找成功。
+
+**仍未验证**：`ON_CLEANUP` 之外的极端调度、以及带真实参考素材（关键帧/参考图/
+参考音频）的完整出片 —— 目前 pin 行是在无参考素材的流程上预计算并在 tiny
+模型上验证逐位一致，尚未在 34GB 教师上跑带参考素材的 A/B。
 
 ---
 
