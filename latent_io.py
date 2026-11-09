@@ -41,6 +41,7 @@ class H3LatentSave:
             },
         }
 
+    DEPRECATED = True  # verification-only; H3 Latent Compare covers the usual case
     RETURN_TYPES = ()
     OUTPUT_NODE = True
     FUNCTION = "save"

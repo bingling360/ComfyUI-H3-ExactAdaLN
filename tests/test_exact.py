@@ -25,6 +25,7 @@ Run:
 """
 
 import os
+import shutil
 import sys
 import tempfile
 
@@ -210,13 +211,19 @@ def main():
     table = table_io.AdaLNTable(t_values, raw_by_key, dict(
         format=table_io.FORMAT, teacher="tiny-teacher", lora_fingerprint="none",
         out_dtype=extra["out_dtype"]))
-    with tempfile.TemporaryDirectory() as tmp:
+    # Not TemporaryDirectory: load_file() keeps an mmap on the .safetensors for
+    # as long as the tensors live, and Windows refuses to unlink an open file.
+    tmp = tempfile.mkdtemp()
+    try:
         path = os.path.join(tmp, "t.safetensors")
         table_io.write_table_file(path, table)
         back = table_io.read_table_file(path)
-    same_t = back.t_values == table.t_values
-    same_rows = all(torch.equal(back.raw_by_key[k], table.raw_by_key[k])
-                    for k in table.raw_by_key)
+        same_t = back.t_values == table.t_values
+        same_rows = all(torch.equal(back.raw_by_key[k], table.raw_by_key[k])
+                        for k in table.raw_by_key)
+    finally:
+        back = None
+        shutil.rmtree(tmp, ignore_errors=True)
     check("table: safetensors round-trip is byte-identical", same_t and same_rows,
           "t_equal={} rows_equal={} size={:.2f} MiB".format(
               same_t, same_rows, table.size_bytes() / (1 << 20)))

@@ -62,9 +62,21 @@ def _dtype_name(dtype):
 class AdaLNRecorder:
     """Live, read-only capture of AdaLN rows keyed by the float32 timestep."""
 
-    def __init__(self, model, dm, mode="strict", tag="", te_override=None):
+    def __init__(self, model, dm, mode="strict", tag="", te_override=None,
+                 pin_targets=()):
         self.model = model
         self.dm = dm
+        # Timesteps the run itself may never produce but a later workflow can ask
+        # for: keyframe/reference rows are pinned at 0.999, reference-audio rows
+        # at 1.0. They are computed through the model's own modules in one extra
+        # call whose batch is [this step's t] + [pin] -- i.e. exactly the batch a
+        # reference run would have used, which is what keeps the row bitwise.
+        self.pin_targets = [float(v) for v in (pin_targets or ())]
+        self.pinned = {}        # pin t -> {projection key: [F] fp32 cpu}
+        self._pin_emb = {}      # pin t -> tensor on the model's device
+        self._pin_pending = {}  # pin t -> keys still to capture in this forward
+        self._pin_step = None   # index of the forward the pins belong to
+        self._in_pin = False    # re-entry guard for our own extra calls
         # Set when the caller swapped `time_embedder` for another checkpoint's
         # (see H3AdaLNRecord.time_embedder_from). The hook must land on the
         # object the forward will actually run, not on the original module.
@@ -117,6 +129,8 @@ class AdaLNRecorder:
 
     # -- hooks -----------------------------------------------------------
     def _time_embedder_hook(self, module, inputs, output):
+        if self._in_pin:  # our own extra call, not the model's
+            return
         if not inputs or not torch.is_tensor(inputs[0]):
             return
         t = inputs[0].detach()
@@ -125,6 +139,60 @@ class AdaLNRecorder:
         self._cur_t = t.reshape(-1).to(torch.float32).cpu().tolist()
         self._cur_forward += 1
         self.forwards += 1
+        if self.pin_targets and self._pin_step is None:
+            self._pin_step = self._cur_forward
+            self._make_pins(module, t.reshape(-1), self._cur_t)
+
+    def _make_pins(self, te, t, t_list):
+        """Compute the pinned embeddings in an [M+1] batch, once per run."""
+        for pin in self.pin_targets:
+            if any(abs(v - pin) < 1e-9 for v in t_list):
+                continue  # this run produces that row by itself
+            self._in_pin = True
+            try:
+                with torch.no_grad():
+                    extra = torch.tensor([pin], dtype=t.dtype, device=t.device)
+                    emb = te(torch.cat([t, extra], 0))[len(t_list):]
+                self._pin_emb[pin] = emb.detach()
+                self._pin_pending[pin] = set(self.proj_keys)
+            except Exception as e:
+                logging.warning(
+                    "H3AdaLNRecord: cannot pre-compute the t=%.3f row (%s: %s); "
+                    "the table will simply not contain it", pin,
+                    type(e).__name__, e)
+            finally:
+                self._in_pin = False
+
+    def _pin_row(self, key, ap, module, x):
+        """One extra projection call per pin; the extra batch row is discarded."""
+        if not self._pin_pending or self._cur_forward != self._pin_step:
+            return
+        for pin, pending in list(self._pin_pending.items()):
+            if key not in pending:
+                continue
+            pending.discard(key)
+            emb = self._pin_emb.get(pin)
+            if emb is None:
+                continue
+            self._in_pin = True
+            try:
+                with torch.no_grad():
+                    # model.py casts t_emb to the compute dtype *before* AdalnProj
+                    # applies silu; doing it the other way round rounds twice.
+                    emb = emb.to(x.dtype)
+                    if getattr(ap, "apply_silu", True):
+                        emb = torch.nn.functional.silu(emb)
+                    aug = torch.cat([x, emb], 0)
+                    out = module(aug)
+                    row = out[len(x):].detach().to(torch.float32).to("cpu")
+                self.pinned.setdefault(pin, {})[key] = row[0]
+            except Exception as e:
+                logging.warning(
+                    "H3AdaLNRecord: cannot pre-compute %s at t=%.3f (%s: %s)",
+                    key, pin, type(e).__name__, e)
+                self._pin_pending.pop(pin, None)
+            finally:
+                self._in_pin = False
 
     def _fail(self, message):
         self.errors.append(message)
@@ -134,6 +202,8 @@ class AdaLNRecorder:
 
     def _linear_hook(self, key, ap, expected):
         def hook(module, inputs, output):
+            if self._in_pin:  # our own extra call
+                return None
             if not torch.is_tensor(output):
                 self._fail("H3AdaLNRecord: {}.linear returned {} instead of a tensor"
                            .format(key, type(output).__name__))
@@ -159,6 +229,9 @@ class AdaLNRecorder:
                     "denoise_mask per-row timesteps are not supported by record mode."
                     .format(key, m, len(t_values)))
                 return None
+
+            if inputs and torch.is_tensor(inputs[0]):
+                self._pin_row(key, ap, module, inputs[0])
 
             if self.out_dtype is None:
                 self.out_dtype = output.dtype
@@ -206,6 +279,19 @@ class AdaLNRecorder:
                 "this model. Wire the recorder between the model and the guider, and "
                 "make sure the node that consumes `table` executes AFTER sampling "
                 "(connect the sampler's LATENT to its `after` input).")
+        for pin, entries in sorted(self.pinned.items()):
+            key_t = sigma_plan.f32_image(pin)
+            if key_t in self.rows:
+                continue  # the run itself produced this row
+            if len(entries) != len(self.proj_keys):
+                logging.warning(
+                    "H3AdaLNRecord: dropping the pre-computed t=%.3f row -- only "
+                    "%d of %d projections were captured", pin, len(entries),
+                    len(self.proj_keys))
+                continue
+            self.rows[key_t] = dict(entries)
+            self.t_order.append(key_t)
+
         t_values = sorted(self.rows)
         raw = {}
         for key in self.proj_keys:

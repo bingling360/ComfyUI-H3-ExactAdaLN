@@ -253,10 +253,13 @@ class ExactAdaLNRuntime:
                 len(missing), ", ".join("{:.7f}".format(t) for t in missing[:12])))
             rows.append("This is a t-set mismatch, not a precision problem: the running "
                         "schedule/shift produces timesteps the table was never recorded "
-                        "for. Re-record on this exact schedule (or add them via extra_t).")
+                        "for. Re-record on this exact schedule (or add them via extra_t).\n"
+                        "Steps / scheduler / shifts change the timestep set; resolution, "
+                        "frame count and seed do not.")
         else:
-            rows.append("No timestep reconstruction was available either. Record the "
-                        "table on this exact model + schedule, or set mode=fallback.")
+            rows.append("No timestep reconstruction was available either -- record the "
+                        "table on this exact model + schedule (steps / scheduler / "
+                        "shifts). Resolution and frame count do not matter.")
         return "\n".join(rows)
 
     def make_hook(self, key):

@@ -27,10 +27,74 @@
 ```bash
 git clone https://github.com/bingling360/ComfyUI-H3-ExactAdaLN.git
 cd ComfyUI-H3-ExactAdaLN
+python tests/test_simple.py       # 纯 CPU，节点面：身份/命名/行合并/录制落盘
 python tests/test_merge.py        # 纯 CPU，验证合并逻辑（需 torch/safetensors/numpy）
 ```
 
 要跑真实模型，需要 ComfyUI 0.42.5+（实例上是 0.44.0）和「§7 模型清单」里的文件。
+
+### 0.1 节点面已改为 v2（本次改动，先读这段）
+
+节点从「8 个单功能 + 1 个 16 widget 的统一节点」收敛为 **3 个可见节点**：
+
+| 节点 | 输入 | 备注 |
+|---|---|---|
+| `H3 AdaLN` | `model` / `mode`(apply·record·off) / `for_model` / `fill_reference_row` / `table` / `[table_in]` / `[after]` | 录制、应用、对照 |
+| `H3 AdaLN Hybrid` | `model` / `table_a` / `table_b` / `split` | bX-49 合并，`final_from` 固定 a |
+| `H3 Latent Compare` | 两个 LATENT | 不变 |
+
+被删掉的 widget 与等价替代：
+
+- `model_tag` / `lora_tag` / `scheduler_tag` / `pass_tag` / `record_name`
+  → 文件名由**身份**推导：`h3_{full|pruned}_{模型指纹6}_{精度}[_L{AdaLN指纹4}]`；
+- `table_source`(auto/dropdown/last) + `table_text` + `table_b_text`
+  → 一个下拉框，默认 `(auto)`；归属由录表时的 `for_model` 写进表头 `target_base`；
+- `strictness` → 恒为严格（`fallback` 只会产出「看起来成功、数值是错的」结果）；
+- `split` / `final_from` → 移到 `H3 AdaLN Hybrid`。
+
+两个**行为变化**，验收时要一起看：
+
+1. **保存改为按身份合并行**：同 schedule 重录是 `unchanged`（不重写）；
+   新 schedule 是 `merged`（追加 t 行）；同 t 不同值则拒绝写盘。
+   目的是消灭 `t-set mismatch` 和 `pass_tag` 分表。
+2. **归属写进表头**：录表时节点自己认基座（扫模型目录，`adaln_t_table` 有、
+   `time_embedder` 无 = 基座；只有一个就直接用），只读它的 AdaLN 张量（几 KB，
+   3.7 ms，不加载模型）算出 `target_base`；apply 侧算同一个指纹去查。
+   没有 `_last_table.json`，也没有 `_bindings.json` —— 表拷到别的机器照样认得出。
+   `for_model` 只在「目录里两个以上基座」时才需要手动指定。
+3. **身份含计算精度**：bf16 教师与 fp32 教师录出的是两张表，不会互相合并。
+4. **固定行自动补**（`fill_reference_row`，默认开）：录表时把 `t=0.999`（参考音频再加
+   `1.0`）追加到该步 t_emb 批里，用模型自己的模块多算一行再丢掉 —— 同批同权重，
+   值等于真带参考跑一次，且**不改采样结果**（不动 layout、不碰 payload）。
+   关掉则回到旧行为：纯 t2v 表没有 0.999，首次上参考会在采样前报 t-set mismatch。
+
+实现落在 `h3_unified.py`（重写）；`nodes.py` / `latent_io.py` 只加了
+`DEPRECATED = True`，逻辑未动，01~08 工作流仍可加载运行。
+新增 `tests/test_simple.py`；`workflows/05`、`08` 的 Record 节点补了缺失的
+`time_embedder_from` widget（原本就让 `test_workflows.py` 红着）。
+
+**本机已验（2026-11-09，ComfyUI 0.44.2 / torch 2.12.1 / GTX 1660S 6GB / 16GB RAM）**：
+
+| 项 | 结果 |
+|---|---|
+| `tests/test_exact.py`（真实 `MiniMaxH3Model`，小尺寸，CPU） | 21/21 PASS，含 record→apply 逐位一致 + `mode=off` 负对照不通过 |
+| `tests/test_runtime.py`（真实进程、真实 `ModelPatcher.cleanup()`） | 7/7 PASS：注册目录、**文件/模块指纹一致**、录制落盘（含 `target_base`）、换 schedule 合并、按指纹找表、off 清理、hybrid 合并注入 |
+| 真实 b25-49 int8 检查点结构 | 曲线形态：`adaln_t_table [1025,8]` F32，无 `time_embedder`，51 个 `adaln_proj` 权重 `[96768,8]` **F16**（不是量化张量），`final_layer` 为 `[10752,8]` |
+| 真实权重/真实宽度注入自检 | 51 投影全挂、`torch.equal=True`、`max_dist=0.000e+00`、0 失败；5 行表 92.5 MiB（≈18.5 MiB/行） |
+| 指纹在真实权重上 | `model_fingerprint` 1 ms；`base_fingerprint` 0.46 ms（fp16 行只有 8 个数），两次加载一致，只改 25-49 块也能区分 |
+| 同一基座的两个量化版本（int8 / w4a8） | `adaln_proj` 都是 `[96768,8] F16`、`adaln_t_table` 都是 `[1025,8] F32` → 同一个 `target_base`，一张表通吃 |
+
+**仍未验证（受本机硬件限制）**：
+
+- 真实 20GB 模型的完整推理：16GB 内存 + 6GB 显存只能靠 mmap/offload，
+  跑一次要流式搬运 20GB/步；而且本机没有**全量教师**，
+  `record` 的完整链路（含 `time_embedder` 取 t）只在 tiny 配置上验过。
+- 真机上的 `ON_CLEANUP` 时机由 ComfyUI 触发（本机是直接调 `cleanup()`，
+  走的是同一段代码，但没有经过队列）。
+- 首次真实录制的耗时：身份指纹 + 合并写盘（见下）。
+
+下一次开机（有全量教师时）按这个顺序验：`mode=record` 跑一次 → 控制台
+`saved ...` → 切 `apply` → 看 `apply stats` 的 `native steps=0`。
 
 ---
 
@@ -297,7 +361,7 @@ tools/             工作流生成器 + 模型/对照辅助
    用插件的 `H3LatentSave`。
 8. **`H3ExactAdaLNLoad` 用自由文本**，不要用 COMBO + `image_upload`（前者启动时缓存，
    后者只收图片）。
-9. **表与 schedule 绑定**：换步数 / shift / 分辨率 / LoRA 强度都要重录；strict 会列出缺失 t。
+9. **表与 t 集合绑定，不与分辨率绑定**：换步数 / 调度器 / shift / AdaLN-LoRA 强度会改变需要的 t（缺了就报 t-set mismatch，再录一次是**追加行**）；分辨率、帧数、seed 不改变 t，不需要重录。
 10. **本地 ComfyUI 0.41.2 跑不了 `test_exact.py`**（低于 0.42.5，且缺 `comfy_kitchen`）；
     数值回归要在 0.44 实例上跑。本地能跑的是 `test_merge.py`（纯 CPU）和
     `test_workflows.py` 的结构部分。
@@ -458,6 +522,10 @@ VERDICT: PASS - bitwise identical
   不再误导成「在 diffusion_models 里没找到」。
 
 ### 11.6c 统一节点 H3AdaLN（2026-11-09，实验性，已注册）
+
+> **已被 §0.1 的 v2 取代**：五种模式合并成 `apply / record / off`，
+> 四个 tag、`table_source`/`table_text`、`strictness` 全部删除，
+> `hybrid`/`merge` 独立成 `H3 AdaLN Hybrid`。下面这段保留为 v1 的设计记录。
 
 一个节点五种模式：`apply / record / hybrid / merge / off`。表统一放
 `models/h3_exact_adaln/`，`record` 在 prompt 结束时（`ON_CLEANUP`）自动落盘，

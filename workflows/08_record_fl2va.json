@@ -624,7 +624,8 @@
       "widgets_values": [
         "strict",
         "fl2va full int8_convrot",
-        "dmad8_s1.0"
+        "dmad8_s1.0",
+        ""
       ],
       "inputs": [
         {

@@ -6,11 +6,14 @@ modulation exactly, so that
 > pruned base + exact table + LoRA  ==  full teacher + the same LoRA  (bitwise)
 
 在剪枝版 MiniMax-H3 上逐位复刻完整模型的 AdaLN 调制：生成结果与「完整模型 +
-同一 LoRA」完全一致，速度维持剪枝版水平，表可 Save/Load 分享。
+同一 LoRA」完全一致，速度维持剪枝版水平，表自动落盘、可直接拷贝分享。
 
 ## Why
 
-> **New here?** Start with [the complete node guide](docs/NODE_GUIDE.md) for the unified `H3AdaLN` node (record / apply / hybrid / merge / off), the naming scheme, five worked recipes, and a checklist of pitfalls found during the 2026-11-08/09 verification runs.
+> **New here?** [The node guide](docs/NODE_GUIDE.md) has the two-step usage, the
+> naming/identity rules, worked recipes and the pitfall checklist from the
+> 2026-11-08/09 verification runs. [The design note](docs/unified-node.md)
+> explains why one node is enough.
 
 
 H3 puts ~13B parameters (39%) into AdaLN branches whose output depends only on
@@ -99,54 +102,81 @@ packages. Verified against ComfyUI 0.44.0 / PyTorch 2.9.1 / RTX 4080 SUPER.
 
 ## Nodes
 
+Two nodes, plus a diagnostic. Everything the old Save / Load / Merge plumbing
+did now happens inside the node that needs it.
+
 | Node | In | Out | Behaviour |
 |---|---|---|---|
-| `H3 AdaLN Record` | full MODEL (+ LoRA) | MODEL, `H3_ADALN_TABLE` | **Exact.** Read-only hooks; the table fills up *during* sampling. |
-| `H3 Exact AdaLN Bake` | full MODEL (+ LoRA), SIGMAS or steps/scheduler | `H3_ADALN_TABLE` | Offline approximation. Cheap, no sampling. |
-| `H3 Exact AdaLN Save Table` | `H3_ADALN_TABLE` | file path | Like **Save Image**: auto-numbered `.safetensors` under `output/h3_adaln/`, or into `models/h3_exact_adaln/`. Mirrors into `input/`. |
-| `H3 Exact AdaLN Load Table` | `table_name` (free text) / `table_path` | `H3_ADALN_TABLE` | Resolves a filename, substring, relative path or absolute path. Scans `input/`, `output/`, `models/h3_exact_adaln/`. |
-| `H3 AdaLN Merge` | two `H3_ADALN_TABLE` | `H3_ADALN_TABLE` | **bX-49 hybrids.** Blocks `0..split-1` from A, `split..49` from B, `final_layer` from A. Refuses mismatched t-sets / projections / dtype / LoRA. |
-| `H3 Exact AdaLN Apply` | pruned MODEL + `H3_ADALN_TABLE` | MODEL | Replaces all 51 AdaLN projections at runtime. `strict` / `fallback` / `off`. |
+| `H3 AdaLN` | `model`, `mode` (`apply` / `record` / `off`), `for_model`, `table` | MODEL, table, report | `record`: read-only hooks on the full teacher; `for_model=(auto)` finds the pruned base and stamps its fingerprint. `apply`: replaces all 51 AdaLN projections on the model that table declares. `off`: pass-through for an A/B control. |
+| `H3 AdaLN Hybrid` | `model`, `table_a`, `table_b`, `split` | MODEL, table, report | **bX-49 only.** Blocks `0..split-1` from A, `split..49` from B, saves and injects. |
 | `H3 Latent Compare` | two LATENT | report | `equal`, `max_abs`, `PSNR`; PASS = bitwise identical. |
-| `H3 Latent Save` | LATENT | file | Saves H3's `NestedTensor` latents (stock `SaveLatent` cannot). |
 
-A saved table is **self-contained**: its safetensors header carries the
-teacher, provenance (record vs bake), LoRA fingerprint, sigma grid, shifts,
-out dtype and ComfyUI version. Copy the file anywhere to share it; the
-receiving side just Loads it. `strict` mode refuses a table recorded with a
-different **AdaLN / timestep** LoRA stack; a different non-AdaLN LoRA is
-harmless and no longer blocks reuse (verified bitwise). See
-[the node guide](docs/NODE_GUIDE.md) for the unified `H3AdaLN` node.
+Why there is nothing to type:
+
+- **The name comes from the model.** A table's identity is its AdaLN weights
+  (fingerprinted from block 0, the middle block, the last block and
+  `final_layer`) + its **AdaLN** LoRA + its compute dtype. The file lands in
+  `models/h3_exact_adaln/` as `h3_full_<fp>_<dtype>[_L<lora>].safetensors`.
+  Rename it freely — the identity lives in the safetensors header and the node
+  keeps finding the file.
+- **The table learns which base it belongs to.** At record time the node finds
+  the pruned checkpoint in your model folder by itself (a base ships
+  `adaln_t_table` and no `time_embedder`; a teacher is the opposite) and writes
+  its AdaLN fingerprint into the table header (`target_base`). At apply time it
+  hashes the model in front of it and takes the table that declares that base —
+  no picker, no sidecar file, and the association travels inside the
+  `.safetensors`. Two model chains in one workflow each find their own table,
+  and there is no "most recent" rule to go stale.
+- **Re-recording merges.** Same schedule: nothing changes. Different schedule:
+  the new timesteps are *added* to the same table. Only a genuine contradiction
+  — the same `t` producing different numbers, which means the model, the AdaLN
+  LoRA or the dtype changed — is refused, and then nothing is written.
+- **One table per model, not per pass.** `modulation = adaln_proj(time_embedder(t))`
+  contains no latent, resolution, seed or pass, so every sampling segment of the
+  same model hits the same rows.
+
+A table is **self-contained**: the safetensors header carries the identity,
+teacher fingerprint, provenance (record vs bake), t rows, shift pair, out dtype
+and ComfyUI version. Copy the file anywhere to share it.
+
+The seven single-purpose nodes this replaces (`H3 AdaLN Record`,
+`H3 Exact AdaLN Bake`, `H3 Exact AdaLN Save/Load Table`, `H3 AdaLN Merge`,
+`H3 Exact AdaLN Apply`, `H3 Latent Save`) still load so the published workflows
+keep working, but they are marked deprecated and no longer appear in the node
+menu.
 
 ## Quick start
 
-1. **Record once.** Load the *full* teacher + your LoRA, put `H3 AdaLN Record`
-   between the shift node and the guider, and run the exact workflow you will
-   actually use (same steps, scheduler, shifts, resolution, frames).
-2. **Save.** Wire the recorder's `table` into `H3 Exact AdaLN Save Table` and
-   its `after` input to the sampler's `LATENT`, so the save happens after
-   sampling rather than before.
-3. **Reuse forever.** On the pruned base, load the table and put
-   `H3 Exact AdaLN Apply` between the shift node and the guider.
+1. **Record.** Load the *full* teacher + your LoRA, put `H3 AdaLN` between the
+   shift node and the guider, set `mode=record`, and run the workflow you will
+   actually use. The table is written when the prompt finishes — no Save node,
+   no `after` edge. Nothing else to fill in: with one pruned checkpoint in the
+   folder, `for_model=(auto)` picks it up and stamps it.
+2. **Apply.** Swap in that pruned base, set `mode=apply`, leave `table` at
+   `(auto)`. Done: the table declares this base, so nothing is picked.
+3. **Verify (optional).** `mode=off` on the same graph must produce a visibly
+   different latent — if it does not, the table was never injected.
 
-### The `after` input (important)
+### The `after` input (only for A/B in one prompt)
 
-ComfyUI runs a node as soon as its inputs exist. A recorded table is **empty
-until chain A has sampled**, so every consumer must be ordered behind it.
-`after` is an ignored wildcard input whose only job is to create that edge:
+A recorded table is empty until the sampler has run, so anything reading it in
+the *same* prompt has to be ordered behind it. `after` is an ignored wildcard
+input whose only job is to create that edge:
 
 ```
-sampler_A.output ──► Apply.after      (chain B may then start)
-sampler_A.output ──► Save.after       (the table may then be written)
+sampler_A.output ──► H3 AdaLN(apply).after      (chain B may then start)
 ```
 
-Without it, `Apply`/`Save` run before any row exists and fail with an explicit
-"nothing was recorded" error. If your frontend refuses to connect a `LATENT`
-into a `*` socket, split the run in two prompts (record + save, then load +
-apply) — AdaLN depends only on `t`, so a table recorded in an earlier run is
-bitwise identical as long as the schedule, shifts and layout match.
+This is only needed for the `05_record_strict.json` style A/B graph. Daily use
+records in one prompt and applies in the next — AdaLN depends only on `t`, so a
+table recorded earlier is bitwise identical as long as the t values match.
 
 ## Workflows
+
+These graphs are the verification suite. They were generated against the
+single-purpose nodes, which are now deprecated but still load, so they keep
+working as-is. For daily use, a graph needs one `H3 AdaLN` node where the
+record/apply node already sits.
 
 - `workflows/01_bake_exact_adaln.json` — Bake → Save. Queue once on its own.
   The offline path; good for a quick look, not for bitwise claims.
@@ -172,30 +202,62 @@ bitwise identical as long as the schedule, shifts and layout match.
 Defaults match the DMAD 8-step LoRA: 8 steps, `euler`, `simple`, strength 1.0,
 no CFG, video shift 12 / **audio shift 2**. Change the LoRA filename to your
 own before running. The short verification clip (832x480, 39 frames) can be
-changed to the full 1344x768 / 124 frames as long as both chains stay in sync
-**and the table is recorded on the same shape** (the layout fixes which
-timesteps exist).
+changed to the full 1344x768 / 124 frames as long as both chains stay in sync —
+the two chains must be comparable, but **resolution and frame count do not
+change the timesteps a table has to cover**: the t values come from sigma and
+the shifts, never from the latent shape.
 
-## Sharing and downloading tables
+### What a table depends on
 
-ComfyUI's asset/output panel only understands media types, so a raw
-`.safetensors` produced by a custom node is normally not downloadable from the
-UI. Save Table works around this in three ways:
+| | value stored for a given t | which t values exist |
+|---|---|---|
+| teacher weights, AdaLN LoRA, compute dtype | **yes** | — |
+| steps, scheduler, custom sigmas | no | **yes** (t = 1 − sigma) |
+| video / audio shift | no | **yes** |
+| keyframes / references / reference audio | no | no — those two rows (`0.999`, `1.0`) are pre-computed at record time |
+| which image, how many, first vs last frame | no | no |
+| resolution, frame count, seed, sampler | no | no |
 
-1. **Direct download link** — the Save report prints a relative URL like
-   `/view?filename=h3_exact_dmad8_v1_00001.safetensors&subfolder=h3_adaln&type=output`.
-   Paste `<your ComfyUI host>` + that URL into a browser; `/view` serves any
-   file under `output/` as `application/octet-stream`.
-2. **Output panel entry** — Save also reports the file through ComfyUI's
-   generic `ui.images` channel, so a download card appears without opening the
-   folder (the thumbnail may be blank for a non-image file).
-3. **input/ mirror** — the same file is copied into `ComfyUI/input/`, which
-   most platform file browsers and the Load node can reach directly.
+So: change the resolution, swap a reference image, add a first/last frame, feed
+three references instead of one — none of it needs a new recording. The two
+“pinned” rows a reference workflow asks for (`t=0.999`, and `1.0` for reference
+audio) are pre-computed during recording (`fill_reference_row`, on by default):
+the node appends that timestep to the step's embedding batch, runs the model's
+own projections, and throws the extra row away. Same batch as a real reference
+run, so the row is exact, and the sampling output is untouched.
 
-Load Table deliberately uses **free text**, not a dropdown + `image_upload`
-widget: a COMBO list is built once at ComfyUI startup (so a table saved later
-never appears), and the image upload control only accepts images. If the name
-cannot be resolved, the error lists every table file it can see.
+Change the steps, scheduler or shift and the existing rows stay correct, but the
+new schedule may need timesteps the table does not have — one more recording run
+adds them (`merged`, see below), it does not replace the table.
+
+## Sharing tables
+
+Tables live in `ComfyUI/models/h3_exact_adaln/` (registered as a model folder,
+so the platform's file browser can reach it). A table is a normal
+`.safetensors` file that carries its own provenance: `target_base` (the model it
+was recorded for), `identity` (teacher + AdaLN LoRA + dtype) and the t-row set.
+Copy it to another machine, drop it in the same folder, and apply finds it with
+no configuration at all. Renaming is safe — nothing is keyed on the filename,
+and the node keeps merging into a renamed file.
+
+There is no state outside the table files. The only thing the plugin ever needs
+to know about a model is its AdaLN fingerprint, and it reads that itself — at
+record time from the checkpoint on disk, at apply time from the loaded model.
+`for_model` therefore defaults to `(auto)` and only has to be touched when the
+folder holds more than one pruned checkpoint, where "which base did you mean"
+is genuinely not derivable. A table recorded without a target still works as
+long as it is the only candidate for that AdaLN LoRA — the node says so in its
+report.
+
+Legacy tables written by the old `H3 Exact AdaLN Save Table` node (in
+`output/h3_adaln/` or mirrored into `input/`) are still listed and still
+apply; they simply have no identity, so a new recording starts a new file
+instead of growing them.
+
+The picker is a plain dropdown of the two table folders plus `(auto)`, which is
+the default and the only value the node writes into a graph. Picking a file is a
+one-shot override for that run — nothing is remembered, so a graph left on
+`(auto)` keeps resolving by fingerprint.
 
 ## Implementation notes
 
@@ -247,20 +309,20 @@ cannot be resolved, the error lists every table file it can see.
 
 ## t-set coverage
 
-A table is valid for exactly the timesteps it contains. Strict mode therefore
-reports a **t-set mismatch** (listing the missing values) rather than a generic
-"different schedule" hint:
+A table is valid for exactly the timesteps it contains, and applying it to a
+schedule with other timesteps fails loudly instead of snapping to a neighbour:
 
 ```
-H3ExactAdaLN: cannot map (17, 8) rows to table rows.
+H3AdaLN: cannot map (17, 8) rows to table rows.
 reason: t_emb=(17, 8) keys=(17, 8) max_dist=4.1e-3 tol=1e-6 (curve keys)
 missing from table (3): 0.9230769, 0.9411765, 0.9600000
 This is a t-set mismatch, not a precision problem: the running schedule/shift
 produces timesteps the table was never recorded for.
 ```
 
-Re-record on the exact schedule you intend to use. `shift_v`/`shift_a` being
-equal is neither necessary nor sufficient: what matters is that *every runtime
+That is no longer a one-way door: run `mode=record` once on the new schedule
+and the missing rows are appended to the same table. `shift_v`/`shift_a` being
+equal is neither necessary nor sufficient — what matters is that *every runtime
 t is in the table*, and that the t→t_emb mapping is the same one that produced
 it.
 
@@ -294,10 +356,11 @@ curve cannot carry either teacher's full modulation. Two ways out, and they are
 
 #### A. Record the assembled hybrid (exact, one pass)
 
-Point Record at a full bX-49 checkpoint — a full model whose body is the base
-teacher's and whose blocks X..49 `adaln_proj` come from the donor, i.e. exactly
-the same recipe as the pruned file. One recording run, no merge, and the table
-reproduces that model **bitwise**. A ready-made `b25-49` int8 teacher:
+Point `H3 AdaLN` (`mode=record`) at a full bX-49 checkpoint — a full model
+whose body is the base teacher's and whose blocks X..49 `adaln_proj` come from
+the donor, i.e. exactly the same recipe as the pruned file. One recording run,
+no merge, and the table reproduces that model **bitwise**. A ready-made `b25-49`
+int8 teacher:
 [`binglingzhimeng/MiniMax-H3-b25-49-full`](https://huggingface.co/binglingzhimeng/MiniMax-H3-b25-49-full).
 
 Measured end to end (both chains, same LoRA, 8 steps, `simple`, shift 12/2):
@@ -317,8 +380,10 @@ base teacher's embedding swapped in first:
 
 1. record the **base** teacher (FL2VA full) → A;
 2. record the **tail donor** (Ref2VA full) with
-   `time_embedder_from = <base teacher file>` → B';
-3. `H3 AdaLN Merge`, `split=25`, `final_from=a`.
+   `time_embedder_from = <base teacher file>` → B'. This input lives on the
+   deprecated `H3 AdaLN Record` node — the one thing the simplified node
+   deliberately does not expose, because it is only needed for this recipe;
+3. `H3 AdaLN Hybrid`, pick A and B', `split=25`.
 
 Why the extra input is mandatory: AdaLN output is `adaln_proj(t_emb)`, and the
 tail blocks of a hybrid see the **base** teacher's `t_emb`. The two official
@@ -414,15 +479,16 @@ cross-LoRA case above could only be run with `mode=fallback`.
 
 ## Known limits
 
-- A table is a function of (base weights, LoRA set **and strengths**, sigma
-  grid, shifts, and the packed layout that decides which timesteps exist).
-  Changing any of them requires a re-record. Strength cannot be interpolated at
-  runtime when a LoRA touches `time_embedder` (two SiLUs make it non-linear).
+- A table is a function of (AdaLN weights, **AdaLN** LoRA set and strengths,
+  compute dtype) and of the timesteps it contains. Every other LoRA is
+  irrelevant, and a new schedule only costs one more recording run — its rows
+  are appended, not substituted. Strength cannot be interpolated at runtime
+  when a LoRA touches `time_embedder` (two SiLUs make it non-linear).
 - `out_dtype` is fixed when the table is produced and must match the teacher's
-  inference dtype. `Apply` compares it against the target model's compute
-  dtype and prints `MISMATCH: ... replay is NOT bitwise` (plus a warning in
-  the log) instead of leaving you to notice it in the pixels. Recording a bf16 teacher and applying into a model forced to
-  fp32 gives different arithmetic than the teacher used.
+  inference dtype, so it is part of the identity: a bf16 recording and an fp32
+  recording of the same teacher are two tables, not one. Apply compares it
+  against the target model's compute dtype and warns
+  `replay is NOT bitwise` instead of leaving you to notice it in the pixels.
 - Per-row `denoise_mask` timesteps are not supported by Record (it labels rows
   by the `unique_t` the forward actually used, and per-row masks multiply that
   set unpredictably); the offline Bake path covers them via `extra_t`.
@@ -430,11 +496,15 @@ cross-LoRA case above could only be run with `mode=fallback`.
 - Python hooks cannot reach DiTs executed by a C++ engine or fused kernels that
   bypass `module.forward`.
 - Record needs one sampling run with the full teacher, so peak VRAM is
-  whatever the teacher needs. The table itself is ~315 MiB for 17 t rows.
+  whatever the teacher needs. The table itself is ~315 MiB for 17 t rows, and it
+  grows with every extra schedule you record.
 
 ## Testing
 
 ```bash
+# the node surface: naming, identity, row merging, record -> save -> inject (CPU)
+python tests/test_simple.py
+
 # structure: every workflow JSON, link/slot consistency, widget counts
 python tests/test_workflows.py
 
@@ -443,6 +513,9 @@ python tests/test_exact.py
 
 # merge: block split, t alignment, metadata round-trip, rejection paths (CPU)
 python tests/test_merge.py
+
+# inside a real ComfyUI: real ModelPatcher, real ON_CLEANUP, real table folder
+COMFYUI_DIR=<checkout> python tests/test_runtime.py
 ```
 
 `test_exact.py` builds a full teacher and a curve student that shares every
@@ -455,22 +528,23 @@ Set `COMFYUI_DIR` if your ComfyUI lives somewhere other than the default path.
 ## Repo layout
 
 ```
+h3_unified.py      the two nodes to use: H3 AdaLN, H3 AdaLN Hybrid
 record_engine.py   observe AdaLN during sampling (the exact path)
 bake_engine.py     offline recomputation + splice donors
 apply_engine.py    runtime injection: t_emb matching + sigma fallback
 sigma_plan.py      float32-exact t arithmetic, mirrors model.py:671-751
 table_io.py        safetensors container, live (recording) tables
-nodes.py           the eight stable nodes
+nodes.py           the original single-purpose nodes (now deprecated)
 workflows/         01 bake, 02/03 load+apply A/B, 04 offline strict,
                    05 record strict, 06 bX-49 hybrid, 07 merge only,
                    08 record FL2VA base
-tests/             test_exact.py (numbers), test_merge.py (hybrid merge),
-                   test_workflows.py (graph structure)
+tests/             test_simple.py (node surface), test_exact.py (numbers),
+                   test_merge.py (hybrid merge), test_workflows.py (graph structure),
+                   test_runtime.py (inside a real ComfyUI process)
 tools/             workflow generators (incl. build_hybrid.py) + fetch helpers
 HANDOFF.md         repair plan, root-cause evidence and per-phase status
-docs/unified-node.md  one-node design: record + apply + merge, t-keyed tables
-docs/NODE_GUIDE.md    full node tutorial + lessons learned + pitfall checklist
-h3_unified.py      unified H3AdaLN node (registered from __init__.py)
+docs/unified-node.md  why one node is enough: invariants, identity, row merging
+docs/NODE_GUIDE.md    the node tutorial + lessons learned + pitfall checklist
 ```
 
 The workflow JSONs are **generated**, never hand-edited:
@@ -498,7 +572,7 @@ tell whether a workflow was hand-edited.
   projections / 17 t rows / 314.5 MiB and the first injection was confirmed
   (`max_dist=0.000e+00`), yet the latents still differ — that measurement is
   what identified the offline path as the root cause and motivated Record.
-- bX-49 hybrid support: `H3 AdaLN Merge` assembles the table from two full
+- bX-49 hybrid support: `H3 AdaLN Hybrid` assembles the table from two full
   teachers (blocks 0..24 from FL2VA, 25..49 from Ref2VA). `tests/test_merge.py`
   covers the split, t alignment, metadata round-trip and every rejection path
   on CPU; the real 20 GiB b25-49 run still needs a GPU instance.
@@ -506,6 +580,20 @@ tell whether a workflow was hand-edited.
   `equal=True / max_abs=0 / VERDICT: PASS`, `Apply.mode=off` reports `FAIL`
   with no injection log, and strict still passes after the control run. Root
   cause, evidence and the verification log live in [`HANDOFF.md`](HANDOFF.md).
+- The v2 node surface is verified on CPU (`tests/test_simple.py`) and inside a
+  real ComfyUI 0.44.2 process (`tests/test_runtime.py`: real `ModelPatcher`,
+  real `ON_CLEANUP`, real table folder, plus the invariant that a fingerprint
+  computed from a checkpoint file is byte-identical to the one computed from the
+  loaded module). `tests/test_exact.py` passes 21/21 against the real
+  `MiniMaxH3Model` at tiny scale, including record → apply bitwise and the
+  `mode=off` control.
+- End-to-end on a real checkpoint is still open: the local box only has a
+  *pruned* b25-49 (20 GB) with 6 GB VRAM and no full teacher, so `record` has
+  never run against a full model. Reading that checkpoint's AdaLN tensors
+  directly confirms the assumptions the plugin makes (`adaln_t_table [1025,8]`,
+  no `time_embedder`, 51 × `[96768,8]` fp16 projections), and injecting its own
+  rows at real width is bitwise with `max_dist=0`. Checklist in
+  [`HANDOFF.md`](HANDOFF.md) §0.1.
 
 ## Related work
 

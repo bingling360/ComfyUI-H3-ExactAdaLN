@@ -411,6 +411,7 @@ class H3AdaLNRecord:
             },
         }
 
+    DEPRECATED = True  # kept for published workflows; use H3 AdaLN mode=record
     RETURN_TYPES = ("MODEL", TABLE_TYPE, "STRING")
     RETURN_NAMES = ("model", "table", "report")
     FUNCTION = "run"
@@ -560,6 +561,7 @@ class H3ExactAdaLNBake:
             },
         }
 
+    DEPRECATED = True  # approximation only; H3 AdaLN mode=record is exact
     RETURN_TYPES = (TABLE_TYPE, "STRING")
     RETURN_NAMES = ("table", "report")
     OUTPUT_NODE = True
@@ -681,6 +683,7 @@ class H3ExactAdaLNSave:
             },
         }
 
+    DEPRECATED = True  # H3 AdaLN mode=record writes the table itself
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("file_path",)
     OUTPUT_NODE = True
@@ -795,6 +798,7 @@ class H3ExactAdaLNLoad:
             },
         }
 
+    DEPRECATED = True  # the table picker on H3 AdaLN replaces this node
     RETURN_TYPES = (TABLE_TYPE, "STRING")
     RETURN_NAMES = ("table", "info")
     OUTPUT_NODE = True
@@ -860,6 +864,7 @@ class H3AdaLNMerge:
             },
         }
 
+    DEPRECATED = True  # use H3 AdaLN Hybrid, which also saves and injects
     RETURN_TYPES = (TABLE_TYPE, "STRING")
     RETURN_NAMES = ("table", "report")
     FUNCTION = "run"
@@ -912,6 +917,7 @@ class H3ExactAdaLNApply:
             },
         }
 
+    DEPRECATED = True  # kept for published A/B workflows; use H3 AdaLN mode=apply
     RETURN_TYPES = ("MODEL", "STRING")
     RETURN_NAMES = ("model", "report")
     FUNCTION = "run"

@@ -1,284 +1,187 @@
-# 一个节点、多种模式：H3 AdaLN 统一节点设计
+# 一个节点为什么够用：H3 AdaLN v2 设计说明
 
-目标：把 Record / Save / Load / Apply / Merge 五个节点合成一个 `H3 AdaLN`，
-表统一放在 `models/h3_exact_adaln/`，用时下拉选表，连线保持「LoRA 之后 → 采样器之前」。
+v1 的统一节点有 16 个 widget。几乎每一个都是在替节点做它自己能查到的事，
+所以 v2 把它们全部删掉了，只留下 `mode` 和一个表选择框。本文记录删掉的理由
+和因此必须成立的不变式 —— 这些不变式比代码本身重要，改动实现前先读一遍。
 
 ---
 
-## 1. 先定不变式
+## 1. 唯一的不变式
 
 ```
 modulation = adaln_proj( time_embedder(t) )
 ```
 
-右边只依赖两样东西：**AdaLN 权重**（含打在它上面的 LoRA）和 **t**。
+右边只依赖两样东西：**AdaLN 权重（含打在上面的 LoRA）** 和 **t**。
 不含 pass、latent、分辨率、步数、sampler、conditioning、seed。
 
-由此推出三条，整个设计都建立在它们之上：
+注意这里说的是**每一行的数值**。表里**有哪些行**（覆盖哪些 t）是另一回事，
+由 `t = 1 - sigma` 的来源决定：sigma 网格（调度器 + 步数 + 自定义 sigmas）、
+shift，以及这次 forward 里存在哪些段（关键帧 / 参考图 / 参考音频会引入固定的
+`max(t, 0.999)`、`1.0`）。分辨率、帧数只改变每段的 token 数，**不改变 t**。
 
-1. 表就是一张 `t -> 调制向量` 的查找表，**按 t 索引，不按调用顺序**。
-2. 同一模型在同一工作流里跑几段采样都无所谓：t 并集变大，表变多几行，仍然正确。
-3. 换模型就换了 `adaln_proj`，表失效；换 AdaLN LoRA 同理。
+由此推出三条，v2 的所有简化都建立在它们之上：
 
-**所以「分表」的维度是模型（+ AdaLN LoRA），不是 pass。**
+1. 表是一张 `t -> 调制向量` 的查找表，**按 t 索引**，不按调用顺序；
+2. 同一模型跑几段采样（二采、refine、hires、SelfLift 高低段）共用一张表，
+   行数是各段 t 的并集；
+3. 换模型 / 换 AdaLN LoRA / 换计算精度 → 表失效；换别的 LoRA 不影响。
 
-## 2. 二次采样 / 高模低模 / 连续流程
+---
 
-### 2.1 同模型两段（二采、refine、hires fix）
-
-一张表。record 时两段的 t 都会被记下来（`rows` 按 t 去重），apply 时两段各自命中。
-**不要**为此做两张表：任何一张都只覆盖一半 t，另一段必然 t-set mismatch。
-
-前提是同一个节点实例挂在同一个 MODEL 链上，且两段的 sigma 网格都经过它。
-
-### 2.2 不同模型（refiner、SelfLift 高/低模、SequenceForge 的多导演台）
-
-两个节点、两张表。判据不是「第几段」，而是「哪个 MODEL 对象」：
-
-- 节点 A 挂在 model_high 上 → 表里存 model_high 的调制；
-- 节点 B 挂在 model_low 上 → 另一张表；
-- 两个节点各自只捕获取样时真正经过它的那次 forward。
-
-因为 `adaln_proj` 是模型自己的模块，hook 不会串台。**这一点已经由现有实现保证**：
-hook 周期随 MODEL 对象走，`_clear_registered` 也只清自己那个 patcher。
-
-### 2.3 连续过程（SelfLift 这类多尺度反复调用）
-
-能读到，条件三条：
-
-| 条件 | 说明 | 不满足时 |
-|---|---|---|
-| 走 Python `forward` | hooks 挂在 `adaln_proj.linear` 上 | 表空，`rows=0`，节点应报错而不是静默存空表 |
-| t 可复现 | record 与 apply 的 t 逐位相同，或差 < `1e-6 * |key|` | t-set mismatch，报错并列出缺失值 |
-| 同一模型 | 高/低模各自一张表 | **静默错值**：匹配到行但语义不对 |
-
-第三条是唯一会「跑通但结果不对」的，所以表元数据里必须写**模型指纹**，
-apply 时比对，不符硬报错。
-
-模型指纹的取法（低成本、稳定）：
+## 2. 身份：表「是什么」
 
 ```
-sha1( use_adaln_curves, len(blocks), adaln_in_features,
-      adaln_out_features, final_adaln_out, 前 3 个 block 的 adaln 权重头 4KB )
+identity = 模型指纹 : AdaLN LoRA 指纹 : 计算精度
 ```
 
-不读全量权重，几十毫秒。同一份 checkpoint 多次加载指纹一致；
-同架构不同权重（比如 fl2va full vs ref2va full）必须不同——
-因此要把权重字节算进去，不能只算形状。
+- **模型指纹**：`block 0` / 中间块 / 最后一块的 `adaln_proj.linear.weight` 首行
+  各取 256 个 float32，加 `final_layer`，sha1 前 12 位。
+  为什么不是全部 50 块：读 50 块在 int8 权重上可能触发大块反量化；
+  为什么不是只读前 3 块：`b25-49` 这种混合体与它的 base 教师前 3 块完全相同，
+  必须取到中段或尾段才分得开。
+- **AdaLN LoRA 指纹**：只 hash `time_embedder` / `adaln_proj` 上的 patch
+  （含强度和权重采样）。0 个 key 时记为 `""`，不是 sha256("")。
+- **精度**进身份，是因为 fp32 与 bf16 存储的同一行数值不同，
+  合并会变成「同一 t 两个值」，与其到那一步报错，不如一开始就是两张表。
 
-### 2.4 唯一真正的冲突：同 t、不同值
+**不进身份**（有意）：schedule、shift、分辨率、seed、非 AdaLN LoRA。
+它们只决定「表里有哪些 t」，而 t 行是累加的。
 
-同一模型、同一个 t 被记到两次但调制不同。触发场景：
+### 2.1 指纹的失败模式
 
-- 运行中改了 AdaLN LoRA（比如两个 LoraLoader 串在不同分支）；
-- `time_embedder_from` 与 LoRA 混用；
-- 模型被中途替换。
+如果某天 `adaln_proj.weight` 读不出来（权重在 meta device、或是某种自定义
+quantized 子类），`_weight_head` 退化成 `shape+dtype` 的 hash。这时两个同架构
+不同教师的指纹会相同，后果是：第二次录制被当成同一张表，行冲突 → **报错并
+拒绝写盘**。不会静默产出错表，所以这个退化可以接受。
 
-recorder 已经在统计 `repeat_conflicts` 与 `max_repeat_delta`。
-新节点把它升级为**保存前硬校验**：`max_repeat_delta > 1e-6` 就拒绝保存并报出冲突的 t。
+---
 
-## 3. 节点契约
-
-```
-输入
-  model        MODEL
-  mode         [apply | record | hybrid | merge | off]
-  table        COMBO(models/h3_exact_adaln)      apply / hybrid / merge 用
-  table_b      COMBO(...)                        hybrid 用
-  split        INT (默认 25)                      hybrid 用
-  final_from   [a | b]                           hybrid 用
-  strictness   [strict | fallback]               与现有 Apply 语义一致
-  table_text   STRING                            非空则覆盖下拉（应对下拉不刷新的版本）
-  table_source [auto | dropdown | last]          选表策略，auto 为默认（见 §4.1）
-  record_name  STRING                            留空则自动命名
-  model_tag    STRING                            record 时写进名字
-  lora_tag     STRING                            record 时写进名字
-  pass_tag     STRING                            可选；一个工作流录两个模型时用来区分（见 §4.2）
-  table_in     H3_ADALN_TABLE (可选)             同一次运行内做 A/B 时用
-  after        * (可选)                          仅排序：另一条链的 LATENT，
-                                                 让无 after 接口的采样器也能同 prompt 录用
-
-输出
-  model        MODEL
-  table        H3_ADALN_TABLE (可选，透传)
-  report       STRING
-```
-
-- `apply`：`model -> node -> sampler`，其余不用连。
-- `record`：同样 `model -> node -> sampler`，表在**采样结束后自动落盘**，
-  不需要 Save 节点、也不需要 `after`。
-- `hybrid`：选两张表 + split，合并结果既落盘也直接注入当前 model。
-- `merge`：只落盘，不改 model。
-- `off`：透传，用于对照实验（会清掉残留 hook）。
-
-## 4. 自动命名
+## 3. 命名：不再需要标签
 
 ```
-{model}__{lora}__{scheduler}{steps}__sh{sv}-{sa}__{fp6}.safetensors
+h3_{full|pruned}_{模型指纹前6}_{精度}[_L{AdaLN指纹前4}].safetensors
 ```
 
-例：
+v1 的 `model_tag` / `lora_tag` / `scheduler_tag` / `pass_tag` 全部删除：
+文件名由身份推导，`scheduler` 对模型侧节点本来就不可见，`pass_tag` 则是
+「按 pass 分表」这个错误做法的补丁 —— 同一模型的任何一张分表都只覆盖一半 t。
 
-```
-b25-49full-int8__dmad8x1.0__simple8__sh12-2__001c09.safetensors
-fl2va-full-int8__none__euler20__sh12-2__e3a71b.safetensors
-```
+**改名安全**：身份写在 safetensors header（`identity` 键）里，
+保存前按 header 扫描两个表目录找同身份的文件，所以用户随手改名之后，
+下次录制仍然合并进那个文件，不会另起一张。
 
-- 每段只保留 `[A-Za-z0-9._-]`，超长截断到 32 字符；
-  `model_tag` / `lora_tag` 留空时用 `model` / `none`。
-- `fp6` = `lora_fingerprint` 前 6 位。它已经把 LoRA 文件名（间接）、
-  强度、patch 数量都揉进去了，所以「同 LoRA 不同强度」不会撞名。
-- `steps` 与 `scheduler` 来自实际调度；`sh` 是 `shift_video-shift_audio`。
-- 文件名里**不放 t 的行数**：行数进元数据（`t_rows`）。这样同一配置重录是覆盖，
-  不会堆出一堆 `t7 / t15 / t23`。
+---
 
-元数据里写全：`model_tag`、`model_fingerprint`、`lora_tag`、`lora_fingerprint`、
-`scheduler`、`steps`、`shift_v`、`shift_a`、`t_rows`、`t_set_hash`、
-`comfyui_version`、`created`、`record_mode`。
+## 4. 行合并（v2 的关键行为变化）
 
-下拉栏里的显示用 `folder_paths` 的 COMBO；为兼容「COMBO 只在启动时构建」的版本，
-额外保留 `table_text` 文本框，非空即覆盖。
+保存时按身份找已有表：
 
-## 4.1 记录→推理的无缝衔接（table_source）
-
-麻烦点：刚录完就想把同一个节点切成 `apply` 用，但下拉栏可能还没刷新（ComfyUI 的
-COMBO 有的版本只在启动时构建），手打名字又违背「简单」的初衷。
-
-做法：**录完立刻把名字写进一个指针文件**，apply 时按策略解析。
-
-- 保存成功后写 `models/h3_exact_adaln/_last_table.json`：
-  `{"name": ..., "path": ..., "created": ..., "t_rows": ..., "tags": {...}}`，
-  原子替换写（`os.replace`），不会读到半个文件。
-- `table_source` 三档：
-  - `auto`（默认）：下拉项能解析就用它；解析不了就退回 `_last_table.json`；
-    两者都不可用才报错，并把候选列出来。
-  - `dropdown`：只认下拉项，旧行为，适合固定引用某张表。
-  - `last`：只认最近一次录制，适合「边调边用」。
-- `table_text` 始终最高优先级，用来兜底/指定绝对路径。
-
-实测（本地单测）：下拉项指向已删除的文件时，`auto` 会落到最近录制并说明原因；
-`dropdown` 则直接报错。这样「录完切模式就能跑」不需要任何额外操作。
-
-## 4.2 一个工作流里两个模型（二采 / 高低模）
-
-节点挂在哪个 MODEL 上，就只会看到流过那个 MODEL 的 forward——hook 是挂在
-`adaln_proj` 模块上的，天然不串台。所以二采换模型时：
-
-- 两个节点，各自挂各自的模型接口；
-- 各自填一个 `pass_tag`（如 `p1` / `p2`、`high` / `low`），它会进文件名和元数据，
-  两张表不会撞名；
-- apply 侧用 `model_fingerprint` 兜底：拿错表会直接报错，而不是悄悄出图。
-  **但只对 full 目标生效**：主路径是「full 教师录 → pruned 基座用」，两者
-  `adaln_proj` 形状本来就不同（2688 vs 8），相等检查会误杀。pruned 基座上
-  表会整体替换掉 curve，其自身 AdaLN 权重无关紧要，因此只做提示不拦截。
-  （2026-11-09 实测发现的 bug，已修。）
-
-这个判定**不做自动推断**，全靠节点上的 `pass_tag`。同一模型的分段采样不需要
-tag：一张表覆盖两段 t 并集即可（§2.1）。
-
-## 5. 保存时机：为什么不需要 `after`
-
-现在要 `after` 是因为「节点执行时表还是空的」。统一节点换一个思路：
-
-- 在 `record` 模式里注册 `CallbacksMP.ON_CLEANUP`，prompt 结束时统一落盘；
-- 落盘前做三件事：`rows > 0`、`repeat_conflicts` 为 0、名字确定；
-- 每个 prompt 只存一次（`_h3_saved` 标志），避免模型因显存被换出时重复写；
-- 存盘成功后写 `_last_table.json`，供 §4.1 的 `auto` 使用。
-
-失败时**不要**静默：在 report 里写明「未保存：rows=0 / 存在冲突」。
-同一 prompt 内要 A/B（一边录一边用），再连 `table_in`——那是唯一需要连线的场景。
-
-## 6. 表体积
-
-一行 = 51 投影 × 96768 × 4B ≈ 19.7 MiB。
-
-| t 行数 | 表大小 |
+| 情况 | 行为 |
 |---|---|
-| 8 | ~158 MiB |
-| 15 | ~296 MiB |
-| 40（两段 20 步） | ~790 MiB |
-| 100（SelfLift 多尺度） | ~2.0 GiB |
+| 没有同身份的表 | 新建，写盘 |
+| 有，且本次的 t 全都已存在，值也相同 | `unchanged`，不重写（省一次 300MB 写） |
+| 有，且有新 t | `merged`，旧的 + 新的按 t 排序后整体重写 |
+| 有，同一个 t 的值不同（`> 1e-6`） | **抛错，不写任何东西** |
 
-连续流程会产生大量 t。建议：record 时按 `round(t, 7)` 去重（已有），
-并在 report 里提示行数与体积；超过 200 行给警告。
+为什么值得这么做：
 
-## 7. 与现有节点的关系
+- 换 schedule 不再需要「删旧表 / 重新开始」，也不会在 apply 时撞
+  `t-set mismatch`；
+- 同一个模型被两个 record 节点录（用户多插了一个）不会互相覆盖成两张半表；
+- 「同配置重录覆盖」的语义仍然成立（值相同 → unchanged）。
 
-- 旧的 `H3 AdaLN Record / Save / Load / Apply / Merge` 全部保留，不删。
-  已经发布的工作流（05/06/07/08）继续可用。
-- 新节点内部直接复用 `record_engine` / `apply_engine` / `table_io`，
-  不复制逻辑。
-- 迁移路径：文档给出「旧五节点 → 新节点」的对照表，老用户不必改。
+代价：表会变大（一行 ≈ 19.7 MiB），并且合并需要读一次旧表。
+放在 prompt 结束时做，一次几秒，可以接受。
 
-## 8. 实例开机后要验证的清单
+---
 
-1. `ON_CLEANUP` 是否真的在采样结束后触发，且只触发一次；
-2. `folder_paths.add_model_folder_path("h3_exact_adaln", ...)` 后，
-   下拉能否在不重启的情况下看到新存的表（不能就靠 `table_text` 兜底）；
-3. 二采（两个 KSampler 串联、同一 model）→ 一张表覆盖两段 t，逐位 PASS；
-4. 二采但第二段换模型 → 两个节点两张表，各自 PASS；
-5. SelfLift 的图：hooks 是否触发、t 是否可复现、冲突计数是否为 0；
-6. SequenceForge 的导演台图：同一模型被多处调用时，表是否仍逐位一致；
-7. 模型指纹：fl2va full 与 ref2va full 必须不同指纹。
+## 4.1 用哪张表：录表时声明归属
 
-## 8.1 本轮新增、需要一起验的两条
+表的身份（§2）刻画的是**全量教师**；apply 侧手里只有**剪枝基座**。
+这两者之间没有可计算的连接：基座里没有任何字段记录它由哪个教师剪出，
+而 `adaln_t_table` 又是教师的 SVD 曲线 —— b25-49 基座用的就是 fl2va 的曲线，
+所以「同一份基座可能对应两张表（fl2va 的 / b25-49 的）」在物理上区分不了。
 
-- **记录→推理无缝衔接**：录完后不改任何参数、只把 `mode` 切到 `apply`，看是否
-  自动选中刚录的那张表（`table_source=auto`，报告里会写
-  `last recorded (dropdown entry not on disk yet)`）。同时确认下拉栏是否已经
-  自己刷新了——如果刷新了，说明 COMBO 缓存不是问题，`table_text` 可以退化成
-  纯兜底。
-- **两个模型各录各的**：二采换模型时两个节点都给 `pass_tag`，确认生成的两个文件
-  名不同、且 apply 侧互相拿错表会报 `model fp` 不匹配而不是出图。
+解决办法是把连接**在录制时**建立一次，而且不需要人来指：节点扫一遍模型目录，
+按结构认出基座（有 `adaln_t_table`、没有 `time_embedder`）。只有一个时那就是它，
+用 `safe_open` 只读它的 AdaLN 张量（曲线表 + 4 个块的权重首行 + bias，几 KB），
+算出指纹写进表头：
 
-## 8.2 已验证结论（2026-11-09）
+```
+target_base = hash(curve flag, 块数,
+                   adaln_t_table[:4],
+                   blocks[0|mid|last] 的 weight[0][:256] 与 bias[:256],
+                   final_layer 同上)
+```
 
-- DMAD8 步（标准 `SamplerCustomAdvanced`，无 SelfLift）：全量原生 vs
-  剪枝 + 表 **逐位一致**（两路 `equal=True / psnr=inf`）；去掉表则
-  30.48 dB / 29.87 dB。表确实在起作用。
-- YZ 终极篇（SelfLift 两段连续采样）：一张 3 行表覆盖两段，102/102
-  精确注入、0 回退、0 native 步，但全量 vs 剪枝仍差 36.05 dB / 29.10 dB
-  （不加表是 27.24 dB / 25.70 dB）。表有效但不完整 —— 残差来自
-  SelfLift 的高/低分辨率机制，尚待定位。
+关键约束：**从文件算出的字节必须与从已加载模块算出的字节完全一致**，
+否则两侧永远对不上。二者都归一到 float32 再取 `tobytes()`，
+`tests/test_runtime.py` 里有一项专门守这个不变量（全量教师 + 曲线基座各一次）。
 
-## 8.3 导演台二采的分表验证（2026-11-09）
+应用时：
 
-`导演台二采+自定义sigmas (2).json`：一采 b25-49、二采 ref2va（不同模型），
-各自 ManualSigmas，提示词内嵌在采样器的导演台状态 JSON 中。
+1. `table` 指定了文件 → 用它（仅本次，不记忆）；
+2. 表头 `target_base` == 当前模型指纹 → 用它；多于一张则报错（两个教师声明了同一基座）；
+3. 没有任何声明、且只有一张 AdaLN-LoRA 相同的表 → 用它，报告里注明；
+4. 其余 → 报错。
 
-两个 `H3AdaLN` 节点各挂各的模型链，用 `pass_tag=p1/p2` 分别录出两张表：
-指纹不同（full 教师不同）、t 集合不重叠（一采 0~.83、二采 .65~.94）、
-0 冲突。同一 prompt 双链对照：
+为什么不做「最近一张」（v1 的 `(latest)`）：那是时间维度的猜测，多 pass /
+多模型时必然踩空，而且选错表是**静默**的（形状、t 集合都对，只有数值错）。
+为什么不做外部索引文件：声明写进表里，表拷到别的机器仍然能被认出来，
+插件也就没有需要同步的可变状态。
 
-- 有表：`video` / `audio` 都 `equal=True, psnr=inf`（注入 2 次）；
-- 无表：14.37 dB / 16.25 dB；
-- 交叉表：strict 直接报 `t-set mismatch`（一采 t=0 不在 p2 表）。
+唯一的边界：目录里有**两个以上**剪枝基座时，"你说的基座是哪个"推不出来 ——
+这时不写 `target_base`（不瞎猜），并在日志里列出候选，`for_model` 才需要手动指定。
 
-即：分表机制正确且必要；`_last_table.json` 在多 pass 录制时会被覆盖，
-应用侧必须用 `table_text` 显式指定。
+同理，找不到表时**不会**自动回退到「不用表」：那样出的是原生 AdaLN 的图，
+数值本来就是偏的。要不用表，就把 `mode` 设成 `off` —— 显式表达。
 
-验证注意：`H3SeamlessChainSampler` 的 IMAGE 输出是占位全零，真实 latent 在
-`output/h3_projects/<存档目录>/seg_000.pt`；且导演台按目录缓存分段，
-换模型不重算 —— 比对前要换新目录、删 `h3chain_state.json`、重启清缓存。
+---
 
-## 8.4 SelfLift 类二段采样器的边界（2026-11-09）
+## 5. 为什么取消 `strict` / `fallback`
 
-SelfLift 在两段之间做 clean endpoint → 学习式 latent 上采样器
-`LatentResizer3D`（或 VAE 往返）→ 重加噪 → 高分辨率段。实测把这些中间
-张量 dump 出来，A/B 两条链在转换点**之前**全部逐位一致，分叉只发生在
-转换点**之后**；而表在两段都是 102/102 精确注入、0 回退。
+`fallback` 只做一件事：t 匹配失败时不抛错，让模型走原生 AdaLN 继续出图。
+而「原生 AdaLN 就是不准的那条路」，所以它产出的是一张**看起来成功、数值是错的**
+图。这个插件存在的唯一理由就是消除这种静默偏差，因此 v2 恒为严格模式。
 
-所以表能做的已经全做了。剩余 ~30 dB 是转换点之后的非 AdaLN 路径
-（同 prompt 双模型显存换页导致 int8 反量化差 1 ulp 并被放大），不是表失效。
-**不要把最终 latent 的 PSNR 当作表是否生效的判据**，看注入日志的
-`exact matches` / `native steps` 才是。
+真正的容错改由「行合并」提供：缺 t 不再是死路，重录一次就补上。
 
-加了 `after` 排序输入：把另一条链的 LATENT 接进来，可强制
-「同 prompt 录表 → 用表」的顺序，让 `table_in` 直连在这类无 after 接口的
-采样器上可靠工作。
+---
 
-## 9. 已知不解决
+## 6. 为什么保留 `table_in` 和 `after`
 
-- 运行中改 AdaLN LoRA：仍要求重录（检测到冲突就拒绝保存）。
-- C++/fused 引擎绕过 `module.forward`：hooks 挂不上，record 直接报错。
+只有一种场景需要它们：**同一个 prompt 里既录又用**（A/B 验证）。
+
+- 录出来的表对象在执行时是空的，rows 在采样过程中才有；
+- ComfyUI 按「输入就绪」调度节点，所以消费侧必须被排到采样之后；
+- `after` 是一个被忽略的 wildcard 输入，唯一作用是建这条边。
+
+日常用法（这个 prompt 录、下个 prompt 用）完全不需要连线：
+表已经落盘，apply 按模型指纹自己找（§5.1）。
+
+---
+
+## 7. 故意不放进节点的东西
+
+| 能力 | 去处 | 原因 |
+|---|---|---|
+| 离线 Bake | 旧节点（deprecated，仍在） | 恒差 1 ulp，不该出现在主路径 |
+| `time_embedder_from` | 旧 `H3 AdaLN Record` | 只为 bX-49 的「两教师」配方存在；有全量混合教师时不需要 |
+| `splice` | 同上（Bake） | 归一为「直接录全量混合教师」 |
+| `final_from` | 固定为 `a` | bX-49 的 `final_layer` 本来就取 base 教师 |
+| Latent 落盘 | `H3 Latent Compare` / 旧 `H3 LatentSave` | 诊断用，不是日常操作 |
+| 自动补 `t=0.999` / `1.0` | **做了**，`fill_reference_row`（默认开） | 把 pin 追加到该步 t_emb 批里，用模型自己的模块算完丢掉多余的行走 —— 同批同权重，值等于真带参考跑一次；不动 layout、不碰 payload、不改采样结果。单独算（M=1 走 GEMV）才会差 2 ulp |
+
+这些放到「已废弃但可用」的层里，而不是删掉：已发布的工作流（01~08）
+仍然要能跑。
+
+---
+
+## 8. 已知不解决
+
+- 运行中改 AdaLN LoRA：检测到同 t 不同值就拒绝保存。
+- C++/fused 引擎绕过 `module.forward`：hook 挂不上，record 直接报错。
 - 同一模型、同一 t、期望不同调制：物理上无解，只能报冲突。
+- `model_fingerprint` 依赖能读到权重；读不到时退化为 shape/dtype，
+  失败模式见 §2.1。
