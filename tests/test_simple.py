@@ -83,12 +83,19 @@ def test_schema():
     assert hybrid["required"]["split"][1]["default"] == 25
 
 
-def test_legacy_nodes_hidden():
-    import nodes
-    for name in ("H3AdaLNRecord", "H3ExactAdaLNBake", "H3ExactAdaLNSave",
-                 "H3ExactAdaLNLoad", "H3AdaLNMerge", "H3ExactAdaLNApply"):
-        assert getattr(nodes.NODE_CLASS_MAPPINGS[name], "DEPRECATED", False), name
-    assert not getattr(nodes.H3LatentCompare, "DEPRECATED", False)
+def test_only_three_nodes_are_registered():
+    import importlib.util
+    import os
+    import sys
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        "h3_pack_for_test", os.path.join(here, "__init__.py"),
+        submodule_search_locations=[here])
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["h3_pack_for_test"] = mod
+    spec.loader.exec_module(mod)
+    assert set(mod.NODE_CLASS_MAPPINGS) == {
+        "H3AdaLN", "H3AdaLNHybrid", "H3LatentCompare"}, set(mod.NODE_CLASS_MAPPINGS)
 
 
 # ---------------------------------------------------------------- identity
@@ -213,12 +220,21 @@ def test_resolve_by_declared_target():
 
 
 def test_resolve_ignores_a_table_declared_for_another_model():
+    """No declared table -> error, never a silent fallback to an untagged one."""
     clean()
     model, dm = _fake_model()
     a, b = _two_tables(declared_for="000000000000")
-    got, why = H.resolve_for_model(model, dm, H.AUTO)
-    assert got != a, "a table declared for another base was used"
-    assert got == b and "without a target" in why, (got, why)
+    try:
+        H.resolve_for_model(model, dm, H.AUTO)
+    except RuntimeError as e:
+        assert "never guess" in str(e), str(e)
+        assert "bbb.safetensors" in str(e), str(e)
+    else:
+        raise AssertionError("an untagged table was used without a declaration")
+    # an explicit override still works
+    got, why = H.resolve_for_model(model, dm, os.path.basename(b))
+    assert got == b and why == "picked", (got, why)
+    assert got != a
 
 
 def test_resolve_two_declared_for_one_base_errors():
@@ -240,15 +256,16 @@ def test_resolve_two_declared_for_one_base_errors():
 
 
 def test_resolve_accepts_legacy_empty_digest():
-    """Tables recorded before v2 stored sha256("")[:16] for "no AdaLN LoRA"."""
+    """Old tables stored sha256("")[:16] for "no AdaLN LoRA" -- still matches."""
     clean()
     model, dm = _fake_model()
     m = meta()
     m["adaln_lora_fingerprint"] = "e3b0c44298fc1c14"
+    m["target_base"] = H.base_fingerprint(dm)
     path, _, _, _ = H.save_table_smart([0.0], rows([0.0]), m, "torch.bfloat16",
                                        "legacy.safetensors")
     got, why = H.resolve_for_model(model, dm, H.AUTO)
-    assert got == path and "without a target" in why, (got, why)
+    assert got == path and "declared" in why, (got, why)
 
 
 def test_resolve_ambiguous_without_a_target():
@@ -258,8 +275,9 @@ def test_resolve_ambiguous_without_a_target():
     try:
         H.resolve_for_model(model, dm, H.AUTO)
     except RuntimeError as e:
-        assert "none of them declares a target" in str(e), str(e)
+        assert "none declares a target base" in str(e), str(e)
         assert "for_model" in str(e), str(e)
+        assert "aaa.safetensors" in str(e) and "bbb.safetensors" in str(e), str(e)
     else:
         raise AssertionError("an ambiguous lookup returned a table")
     got, why = H.resolve_for_model(model, dm, os.path.basename(b))
@@ -510,8 +528,15 @@ def test_t_set_ignores_shape_but_not_schedule():
 
 
 check("schema: main node has model + mode + one picker", test_schema)
-check("schema: legacy single-purpose nodes are marked deprecated",
-      test_legacy_nodes_hidden)
+def test_only_one_table_directory_is_scanned():
+    """Stale saves in output/h3_adaln must never compete with the real table."""
+    assert H.table_dirs() == [H.table_folder()], H.table_dirs()
+
+
+check("scan: only models/h3_exact_adaln is searched",
+      test_only_one_table_directory_is_scanned)
+check("schema: exactly three core nodes are registered",
+      test_only_three_nodes_are_registered)
 check("name: derived from model fp + dtype (+ AdaLN LoRA)", test_auto_name)
 check("identity: model / AdaLN LoRA / dtype, nothing else", test_identity_is_model_lora_dtype)
 check("t-set: shape-free, but steps/scheduler/shift change it",

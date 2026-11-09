@@ -117,16 +117,13 @@ def table_folder():
 
 
 def table_dirs():
-    """Every folder a table may live in -- new ones first, then legacy saves."""
-    dirs = [table_folder()]
-    try:
-        import folder_paths
-        legacy = os.path.join(folder_paths.get_output_directory(), "h3_adaln")
-        if os.path.isdir(legacy):
-            dirs.append(legacy)
-    except Exception:
-        pass
-    return dirs
+    """The one folder tables live in.
+
+    v1 also scanned `output/h3_adaln`; that let stale saves from an unrelated
+    run compete with the current table, so it was removed. Tables are portable
+    by copying the .safetensors itself, not by adding search paths.
+    """
+    return [table_folder()]
 
 
 def list_tables():
@@ -227,15 +224,17 @@ def find_table(name, what="table"):
 
 
 def resolve_for_model(model, dm, choice):
-    """Which table this model gets -- by fingerprint, not by choosing.
+    """Which table this model gets -- by fingerprint, never by guessing.
 
     Order:
-      1. `table` names a file -> that one (an explicit override, nothing is
+      1. `table` names a file -> that one (explicit override, nothing is
          remembered behind your back);
-      2. a table whose header says `target_base == this model` -> exactly one;
-      3. the only table recorded with this AdaLN LoRA that declares no target
-         (tables recorded before `for_model` existed, or on purpose);
-      4. nothing -> error.
+      2. exactly one table whose header declares `target_base == this model`;
+      3. otherwise -> error.
+
+    There is deliberately no "only table without a target" fallback. A v1
+    table (or one recorded while the folder held several bases) may belong to
+    a different teacher; using it would be a silent, unfixable wrong answer.
     """
     picked = "" if str(choice or "").strip() in ("", AUTO) else str(choice).strip()
     if picked:
@@ -243,13 +242,14 @@ def resolve_for_model(model, dm, choice):
 
     base_fp = base_fingerprint(dm)
     want = _norm_adaln_fp(_adaln_lora_fingerprint(model))
-    mine, undeclared = [], []
-    for path, meta in _scan_tables():
+    scanned = _scan_tables()
+    mine, untagged = [], []
+    for path, meta in scanned:
         if _norm_adaln_fp(meta.get("adaln_lora_fingerprint", "")) != want:
             continue
         target = str(meta.get("target_base") or "")
         if not target:
-            undeclared.append(path)
+            untagged.append(path)
         elif target == base_fp:
             mine.append(path)
 
@@ -257,28 +257,27 @@ def resolve_for_model(model, dm, choice):
         return mine[0], "declared for this model"
     if len(mine) > 1:
         raise RuntimeError(
-            "H3AdaLN: {} tables are all declared for this model:\n  {}\n"
+            "H3AdaLN: {} tables are all declared for this model://n  {}\n"
             "That means two teachers were recorded for the same base. Keep one, "
             "or pick the one you want in `table`.".format(
                 len(mine), "\n  ".join(os.path.basename(p) for p in mine)))
-    if len(undeclared) == 1:
-        return undeclared[0], "only table without a target"
-    if not undeclared:
-        names = list_tables()
-        why = ("{} table(s) in the folder, but none is declared for this model "
-               "({}) with its AdaLN LoRA:\n  {}".format(
-                   len(names), base_fp, "\n  ".join(names)) if names
-               else "no tables in {}".format(table_folder()))
-        raise RuntimeError(
-            "H3AdaLN: no table for this model -- {}.\n"
-            "Record one with mode=record + for_model=<this checkpoint>, or set "
-            "mode=off to run without a table.".format(why))
+
+    if not scanned:
+        why = "the table folder is empty ({})".format(table_folder())
+    elif untagged:
+        why = ("{} table(s) exist but none declares a target base:\n  {}\n"
+               "They were recorded without `for_model` (or are v1 tables). "
+               "Re-record with for_model=<this checkpoint>; the plugin will "
+               "never guess which teacher they belong to.".format(
+                   len(untagged),
+                   "\n  ".join(os.path.basename(p) for p in untagged)))
+    else:
+        why = ("{} table(s) exist but none matches this model's AdaLN LoRA "
+               "fingerprint ({!r})".format(len(scanned), want or "none"))
     raise RuntimeError(
-        "H3AdaLN: {} tables fit this model and none of them declares a target:\n"
-        "  {}\n"
-        "Pick one in `table`, or re-record with for_model=<this checkpoint> so "
-        "the table carries its base fingerprint.".format(
-            len(undeclared), "\n  ".join(os.path.basename(p) for p in undeclared)))
+        "H3AdaLN: no table for this model (base fp {}) -- {}.\n"
+        "Record one with mode=record + for_model=<this checkpoint>, or set "
+        "mode=off to run without a table.".format(base_fp, why))
 
 
 def _find_named(name):
@@ -1021,7 +1020,12 @@ class H3AdaLN:
             table, src = table_in, "table_in"
         else:
             path, src = resolve_for_model(model, dm, choice)
-            table = table_io.read_table_file(path)
+            try:
+                table = table_io.read_table_file(path)
+            except Exception as e:
+                raise RuntimeError(
+                    "H3AdaLN: cannot read table {}: {}: {}".format(
+                        path, type(e).__name__, e))
         lines = ["H3 AdaLN · apply · {}".format(src)] + _inject(model, dm, table)
         return (model, table, "\n".join(lines))
 

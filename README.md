@@ -35,45 +35,15 @@ exact for any LoRA ComfyUI can apply.
 
 ## The exactness contract
 
-Two ways to produce a table, and only one of them is exact.
+There is exactly one way to produce a table: `mode=record` on the full teacher
+during a real sampling run. Read-only hooks capture the tensors the teacher
+itself computed, so replaying them is bitwise by construction.
 
-| | `H3 AdaLN Record` | `H3 Exact AdaLN Bake` |
-|---|---|---|
-| when | during a real sampling run | offline, no sampling |
-| source of numbers | the teacher's own forward pass | recomputed on unloaded CPU weights |
-| bitwise vs native | **yes, by construction** | no |
-| needs a sampling run | yes | no |
-| use it for | anything you will compare or ship | exploring a schedule cheaply |
+Offline recomputation (the v1 "Bake" node) was removed. It runs on unloaded CPU
+weights and cannot reproduce the kernels ComfyUI selects at sampling time:
+measured drift is one bf16 ulp per projection, amplified to ~0.145 mean_abs on
+the latent after 8 steps. There is no offline fallback.
 
-Why the offline path cannot be exact, even with perfect code: at sampling time
-ComfyUI runs the AdaLN GEMM on GPU with weights it dequantised through its own
-CUDA kernels (`comfy_kitchen`), while an offline pass sees the checkpoint's
-CPU-side form and eager dequantisation. Measured on the real 34 GB teacher:
-
-```
-blocks.0.adaln_proj   equal=False   max_abs=0.015625   mean_abs=5.2e-4
-```
-
-`0.015625` is exactly one bf16 ulp, and eight diffusion steps amplify it into a
-latent offset of `mean_abs=0.145` (`PSNR≈31 dB`). No amount of offline care can
-predict a kernel that is chosen at run time — so Record replaces prediction with
-observation.
-
-Record attaches two **read-only** forward hooks:
-
-- `dm.time_embedder` — captures `t_vals`, the float32 tensor of distinct
-  timesteps that `model.py:743` builds from `unique_t`. Row *i* of every AdaLN
-  projection therefore belongs to `unique_t[i]`; nothing has to be
-  reconstructed from sigmas, layouts or shifts.
-- every `adaln_proj.linear` — captures the raw
-  `[M, expand*hidden*modalities]` output, which is exactly what a table stores
-  (the module's own view/chunk is replayed later, not baked in).
-
-Replay is then bitwise by construction: gather rows, `reshape` exactly like
-`AdalnProj.forward`, `chunk`, and cast back to **the dtype the rows were
-recorded in**. That last part matters — `FinalLayer.mod` switches its
-multiply-add precision on `scale.dtype`, so injecting fp32 into a model whose
-teacher ran bf16 would change the arithmetic even with identical numbers.
 
 ## Install
 
@@ -136,14 +106,13 @@ Why there is nothing to type:
   same model hits the same rows.
 
 A table is **self-contained**: the safetensors header carries the identity,
-teacher fingerprint, provenance (record vs bake), t rows, shift pair, out dtype
+teacher fingerprint, provenance, t rows, shift pair, out dtype
 and ComfyUI version. Copy the file anywhere to share it.
 
-The seven single-purpose nodes this replaces (`H3 AdaLN Record`,
-`H3 Exact AdaLN Bake`, `H3 Exact AdaLN Save/Load Table`, `H3 AdaLN Merge`,
-`H3 Exact AdaLN Apply`, `H3 Latent Save`) still load so the published workflows
-keep working, but they are marked deprecated and no longer appear in the node
-menu.
+The v1 single-purpose nodes (Record / Bake / Save / Load / Merge / Apply /
+LatentSave) and the offline bake engine have been **removed**. Only three nodes
+remain: `H3 AdaLN`, `H3 AdaLN Hybrid`, `H3 Latent Compare`. Old v1 workflows no
+longer load; the two shipped API prompts below use the current nodes.
 
 ## Quick start
 
@@ -176,45 +145,29 @@ input whose only job is to create that edge:
 sampler_A.output ──► H3 AdaLN(apply).after      (chain B may then start)
 ```
 
-This is only needed for the `05_record_strict.json` style A/B graph. Daily use
+This is only needed for the `v2_record_apply_ab.json` A/B prompt. Daily use
 records in one prompt and applies in the next — AdaLN depends only on `t`, so a
 table recorded earlier is bitwise identical as long as the t values match.
 
 ## Workflows
 
-These graphs are the verification suite. They were generated against the
-single-purpose nodes, which are now deprecated but still load, so they keep
-working as-is. For daily use, a graph needs one `H3 AdaLN` node where the
-record/apply node already sits.
+Two **API-format prompts** live in `workflows/`. They are plain JSON you POST to
+ComfyUI's `/prompt` endpoint (they are not UI workflow exports), and both were
+run end to end on the cloud instance before shipping.
 
-- `workflows/01_bake_exact_adaln.json` — Bake → Save. Queue once on its own.
-  The offline path; good for a quick look, not for bitwise claims.
-- `workflows/02_verify_full_vs_pruned.json` — Load → Apply on chain B, chain A
-  runs the full model natively; both chains share LoRA, sigmas, seed, sampler,
-  conditioning and shift.
-- `workflows/03_verify_save_latent.json` — same, plus two `H3LatentSave` taps
-  that write both latents to disk for an independent cross-check.
-- `workflows/04_verify_strict.json` — single prompt, two chains, offline table.
-  Kept as the A/B comparison of the bake path.
-- `workflows/05_record_strict.json` — **the exact one.** Single prompt, two
-  chains, `after`-ordered: A records while it samples, B applies the recorded
-  rows, Compare must print `equal=True / max_abs=0 / VERDICT: PASS`. Set
-  `Apply.mode=off` and rerun for the negative control (must FAIL).
-- `workflows/08_record_fl2va.json` — records the **FL2VA full** teacher, the
-  base half of a bX-49 hybrid. Run this once before 06.
-- `workflows/06_b25-49_hybrid.json` — **bX-49 hybrid, one run.** Records the
-  Ref2VA full teacher, merges it with the FL2VA table (`split=25`), and saves
-  both the donor table and the hybrid table.
-- `workflows/07_merge_tables.json` — CPU-only merge of two saved tables, for
-  re-combining after either side was re-recorded.
+- `workflows/v2_record_apply_ab.json` — single prompt, two chains. Chain A
+  records on the full 34 GB teacher while chain B applies that same table to
+  the pruned 20 GB base; `H3 Latent Compare` must report
+  `VERDICT: PASS - bitwise identical`. Set chain B's `mode=off` and rerun for
+  the negative control (must FAIL).
+- `workflows/v2_apply_auto.json` — cross-prompt lookup. Only the pruned base,
+  `table=(auto)`, no `table_in`: the node must find the table by its
+  `target_base` header with no picker. `PreviewAny` shows the apply report.
 
-Defaults match the DMAD 8-step LoRA: 8 steps, `euler`, `simple`, strength 1.0,
-no CFG, video shift 12 / **audio shift 2**. Change the LoRA filename to your
-own before running. The short verification clip (832x480, 39 frames) can be
-changed to the full 1344x768 / 124 frames as long as both chains stay in sync —
-the two chains must be comparable, but **resolution and frame count do not
-change the timesteps a table has to cover**: the t values come from sigma and
-the shifts, never from the latent shape.
+Both default to the smallest practical recording size (256x128, 5 frames),
+8 steps, `euler/simple`, the DMAD 8-step LoRA and shift 12/2. Change the LoRA
+and checkpoint names to your own. The two chains in the A/B prompt must stay
+comparable; resolution and frame count do not affect the table.
 
 ### What a table depends on
 
@@ -254,16 +207,13 @@ to know about a model is its AdaLN fingerprint, and it reads that itself — at
 record time from the checkpoint on disk, at apply time from the loaded model.
 `for_model` therefore defaults to `(auto)` and only has to be touched when the
 folder holds more than one pruned checkpoint, where "which base did you mean"
-is genuinely not derivable. A table recorded without a target still works as
-long as it is the only candidate for that AdaLN LoRA — the node says so in its
-report.
+is genuinely not derivable. **A table without `target_base` is never used
+automatically**: it could belong to a different teacher, and guessing would be
+a silent wrong answer. Re-record it with `for_model` set, or pick it explicitly
+in `table` for that run. Only `models/h3_exact_adaln/` is searched; v1 saves
+under `output/h3_adaln/` are ignored.
 
-Legacy tables written by the old `H3 Exact AdaLN Save Table` node (in
-`output/h3_adaln/` or mirrored into `input/`) are still listed and still
-apply; they simply have no identity, so a new recording starts a new file
-instead of growing them.
-
-The picker is a plain dropdown of the two table folders plus `(auto)`, which is
+The picker is a plain dropdown of the table folder plus `(auto)`, which is
 the default and the only value the node writes into a graph. Picking a file is a
 one-shot override for that run — nothing is remembered, so a graph left on
 `(auto)` keeps resolving by fingerprint.
@@ -294,22 +244,16 @@ one-shot override for that run — nothing is remembered, so a graph left on
   **timestep** (`sigma * 1000`), not to sigma and not to the schedule (that is
   `"sample_sigmas"`). `sigma_plan.sigma_from_options` divides by 1000, and all
   t arithmetic is done on float32 tensors to mirror `model.py:674-676`.
-- Bake never parses safetensors by hand and never mutates the model: it asks
-  ComfyUI's own `convert_weight` / `calculate_weight` hooks for the effective
-  (dequantised + LoRA-patched) weight, does the matmul itself, and lets the
-  transient weight go. The previous implementation called
-  `patch_weight_to_device(inplace_update=True)` — which asserts on quantised
-  ops — on a `clone()` that shares the same `nn.Module`, then `unpatch`ed it,
-  leaving the caller's ModelPatcher holding restored weights from a
-  half-finished patch.
+- Record never mutates the model: it only reads what the teacher's forward
+  produced, so quantised checkpoints and LoRA patches are handled by ComfyUI
+  itself.
 - Tables are stored fp32; the recorded/produced dtype travels in `out_dtype`
   and is replayed exactly. bf16 *storage* of AdaLN values costs ~2.5e-2
   relative error, so fp32 storage is not negotiable even when the values are
   bf16-precision.
-- `round(t, 7)` is gone. Rounding the baked t by up to 5e-8 shifts `t_emb`
-  visibly after `exp(-log(10000)*k/128)`, i.e. it re-introduced the very
-  mismatch the table is supposed to remove. Dedup now happens on the exact
-  float32 value.
+- t values are stored as exact float32 images; dedup happens on the exact
+  value, never on a rounded one (a 5e-8 shift is visible after the sinusoidal
+  embedding).
 - On ComfyUI 0.44 H3 latents are `comfy.nested_tensor.NestedTensor` (video +
   audio tensors), not a `torch.Tensor`. Both `H3LatentCompare` and
   `H3LatentSave` expand it via `.unbind()` into `samples__part0`,
@@ -339,21 +283,11 @@ it.
 
 `b25-49`-style hybrids are **not** "full blocks + pruned blocks" stitched
 together: they take FL2VA as the base and swap the `adaln_proj.linear`
-weight/bias of a trailing block range for Ref2VA's tensors. Because the base is
-a pruned file, it has no `time_embedder`, so it cannot be recorded from
-directly.
-
-`H3 Exact AdaLN Bake` accepts a `splice` string, `FILE:FIRST-LAST`
-(e.g. `/models/ref2va.safetensors:25-49`), which swaps those blocks' AdaLN
-weights for the donor's before computing the table, and records the donor
-fingerprint in the metadata. The donor must be a **plain float** checkpoint
-(bf16/fp16/fp32); quantised donors are rejected with an explicit error, since
-their storage format is not a weight.
-
-Standing caveat: a table baked from an FL2VA teacher replaces all 51 blocks
-with FL2VA modulation, which erases the reference-conditioning behaviour of the
-hybrid's tail blocks. Splice is what keeps that behaviour; without it the table
-is numerically fine but semantically wrong for a hybrid.
+weight/bias of a trailing block range for Ref2VA's tensors. The shipped pruned
+file is curve-shaped everywhere (51 x `[96768, 8]`, one
+`adaln_t_table [1025, 8]`, no `time_embedder`), so it cannot be recorded from
+directly — record on a **full** bX-49 teacher instead. `H3 AdaLN Hybrid` can
+still splice two recorded tables, but see the caveat in section B below.
 
 ### The exact path for bX-49
 
@@ -382,54 +316,15 @@ samples__part1: equal=True max_abs=0.000e+00 psnr=inf
 VERDICT: PASS - bitwise identical
 ```
 
-#### B. Two teachers + `time_embedder_from` (same target, no merged file)
+#### B. If you have no full hybrid teacher
 
-If you do not want a second 34 GB checkpoint, record the donor teacher with the
-base teacher's embedding swapped in first:
-
-1. record the **base** teacher (FL2VA full) → A;
-2. record the **tail donor** (Ref2VA full) with
-   `time_embedder_from = <base teacher file>` → B'. This input lives on the
-   deprecated `H3 AdaLN Record` node — the one thing the simplified node
-   deliberately does not expose, because it is only needed for this recipe;
-3. `H3 AdaLN Hybrid`, pick A and B', `split=25`.
-
-Why the extra input is mandatory: AdaLN output is `adaln_proj(t_emb)`, and the
-tail blocks of a hybrid see the **base** teacher's `t_emb`. The two official
+`H3 AdaLN Hybrid` can still splice two recorded tables, but the two official
 teachers do not share a `time_embedder` (`proj_out.weight` differs by up to
-`0.104`), so recording the donor as-is bakes the donor's embedding into the
-table. Measured against the assembled hybrid:
-
-| tail source | max abs delta on blocks 25-49 |
-|---|---|
-| donor recorded as-is (old recipe) | 0.09 – 0.19 |
-| donor + `time_embedder_from` (this recipe) | **0** (25/25 projections bitwise) |
-
-`time_embedder_from` swaps the whole module, not the weights: a weight patch
-would run through `patch_weight_to_device`, be cast to `lora_compute_dtype`
-(bf16) and stay there, while the real model keeps the embedding in fp32 —
-that alone moves the modulation by ~1e-1.
-
-Edge cases the node refuses or repairs instead of getting quietly wrong:
-
-- donor tensors that do not match the teacher's `time_embedder` in name or shape
-  (a *partial* swap would mix two embeddings) -> hard error;
-- a donor with no `time_embedder.*` at all (a pruned file) -> hard error;
-- a MODEL that already carries a LoRA patch on `time_embedder` -> hard error,
-  because the module swap would drop that LoRA's timestep delta;
-- two Record nodes on the same MODEL: only one recorder can be live, the
-  second replaces the first (and the first table stays empty);
-- re-running Record without `time_embedder_from` after one that used it: the
-  previous swap is undone first, so the second table is the donor's native one.
-
-If the module swap is impossible in a given ComfyUI build the node falls back
-to weight patches and says so in the report — that path rounds the embedding to
-bf16 and is **not** bitwise.
-
-If the merged table and the hybrid disagree, the numbers are large enough to
-see: applying the old merged table to the pruned b25-49 and comparing against
-the full hybrid gives `psnr=22.20 dB` (video) / `31.10 dB` (audio), while the
-table from A gives `inf`.
+`0.104`). Recording the tail donor as-is bakes the donor's embedding into the
+table: measured `0.09–0.19` off on blocks 25–49. The v1
+`time_embedder_from` workaround lived on the removed `H3 AdaLN Record` node
+and is gone. **Record the full bX-49 teacher directly** (published as
+`binglingzhimeng/MiniMax-H3-b25-49-full`); that is the only exact route.
 
 #### What the shipped b25-49 actually is
 
@@ -498,9 +393,9 @@ cross-LoRA case above could only be run with `mode=fallback`.
   recording of the same teacher are two tables, not one. Apply compares it
   against the target model's compute dtype and warns
   `replay is NOT bitwise` instead of leaving you to notice it in the pixels.
-- Per-row `denoise_mask` timesteps are not supported by Record (it labels rows
-  by the `unique_t` the forward actually used, and per-row masks multiply that
-  set unpredictably); the offline Bake path covers them via `extra_t`.
+- Per-row `denoise_mask` timesteps are not supported (Record labels rows by
+  the `unique_t` the forward actually used, and per-row masks multiply that set
+  unpredictably).
 - HyperFlow-style `(t, r)` endpoint conditioning is not reproduced.
 - Python hooks cannot reach DiTs executed by a C++ engine or fused kernels that
   bypass `module.forward`.
@@ -537,55 +432,39 @@ Set `COMFYUI_DIR` if your ComfyUI lives somewhere other than the default path.
 ## Repo layout
 
 ```
-h3_unified.py      the two nodes to use: H3 AdaLN, H3 AdaLN Hybrid
+h3_unified.py      H3 AdaLN (record/apply/off) + H3 AdaLN Hybrid
+nodes.py           shared helpers + H3 Latent Compare
 record_engine.py   observe AdaLN during sampling (the exact path)
-bake_engine.py     offline recomputation + splice donors
 apply_engine.py    runtime injection: t_emb matching + sigma fallback
 sigma_plan.py      float32-exact t arithmetic, mirrors model.py:671-751
-table_io.py        safetensors container, live (recording) tables
-nodes.py           the original single-purpose nodes (now deprecated)
-workflows/         01 bake, 02/03 load+apply A/B, 04 offline strict,
-                   05 record strict, 06 bX-49 hybrid, 07 merge only,
-                   08 record FL2VA base
-tests/             test_simple.py (node surface), test_exact.py (numbers),
-                   test_merge.py (hybrid merge), test_workflows.py (graph structure),
-                   test_runtime.py (inside a real ComfyUI process)
-tools/             workflow generators (incl. build_hybrid.py) + fetch helpers
-HANDOFF.md         repair plan, root-cause evidence and per-phase status
+table_io.py        safetensors container, live (recording) tables, row merge
+workflows/         two API-format prompts (A/B verification, auto lookup)
+tests/             test_simple.py (node surface + lookup), test_exact.py
+                   (numbers), test_merge.py (hybrid merge), test_workflows.py
+                   (prompt structure), test_runtime.py (real ComfyUI process)
+HANDOFF.md         root-cause evidence, cloud verification log, v1 history
 docs/unified-node.md  why one node is enough: invariants, identity, row merging
-docs/NODE_GUIDE.md    the node tutorial + lessons learned + pitfall checklist
+docs/NODE_GUIDE.md    node tutorial + lessons learned + pitfall checklist
 ```
 
-The workflow JSONs are **generated**, never hand-edited:
-
-```bash
-python tools/build_workflows.py   # 01, 02
-python tools/add_savelatent.py    # 03 (from 02)
-python tools/build_strict.py      # 04
-python tools/build_record.py      # 05
-python tools/build_hybrid.py      # 06, 07
-```
-
-They read node slot definitions from ComfyUI's own
-`blueprints/Image to Video (MiniMax H3).json`; set `COMFYUI_DIR` or
-`H3_BLUEPRINT` if it is not in the default place. Regenerating on a clean
-checkout reproduces the committed files byte-for-byte, which is a cheap way to
-tell whether a workflow was hand-edited.
+The two files in `workflows/` are API prompts, not UI graph exports. They were
+hand-built from the ComfyUI node signatures and validated on the cloud
+instance; `tests/test_workflows.py` checks their structure offline.
 
 ## Status
 
 - Record → Apply verified bitwise on a real `MiniMaxH3Model` (tiny config):
   4/4 steps `equal=True`, `max_dist=0.000e+00`, 12 exact t_emb matches, control
   fails as expected.
-- End-to-end on ComfyUI 0.44.0 / RTX 4080 SUPER: the offline bake produced 51
-  projections / 17 t rows / 314.5 MiB and the first injection was confirmed
-  (`max_dist=0.000e+00`), yet the latents still differ — that measurement is
-  what identified the offline path as the root cause and motivated Record.
+- Why the offline path was removed: on ComfyUI 0.44.0 / RTX 4080 SUPER it
+  produced 51 projections / 17 t rows / 314.5 MiB and the first injection was
+  confirmed (`max_dist=0.000e+00`), yet the latents still differed. That
+  measurement identified offline recomputation as the root cause.
 - bX-49 hybrid support: `H3 AdaLN Hybrid` assembles the table from two full
   teachers (blocks 0..24 from FL2VA, 25..49 from Ref2VA). `tests/test_merge.py`
   covers the split, t alignment, metadata round-trip and every rejection path
   on CPU; the real 20 GiB b25-49 run still needs a GPU instance.
-- End-to-end on the 34 GB teacher is done: `05_record_strict.json` reports
+- v1 end-to-end on the 34 GB teacher (historical): the old strict A/B graph reports
   `equal=True / max_abs=0 / VERDICT: PASS`, `Apply.mode=off` reports `FAIL`
   with no injection log, and strict still passes after the control run. Root
   cause, evidence and the verification log live in [`HANDOFF.md`](HANDOFF.md).

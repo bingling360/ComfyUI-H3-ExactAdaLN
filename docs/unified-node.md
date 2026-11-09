@@ -166,11 +166,10 @@ target_base = hash(curve flag, 块数,
 
 | 能力 | 去处 | 原因 |
 |---|---|---|
-| 离线 Bake | 旧节点（deprecated，仍在） | 恒差 1 ulp，不该出现在主路径 |
-| `time_embedder_from` | 旧 `H3 AdaLN Record` | 只为 bX-49 的「两教师」配方存在；有全量混合教师时不需要 |
-| `splice` | 同上（Bake） | 归一为「直接录全量混合教师」 |
+| 离线 Bake / `splice` / `time_embedder_from` | 随 v1 节点一并删除 | 恒差 1 ulp；bX-49 改为直接录全量混合教师 |
 | `final_from` | 固定为 `a` | bX-49 的 `final_layer` 本来就取 base 教师 |
-| Latent 落盘 | `H3 Latent Compare` / 旧 `H3 LatentSave` | 诊断用，不是日常操作 |
+| Latent 落盘 | 只保留 `H3 Latent Compare` | 诊断用，不是日常操作 |
+| 自动使用无 `target_base` 的旧表 | 不做 | 旧表可能属于别的教师；宁可报错也不静默用错 |
 | 自动补 `t=0.999` / `1.0` | **做了**，`fill_reference_row`（默认开） | 把 pin 追加到该步 t_emb 批里，用模型自己的模块算完丢掉多余的行走 —— 同批同权重，值等于真带参考跑一次；不动 layout、不碰 payload、不改采样结果。单独算（M=1 走 GEMV）才会差 2 ulp |
 
 这些放到「已废弃但可用」的层里，而不是删掉：已发布的工作流（01~08）

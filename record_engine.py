@@ -2,8 +2,8 @@
 
 Why recording instead of baking offline
 ---------------------------------------
-`bake_engine.bake()` runs `time_embedder` + `adaln_proj.linear` on weights that
-are still sitting on CPU in their checkpoint form. At sampling time the very
+Offline recomputation runs `time_embedder` + `adaln_proj.linear` on weights
+that are still sitting on CPU in their checkpoint form. At sampling time the very
 same modules run on GPU with weights ComfyUI dequantised through its own CUDA
 kernels, so the two paths disagree. Measured on the real 34 GB teacher:
 
@@ -77,9 +77,9 @@ class AdaLNRecorder:
         self._pin_pending = {}  # pin t -> keys still to capture in this forward
         self._pin_step = None   # index of the forward the pins belong to
         self._in_pin = False    # re-entry guard for our own extra calls
-        # Set when the caller swapped `time_embedder` for another checkpoint's
-        # (see H3AdaLNRecord.time_embedder_from). The hook must land on the
-        # object the forward will actually run, not on the original module.
+        # Optional override when a caller swapped `time_embedder` for another
+        # checkpoint's; the hook must land on the object the forward will
+        # actually run, not on the original module.
         self.te_override = te_override
         self.mode = mode
         self.tag = tag
@@ -103,7 +103,7 @@ class AdaLNRecorder:
         te = self.te_override if self.te_override is not None else getattr(self.dm, "time_embedder", None)
         if te is None or not hasattr(te, "register_forward_hook"):
             raise RuntimeError(
-                "H3AdaLNRecord: this checkpoint has no `time_embedder` -- it is a "
+                "H3AdaLN: this checkpoint has no `time_embedder` -- it is a "
                 "pruned/curve base. Record must run on the FULL teacher model "
                 "(same checkpoint you would feed to Bake).")
         self.handles.append(te.register_forward_hook(self._time_embedder_hook))
@@ -115,7 +115,7 @@ class AdaLNRecorder:
             self.handles.append(
                 ap.linear.register_forward_hook(self._linear_hook(key, ap, expected)))
         if not self.proj_keys:
-            raise RuntimeError("H3AdaLNRecord: no adaln_proj modules found")
+            raise RuntimeError("H3AdaLN: no adaln_proj modules found")
         self._canary_key = "blocks.0" if "blocks.0" in self.proj_keys else self.proj_keys[0]
         return len(self.proj_keys)
 
@@ -157,7 +157,7 @@ class AdaLNRecorder:
                 self._pin_pending[pin] = set(self.proj_keys)
             except Exception as e:
                 logging.warning(
-                    "H3AdaLNRecord: cannot pre-compute the t=%.3f row (%s: %s); "
+                    "H3AdaLN: cannot pre-compute the t=%.3f row (%s: %s); "
                     "the table will simply not contain it", pin,
                     type(e).__name__, e)
             finally:
@@ -188,7 +188,7 @@ class AdaLNRecorder:
                 self.pinned.setdefault(pin, {})[key] = row[0]
             except Exception as e:
                 logging.warning(
-                    "H3AdaLNRecord: cannot pre-compute %s at t=%.3f (%s: %s)",
+                    "H3AdaLN: cannot pre-compute %s at t=%.3f (%s: %s)",
                     key, pin, type(e).__name__, e)
                 self._pin_pending.pop(pin, None)
             finally:
@@ -198,34 +198,34 @@ class AdaLNRecorder:
         self.errors.append(message)
         if self.mode == "strict":
             raise RuntimeError(message)
-        logging.warning("H3AdaLNRecord: %s", message)
+        logging.warning("H3AdaLN: %s", message)
 
     def _linear_hook(self, key, ap, expected):
         def hook(module, inputs, output):
             if self._in_pin:  # our own extra call
                 return None
             if not torch.is_tensor(output):
-                self._fail("H3AdaLNRecord: {}.linear returned {} instead of a tensor"
+                self._fail("H3AdaLN: {}.linear returned {} instead of a tensor"
                            .format(key, type(output).__name__))
                 return None
             if output.ndim != 2:
-                self._fail("H3AdaLNRecord: {}.linear output has shape {}, expected 2-D"
+                self._fail("H3AdaLN: {}.linear output has shape {}, expected 2-D"
                            .format(key, tuple(output.shape)))
                 return None
             m = int(output.shape[0])
             if expected and int(output.shape[1]) != expected:
                 self._fail(
-                    "H3AdaLNRecord: {}.linear output width {} != expand*hidden*modalities {}"
+                    "H3AdaLN: {}.linear output width {} != expand*hidden*modalities {}"
                     .format(key, int(output.shape[1]), expected))
                 return None
             t_values = self._cur_t
             if t_values is None:
-                self._fail("H3AdaLNRecord: {} fired before time_embedder; cannot label rows"
+                self._fail("H3AdaLN: {} fired before time_embedder; cannot label rows"
                            .format(key))
                 return None
             if len(t_values) != m:
                 self._fail(
-                    "H3AdaLNRecord: {} got {} rows but time_embedder saw {} timesteps. "
+                    "H3AdaLN: {} got {} rows but time_embedder saw {} timesteps. "
                     "denoise_mask per-row timesteps are not supported by record mode."
                     .format(key, m, len(t_values)))
                 return None
@@ -236,7 +236,7 @@ class AdaLNRecorder:
             if self.out_dtype is None:
                 self.out_dtype = output.dtype
             elif output.dtype != self.out_dtype:
-                self._fail("H3AdaLNRecord: dtype changed mid-run ({} -> {})"
+                self._fail("H3AdaLN: dtype changed mid-run ({} -> {})"
                            .format(self.out_dtype, output.dtype))
 
             labels = [sigma_plan.f32_image(t) for t in t_values]
@@ -251,7 +251,7 @@ class AdaLNRecorder:
             # later forward only the canary projection.
             rows_cpu = output.detach().to(torch.float32).to("cpu")
             if new_rows and self._canary_key == key:
-                logging.info("H3AdaLNRecord: first rows captured at t=%s",
+                logging.info("H3AdaLN: first rows captured at t=%s",
                              ", ".join("{:.7f}".format(t_values[i]) for i in new_rows[:4]))
             for i in new_rows:
                 t = labels[i]
@@ -275,7 +275,7 @@ class AdaLNRecorder:
     def build(self):
         if not self.rows:
             raise RuntimeError(
-                "H3AdaLNRecord: nothing was recorded -- the sampler never ran with "
+                "H3AdaLN: nothing was recorded -- the sampler never ran with "
                 "this model. Wire the recorder between the model and the guider, and "
                 "make sure the node that consumes `table` executes AFTER sampling "
                 "(connect the sampler's LATENT to its `after` input).")
@@ -285,7 +285,7 @@ class AdaLNRecorder:
                 continue  # the run itself produced this row
             if len(entries) != len(self.proj_keys):
                 logging.warning(
-                    "H3AdaLNRecord: dropping the pre-computed t=%.3f row -- only "
+                    "H3AdaLN: dropping the pre-computed t=%.3f row -- only "
                     "%d of %d projections were captured", pin, len(entries),
                     len(self.proj_keys))
                 continue
@@ -298,7 +298,7 @@ class AdaLNRecorder:
             missing = [t for t in t_values if key not in self.rows[t]]
             if missing:
                 raise RuntimeError(
-                    "H3AdaLNRecord: {} is missing rows for {} timestep(s) (interrupted "
+                    "H3AdaLN: {} is missing rows for {} timestep(s) (interrupted "
                     "run?). Nothing was saved.".format(key, len(missing)))
             raw[key] = torch.stack([self.rows[t][key] for t in t_values]).contiguous()
         te = self.te_override if self.te_override is not None else getattr(self.dm, "time_embedder", None)

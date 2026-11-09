@@ -1,16 +1,13 @@
-"""Structural validation of the shipped workflows.
+"""Structural validation of the shipped API prompts.
 
-ComfyUI fails late and confusingly when a workflow JSON is inconsistent (a
-link that points at a missing slot, an input whose `link` id is stale, an
-output that does not list its own link). These checks catch that offline,
-before the file ever reaches a server.
+The two JSON files in workflows/ are **API-format prompts** (what you POST to
+ComfyUI's /prompt endpoint), not UI workflow exports. ComfyUI fails late and
+confusingly when such a prompt is inconsistent (a link pointing at a missing
+node, a required input absent, no reachable output node), so check it offline.
 
-It also verifies the parts of the graph that carry the correctness argument:
-
-  * 05 pins chain B (and the saver) behind chain A via `after` edges, which is
-    what guarantees the recorded table is filled before it is read;
-  * every widget count matches the node's INPUT_TYPES, so a signature change
-    cannot silently shift which value lands in which field.
+  v2_record_apply_ab.json -- A/B verification: full teacher records a table,
+                             pruned base applies it in the same prompt.
+  v2_apply_auto.json      -- cross-prompt lookup: pruned base only, table=(auto).
 
 Run: python tests/test_workflows.py
 """
@@ -23,138 +20,97 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.dirname(HERE)
 WF = os.path.join(PLUGIN, "workflows")
 
-sys.path.insert(0, PLUGIN)
+REMOVED_NODES = {
+    "H3AdaLNRecord", "H3ExactAdaLNBake", "H3ExactAdaLNSave",
+    "H3ExactAdaLNLoad", "H3AdaLNMerge", "H3ExactAdaLNApply",
+    "H3LatentSave",
+}
+OUTPUT_NODES = {"H3LatentCompare", "PreviewAny", "SaveImage", "PreviewImage",
+                "SaveLatent", "SaveAnimatedWEBP", "VHS_VideoCombine"}
 
-WILDCARD = "*"
 
-
-def load(path):
-    with open(path, "r", encoding="utf-8") as f:
+def load(name):
+    with open(os.path.join(WF, name), "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def check_graph(path, d):
+def validate(prompt):
+    """Return a list of human-readable problems."""
     problems = []
-    nodes = {n["id"]: n for n in d["nodes"]}
-    if len(nodes) != len(d["nodes"]):
-        problems.append("duplicate node ids")
-    link_ids = [l[0] for l in d["links"]]
-    if len(set(link_ids)) != len(link_ids):
-        problems.append("duplicate link ids")
-    for lid, src, sslot, dst, dslot, typ in d["links"]:
-        if src not in nodes or dst not in nodes:
-            problems.append("link {} dangling endpoint".format(lid))
+    if not isinstance(prompt, dict):
+        return ["top level is not a dict (UI workflows are not supported)"]
+    ids = set(prompt)
+    for nid, node in prompt.items():
+        if not isinstance(node, dict) or "class_type" not in node:
+            problems.append("node {} has no class_type".format(nid))
             continue
-        outs = nodes[src].get("outputs") or []
-        ins = nodes[dst].get("inputs") or []
-        if sslot >= len(outs) or dslot >= len(ins):
-            problems.append("link {} bad slot {}->{}".format(lid, sslot, dslot))
-            continue
-        out_t, in_t = outs[sslot]["type"], ins[dslot]["type"]
-        if not (typ == out_t == in_t or WILDCARD in (out_t, in_t)):
-            problems.append("link {} type {} {}->{}".format(lid, typ, out_t, in_t))
-        if lid not in (outs[sslot].get("links") or []):
-            problems.append("link {} missing from source outputs".format(lid))
-        if ins[dslot].get("link") != lid:
-            problems.append("link {} not set on target input".format(lid))
-    for n in d["nodes"]:
-        # Newer frontends may read the named-widget / asset metadata instead of
-        # the positional array. Both must describe the same run.
-        widgets = n.get("widgets_values") or []
-        named = n.get("widgets_values_named")
-        if isinstance(named, dict):
-            for i, value in enumerate(list(named.values())[:len(widgets)]):
-                if value != widgets[i]:
-                    problems.append(
-                        "node {} ({}) widgets_values_named[{}]={!r} != "
-                        "widgets_values[{}]={!r}".format(
-                            n["id"], n.get("type"), i, value, i, widgets[i]))
-                    break
-        for m in ((n.get("properties") or {}).get("models") or []):
-            if isinstance(m, dict) and m.get("name") not in widgets:
-                problems.append(
-                    "node {} ({}) properties.models name {!r} is not a widget "
-                    "value".format(n["id"], n.get("type"), m.get("name")))
-        for i, inp in enumerate(n.get("inputs") or []):
-            lid = inp.get("link")
-            if lid is not None and not any(
-                    l[0] == lid and l[3] == n["id"] and l[4] == i for l in d["links"]):
-                problems.append("node {} input {} -> stale link {}".format(
-                    n["id"], inp.get("name"), lid))
-        for i, out in enumerate(n.get("outputs") or []):
-            for lid in (out.get("links") or []):
-                if not any(l[0] == lid and l[1] == n["id"] and l[2] == i
-                           for l in d["links"]):
-                    problems.append("node {} output {} -> stale link {}".format(
-                        n["id"], out.get("name")))
+        cls = node["class_type"]
+        if cls in REMOVED_NODES:
+            problems.append("node {} uses removed v1 node {}".format(nid, cls))
+        for key, value in (node.get("inputs") or {}).items():
+            if isinstance(value, list) and len(value) == 2 \
+                    and isinstance(value[0], str) and isinstance(value[1], int):
+                src = value[0]
+                if src not in ids:
+                    problems.append("node {}.{} -> missing node {}".format(nid, key, src))
+    if not any(n.get("class_type") in OUTPUT_NODES for n in prompt.values()
+               if isinstance(n, dict)):
+        problems.append("no output node -- ComfyUI would execute nothing")
     return problems
 
 
-def widget_count(d, node):
-    """Expected number of widget values for one node, from INPUT_TYPES."""
-    import nodes as h3
-    cls = h3.NODE_CLASS_MAPPINGS.get(node["type"])
-    if cls is None:
-        return None
-    spec = cls.INPUT_TYPES()
-    count = 0
-    for group in ("required", "optional"):
-        for name, decl in (spec.get(group) or {}).items():
-            if isinstance(decl, tuple) and decl and isinstance(decl[0], list):
-                count += 1
-            elif isinstance(decl, tuple) and decl and isinstance(decl[0], str) \
-                    and decl[0] in ("INT", "FLOAT", "STRING", "BOOLEAN"):
-                count += 1
-    return count
-
-
 def main():
-    files = sorted(f for f in os.listdir(WF) if f.endswith(".json"))
     failures = []
-    for name in files:
-        path = os.path.join(WF, name)
-        d = load(path)
-        problems = check_graph(path, d)
-        status = "PASS" if not problems else "FAIL"
-        print("{} {} ({} nodes, {} links)".format(
-            status, name, len(d["nodes"]), len(d["links"])))
-        for p in problems:
-            print("     " + p)
-        if problems:
+    files = sorted(f for f in os.listdir(WF) if f.endswith(".json"))
+    if not files:
+        print("FAIL no workflows found")
+        return 1
+
+    def check(name, ok, detail=""):
+        print("{} {}".format("PASS" if ok else "FAIL", name) +
+              ("" if ok else " -> " + str(detail)[:300]))
+        if not ok:
             failures.append(name)
 
-    # widget-count agreement for our own nodes
-    import nodes as h3
     for name in files:
-        d = load(os.path.join(WF, name))
-        for n in d["nodes"]:
-            expected = widget_count(d, n)
-            if expected is None:
-                continue
-            got = len(n.get("widgets_values") or [])
-            if got != expected:
-                msg = "{}: node {} ({}): {} widgets, INPUT_TYPES wants {}".format(
-                    name, n["id"], n["type"], got, expected)
-                print("FAIL " + msg)
-                failures.append(msg)
+        p = load(name)
+        problems = validate(p)
+        check("{}: {} nodes, valid structure".format(name, len(p)),
+              not problems, problems)
 
-    # ordering edges that carry the exactness argument
-    d = load(os.path.join(WF, "05_record_strict.json"))
-    nodes = {n["id"]: n for n in d["nodes"]}
-    def has_after(node_type):
-        hits = [n for n in d["nodes"] if n["type"] == node_type]
-        return bool(hits) and all(
-            any(i.get("name") == "after" and i.get("link") is not None
-                for i in (n.get("inputs") or [])) for n in hits)
-    for node_type in ("H3ExactAdaLNApply", "H3ExactAdaLNSave"):
-        ok = has_after(node_type)
-        print("{} 05: {} waits on chain A".format("PASS" if ok else "FAIL", node_type))
-        if not ok:
-            failures.append("05 missing after edge on " + node_type)
+    by_name = {n: load(n) for n in files}
+
+    ab = by_name.get("v2_record_apply_ab.json")
+    if ab is not None:
+        h3 = [n for n in ab.values() if n.get("class_type") == "H3AdaLN"]
+        modes = sorted(n["inputs"].get("mode") for n in h3)
+        check("A/B: one record + one apply H3AdaLN", modes == ["apply", "record"], modes)
+        check("A/B: apply consumes the recorded table via table_in",
+              any(isinstance(n["inputs"].get("table_in"), list)
+                  for n in h3 if n["inputs"].get("mode") == "apply"), "")
+        check("A/B: has H3LatentCompare",
+              any(n.get("class_type") == "H3LatentCompare" for n in ab.values()), "")
+    else:
+        check("A/B workflow present", False, "missing")
+
+    auto = by_name.get("v2_apply_auto.json")
+    if auto is not None:
+        h3 = [n for n in auto.values() if n.get("class_type") == "H3AdaLN"]
+        check("auto: exactly one H3AdaLN in apply mode",
+              len(h3) == 1 and h3[0]["inputs"].get("mode") == "apply", h3)
+        if h3:
+            inp = h3[0]["inputs"]
+            check("auto: uses (auto) lookup, no table_in / no after",
+                  inp.get("table") == "(auto)" and "table_in" not in inp
+                  and "after" not in inp, inp)
+        check("auto: has an output node",
+              any(n.get("class_type") in OUTPUT_NODES for n in auto.values()), "")
+    else:
+        check("auto workflow present", False, "missing")
 
     print()
     if failures:
-        print("{} FAILED".format(len(failures)))
+        print("{} CHECK(S) FAILED".format(len(failures)))
         return 1
     print("ALL WORKFLOWS VALID")
     return 0

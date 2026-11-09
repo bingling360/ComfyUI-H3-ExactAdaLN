@@ -241,4 +241,4 @@ def sigma_from_options(transformer_options, timestep=None):
             return sigma_from_timestep(sig)
         except Exception:
             pass
-    raise RuntimeError("H3ExactAdaLN: no sigma available in transformer_options")
+    raise RuntimeError("H3AdaLN: no sigma available in transformer_options")

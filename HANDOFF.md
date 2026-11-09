@@ -3,8 +3,14 @@
 > **换机后从这里开始。** 本文件自包含，新对话请先完整读完再动手。
 > 所有结论都已实测或经源码核对，不要重复排查「已排除项」。
 >
-> 状态截至 `705a368`（2026-11-08）。`README.md` 是给用户看的用法说明，
-> 本文件是给下一个接手的开发者看的状态、流程与坑。
+> **v2 精简（2026-11-09）**：插件现在只注册三个节点 —— `H3 AdaLN`、
+> `H3 AdaLN Hybrid`、`H3 Latent Compare`。v1 的七个单功能节点、离线 Bake
+> 引擎、`latent_io.py`、`tools/` 生成器、01~08 工作流**已全部删除**。
+> 本文件 §2 / §3 的 v1 清单和 §4 之后的排障记录保留作历史与根因证据，
+> 其中出现的旧节点名都已不存在，不要照着去找代码。当前状态见 §0.1。
+>
+> `README.md` 是给用户看的用法说明，本文件是给下一个接手的开发者看的状态、
+> 流程与坑。
 
 ---
 
@@ -13,7 +19,7 @@
 | 项 | 值 |
 |---|---|
 | 仓库 | `https://github.com/bingling360/ComfyUI-H3-ExactAdaLN`（分支 `main`） |
-| 代码状态 | `705a368`（b25-49 支持 + FL2VA 录制工作流）；此后仅本文档有更新 |
+| 代码状态 | `main` 最新提交；v2 精简版（三节点 + 两份 API prompt） |
 | 插件安装位置（实例） | `/root/ComfyUI/custom_nodes/ComfyUI-H3-ExactAdaLN/` |
 | 实例环境 | ComfyUI 0.44.0 / PyTorch 2.9.1+cu130 / Python 3.12.3 / RTX 4080 SUPER 32GB |
 | 本地开发目录 | 任意 clone 位置（本文档写作时为 `D:/Adaln/ComfyUI-H3-ExactAdaLN/`） |
@@ -68,10 +74,10 @@ python tests/test_merge.py        # 纯 CPU，验证合并逻辑（需 torch/saf
    值等于真带参考跑一次，且**不改采样结果**（不动 layout、不碰 payload）。
    关掉则回到旧行为：纯 t2v 表没有 0.999，首次上参考会在采样前报 t-set mismatch。
 
-实现落在 `h3_unified.py`（重写）；`nodes.py` / `latent_io.py` 只加了
-`DEPRECATED = True`，逻辑未动，01~08 工作流仍可加载运行。
-新增 `tests/test_simple.py`；`workflows/05`、`08` 的 Record 节点补了缺失的
-`time_embedder_from` widget（原本就让 `test_workflows.py` 红着）。
+实现落在 `h3_unified.py`（重写）；`nodes.py` 已瘦身为共享 helper +
+`H3LatentCompare`；`latent_io.py`、`bake_engine.py`、`tools/` 和 01~08 工作流
+全部删除。`tests/test_simple.py` / `tests/test_runtime.py` 覆盖新节点；
+`tests/test_workflows.py` 改为校验两份 API prompt 的结构。
 
 **本机已验（2026-11-09，ComfyUI 0.44.2 / torch 2.12.1 / GTX 1660S 6GB / 16GB RAM）**：
 
@@ -121,6 +127,18 @@ B 链 UNETLoader(minimax_h3_ref2va_pruned_int8_convrot, 20GB 剪枝基座)
    不同。修复：基座指纹统一先舍入到 bf16 精度，两侧字节流一致；教师身份指纹
    不受影响（commit `22b61a1`），并加回归测试。重录后自动查找成功。
 
+**v2 精简与边界加固（2026-11-09 收尾）**：
+
+- 删掉 v1 七个单功能节点、`bake_engine.py`、`latent_io.py`、`tools/`
+  全部生成器、01~08 工作流；`nodes.py` 由 1218 行瘦到 346 行（helper +
+  `H3LatentCompare`）。只保留三节点 + 两份 API prompt。
+- `table_dirs()` 不再扫 `output/h3_adaln/`：v1 遗留表会和新表竞争。
+- **移除「唯一未声明归属的表」静默兜底**：v1 表可能属于别的教师，用了就是
+  不可察觉的错答案。现在 `target_base` 必须命中唯一一张，否则明确报错并提示
+  重录时指定 `for_model`。显式 `table` 覆盖仍可用。
+- 读表失败包一层带路径的清晰异常；测试补了 fp16/bf16 指纹一致性、
+  单目录扫描、无兜底行为等回归项。
+
 **仍未验证**：`ON_CLEANUP` 之外的极端调度、以及带真实参考素材（关键帧/参考图/
 参考音频）的完整出片 —— 目前 pin 行是在无参考素材的流程上预计算并在 tiny
 模型上验证逐位一致，尚未在 34GB 教师上跑带参考素材的 A/B。
@@ -151,7 +169,9 @@ H3 有约 13B 参数（39%）在 AdaLN 分支里，其输出只依赖 timestep�
 
 ---
 
-## 2. 节点清单（8 个）
+## 2. v1 节点清单（已删除，历史参考）
+
+当前只有三个节点，见 §0 与 README。下表是已删除的 v1 节点，仅用于读懂后面的排障记录：
 
 | 节点 | 输入 → 输出 | 说明 |
 |---|---|---|
@@ -161,38 +181,24 @@ H3 有约 13B 参数（39%）在 AdaLN 分支里，其输出只依赖 timestep�
 | `H3ExactAdaLNLoad` | `table_name`（自由文本/子串/绝对路径）→ TABLE | 不用 COMBO（启动时缓存）也不支持上传控件 |
 | `H3AdaLNMerge` | 两张 TABLE + `split` + `final_from` → TABLE | **bX-49 专用**：0..split-1 取 A，split..49 取 B |
 | `H3ExactAdaLNApply` | pruned MODEL + TABLE → MODEL | `strict` / `fallback` / `off`；`off` 会先清理残留 hook |
-| `H3LatentCompare` | 两个 LATENT → 报告 | 支持 NestedTensor；拒绝同源输入（防假 PASS） |
+| `H3LatentCompare` | 两个 LATENT → 报告 | **仍保留**；支持 NestedTensor，拒绝同源输入（防假 PASS） |
 | `H3LatentSave` | LATENT → 文件 | 核心 `SaveLatent` 对 NestedTensor 会崩，必须用这个 |
 
 ---
 
-## 3. 工作流清单（`workflows/`，全部由 `tools/build_*.py` 生成，不要手改）
+## 3. v1 工作流清单（已删除）
+
+01~08 及 `tools/build_*.py` 生成器全部删除。现在 `workflows/` 只有两份
+**API 格式**的 prompt（提交到 `/prompt`，不是 UI 工作流导出）：
 
 | 文件 | 用途 |
 |---|---|
-| `01_bake_exact_adaln.json` | Bake → Save（离线，仅供快速看效果） |
-| `02_verify_full_vs_pruned.json` | Load + Apply 的 A/B 验证（full vs pruned+表） |
-| `03_verify_save_latent.json` | 同 02，多两个 `H3LatentSave` 落盘交叉检查 |
-| `04_verify_strict.json` | 离线 Bake 路径的严格 A/B（**预期 FAIL，是根因证据**） |
-| `05_record_strict.json` | **Record 路径的严格验证**：A 录 + B 注入，Compare 必须 PASS |
-| `06_b25-49_hybrid.json` | 录 Ref2VA full + 与已有 FL2VA 表合并，一次运行产出 B 表与 hybrid 表 |
-| `07_merge_tables.json` | 纯 CPU 重合并（两张表都已落盘时用） |
-| `08_record_fl2va.json` | 录 FL2VA full 基准表（b25-49 的 0-24 半） |
+| `v2_record_apply_ab.json` | 单 prompt 双链：A 录表、B 注入、`H3LatentCompare` 逐位比较 |
+| `v2_apply_auto.json` | 跨 prompt：只剪枝基座、`table=(auto)`、自动查表 |
 
-生成命令（需要 ComfyUI 的 `blueprints/Image to Video (MiniMax H3).json`，
-用 `COMFYUI_DIR` 或 `H3_BLUEPRINT` 指定）：
+两者都在云实例实测通过；`tests/test_workflows.py` 离线校验结构。
 
-```bash
-python tools/build_workflows.py   # 01, 02
-python tools/add_savelatent.py    # 03（从 02）
-python tools/build_strict.py      # 04
-python tools/build_record.py      # 05
-python tools/build_hybrid.py      # 06, 07, 08
-```
 
-工作流 JSON 在 `.gitattributes` 里强制 LF；在 Linux 上重生成后 `git status` 应为空。
-
----
 
 ## 4. 已验证的事实（不要重复排查）
 
@@ -320,20 +326,22 @@ python tools/build_hybrid.py      # 06, 07, 08
 
 ---
 
-## 6. 代码结构与关键实现
+## 6. 代码结构（当前）
 
 ```
+h3_unified.py      H3 AdaLN (record/apply/off) + H3 AdaLN Hybrid
+nodes.py           共享 helper + H3 Latent Compare（346 行）
 record_engine.py   采样期只读 hook（精确路径）
-bake_engine.py     离线重算 + splice donor
 apply_engine.py    运行时注入：t_emb 匹配 + sigma 兜底
 sigma_plan.py      float32 精确的 t 运算，镜像 model.py:671-751
 table_io.py        safetensors 容器 + merge_tables（bX-49 合并）
-nodes.py           8 个节点
-latent_io.py       H3LatentSave（NestedTensor）
-workflows/         01-08（生成，不手改）
-tests/             test_exact.py（21 项数值）/ test_workflows.py（结构）/ test_merge.py（10 项合并）
-tools/             工作流生成器 + 模型/对照辅助
+workflows/         两份 API prompt（v2_record_apply_ab / v2_apply_auto）
+tests/             test_simple / test_exact / test_merge / test_workflows /
+                   test_runtime
 ```
+
+v1 的 `bake_engine.py`、`latent_io.py`、`tools/`、01~08 工作流已删除；
+下面的实现要点中若提到它们，属于历史根因记录。
 
 几个容易踩的实现点：
 

@@ -177,7 +177,7 @@ class ExactAdaLNRuntime:
             self.state["wrapper_steps"] += 1
             self._build_t_indices(timestep, transformer_options, payload)
         except Exception as e:
-            logging.warning("H3ExactAdaLN: sigma reconstruction failed (%s: %s)",
+            logging.warning("H3AdaLN: sigma reconstruction failed (%s: %s)",
                             type(e).__name__, e)
             self.state["t_indices"] = None
         return executor(*args, **kwargs)
@@ -206,7 +206,7 @@ class ExactAdaLNRuntime:
             if indices is None:
                 if self.mode == "strict":
                     raise RuntimeError(
-                        "H3ExactAdaLN: table has no row for t={} (sigma={}). Re-record "
+                        "H3AdaLN: table has no row for t={} (sigma={}). Re-record "
                         "with this workflow's sigmas, or use mode=fallback.".format(
                             ", ".join("{:.7f}".format(t)
                                       for t in sorted(self.state["missing"])[:8]),
@@ -217,14 +217,14 @@ class ExactAdaLNRuntime:
         except RuntimeError:
             raise
         except Exception as e:
-            logging.warning("H3ExactAdaLN: could not resolve timesteps (%s: %s)",
+            logging.warning("H3AdaLN: could not resolve timesteps (%s: %s)",
                             type(e).__name__, e)
             self.state["t_indices"] = None
             self.state["sigma_misses"] += 1
 
         if not callable(fn):
             raise RuntimeError(
-                "H3ExactAdaLN: ComfyUI did not supply a callable original_block "
+                "H3AdaLN: ComfyUI did not supply a callable original_block "
                 "(got {}). Cannot run the dit fallback.".format(type(fn).__name__))
         if self.previous_patch is not None:
             return self.previous_patch(args, info)
@@ -241,7 +241,7 @@ class ExactAdaLNRuntime:
 
     def _strict_error(self, key, t_emb, detail):
         missing = sorted(self.state["missing"])
-        rows = ["H3ExactAdaLN: cannot map {} rows to table rows.".format(
+        rows = ["H3AdaLN: cannot map {} rows to table rows.".format(
             tuple(t_emb.shape)),
             "reason: {}".format(detail),
             "table t rows ({}): {}".format(
@@ -304,7 +304,7 @@ class ExactAdaLNRuntime:
             self.state["injected"] += 1
             if self.state["injected"] == 1:
                 logging.info(
-                    "H3ExactAdaLN: first injection confirmed during sampling "
+                    "H3AdaLN: first injection confirmed during sampling "
                     "(%s, %d rows, indices=%s, max_dist=%.3e)",
                     key, m, indices, self.state["max_match_distance"])
 
@@ -327,13 +327,13 @@ class ExactAdaLNRuntime:
                 targets.append(("blocks.{}".format(i), ap))
         fl_ap = getattr(getattr(dm, "final_layer", None), "adaln_proj", None)
         if fl_ap is None:
-            raise RuntimeError("H3ExactAdaLN Apply: final_layer.adaln_proj missing "
+            raise RuntimeError("H3AdaLN: final_layer.adaln_proj missing "
                                "(50 blocks + final = 51 projections required)")
         targets.append(("final_layer", fl_ap))
 
         missing_keys = [k for k, _ in targets if k not in self.raw_by_key]
         if missing_keys:
-            raise RuntimeError("H3ExactAdaLN Apply: table is missing projections: {}".format(
+            raise RuntimeError("H3AdaLN: table is missing projections: {}".format(
                 ", ".join(missing_keys[:8])))
 
         if use_sigma_wrapper:
@@ -355,7 +355,7 @@ class ExactAdaLNRuntime:
                 pe.WrappersMP.DIFFUSION_MODEL, self.wrapper_key,
                 self.diffusion_wrapper, model.model_options, is_model_options=True)
         except Exception as e:
-            logging.warning("H3ExactAdaLN: could not register the sigma wrapper "
+            logging.warning("H3AdaLN: could not register the sigma wrapper "
                             "(%s: %s); relying on t_emb matching only",
                             type(e).__name__, e)
             self.wrapper_key = None

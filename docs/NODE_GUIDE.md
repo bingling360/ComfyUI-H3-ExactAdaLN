@@ -1,10 +1,11 @@
 # H3 AdaLN 使用教程（v2：两个节点，不用选表）
 
-> 适用版本：v2 节点（`h3_unified.py` 重写后）。旧的八个单功能节点仍然注册、
-> 仍然能被已发布的工作流加载，但已标记 deprecated，不再出现在节点菜单里。
+> 适用版本：v2 精简版。插件只注册三个节点：`H3 AdaLN`、
+> `H3 AdaLN Hybrid`、`H3 Latent Compare`；旧的八个单功能节点、离线 Bake、
+> 以及 01~08 工作流已全部删除，旧工作流不再可加载。
 >
 > 数值结论没有变：新节点直接复用 `record_engine` / `apply_engine` /
-> `table_io`，和之前逐位 PASS 的是同一套代码。本文只讲「怎么用」和「哪里会错」。
+> `table_io`，和云实例逐位 PASS 的是同一套代码。本文只讲「怎么用」和「哪里会错」。
 
 ---
 
@@ -293,11 +294,11 @@ B 链: 剪枝 → H3AdaLN(mode=apply, table_in=A的表) → 采样器B
 **推荐**：直接在有全量 bX-49 教师上 `mode=record`。一次录制，不需要合并。
 已发布的 b5/b20/b25/b30/b45 全量教师：`binglingzhimeng/MiniMax-H3-b25-49-full`。
 
-**没有全量混合教师时**：分别录 FL2VA 和 Ref2VA 两张表，再用 `H3 AdaLN Hybrid`
-（`split=25`）合并。注意 Ref2VA 那张表必须用旧节点 `H3 AdaLN Record` 的
-`time_embedder_from` 指向 FL2VA 的 checkpoint 录 —— 否则尾部会带 Ref2VA 自己的
-嵌入，尾部 25 个投影偏 0.09~0.19。这是唯一还在用旧节点的场景，详见 README
-「Hybrid (spliced) teachers」。
+**没有全量混合教师时**：`H3 AdaLN Hybrid`（`split=25`）可以合并两张表，
+但**不精确**：两个官方教师的 `time_embedder` 不同（`proj_out.weight` 最多差
+0.104），直接录 Ref2VA 会把 donor 自己的嵌入带进尾部，25 个投影偏 0.09~0.19。
+v1 的 `time_embedder_from` 补救节点已删除，所以唯一的精确做法还是拿到全量
+混合教师直接录。详见 README「Hybrid (spliced) teachers」。
 
 ### 4.6 录表建议：把尺寸压到最小
 
@@ -400,22 +401,25 @@ ComfyUI 0.44.2 / torch 2.12.1 / GTX 1660 SUPER 6GB / 16GB 内存：
 
 ---
 
-## 6. 与旧节点的对应关系
+## 6. 现在的节点与工作流
 
-| 旧节点 | 现在 |
+| 节点 | 用途 |
 |---|---|
-| `H3 AdaLN Record` | `H3 AdaLN` → `mode=record`（标签、`time_embedder_from` 不再暴露） |
-| `H3 Exact AdaLN Save Table` | 不需要，跑完自动落盘 |
-| `H3 Exact AdaLN Load Table` | 不需要，`table=(auto)` 按表头声明的基座指纹自动找（§3.2） |
-| `H3 Exact AdaLN Apply` | `H3 AdaLN` → `mode=apply`（`strict/fallback` 已取消，恒为严格） |
-| `H3 AdaLN Merge` | `H3 AdaLN Hybrid`（`final_from` 固定为 a） |
-| `H3 Exact AdaLN Bake` | 不再出现在菜单（离线近似，恒差 1 ulp） |
-| `H3 Latent Save` | 不再出现在菜单（`H3 Latent Compare` 够用） |
+| `H3 AdaLN` | `record` / `apply` / `off`，日常只需要这一个 |
+| `H3 AdaLN Hybrid` | bX-49 两表合并（见 §4.5，不精确，优先用全量混合教师） |
+| `H3 Latent Compare` | A/B 逐位对照 |
 
-旧节点仍然可以加载运行，已发布的工作流（01~08）不受影响。
+v1 的 Record / Bake / Save / Load / Merge / Apply / LatentSave 节点和离线
+Bake 引擎已删除，依赖它们的 01~08 工作流也一并删除。现在 `workflows/` 里是
+两份 **API 格式** 的 prompt（不是 UI 工作流导出）：
 
-**迁移已有表**：旧表放在 `output/h3_adaln/` 或 `input/` 下也能被下拉框列出、
-可以正常 apply；只是它们没有 `identity`，新录制不会往里面加行（会另起一张新表）。
+- `v2_record_apply_ab.json` —— 单 prompt 双链 A/B，录制 + 注入 + 逐位比较；
+- `v2_apply_auto.json` —— 跨 prompt 自动查表，只有剪枝基座。
+
+它们提交到 ComfyUI 的 `/prompt` 接口即可运行，云实例实测过两份都能 PASS。
+
+**旧表**：v1 表没有 `target_base`，插件不会自动使用（避免静默用错教师），
+也不会再扫 `output/h3_adaln/`。要用就重录，并指定 `for_model`。
 
 ---
 
@@ -451,9 +455,9 @@ ComfyUI 0.44.2 / torch 2.12.1 / GTX 1660 SUPER 6GB / 16GB 内存：
 
 ### 7.5 表相关的静默失败（都已修，但要知道症状）
 
-- 部分替换 `time_embedder` 会混两个嵌入 → 旧节点现在硬报错。
-- 上一次的模块替换残留到下一次录制 → 旧节点进节点先撤销。
-- 降级到 weight patch 会被降到 bf16（非 bitwise）→ 报告会明写。
+- 部分替换 `time_embedder` 会混两个嵌入 → v1 曾硬报错；该能力已随旧节点删除。
+- 上一次的模块替换残留到下一次录制 → v1 进节点先撤销；该能力已删除。
+- 降级到 weight patch 会被降到 bf16（非 bitwise）→ v1 报告会明写；已删除。
 - full→pruned 主路径被「模型指纹相等」检查误杀 → 现在只在 full 目标上比较。
 - **v2 新增**：同一 t 出现两种调制值 → 拒绝写盘，不会静默保留其中一份。
 
@@ -556,5 +560,5 @@ A：约 19.7 MiB。17 行 ≈ 315 MiB。
 - `README.md` —— 精确性契约、实测证据、bX-49 混合模型的来龙去脉
 - `docs/unified-node.md` —— v2 的设计不变式：身份、行合并、为什么取消 strict/fallback
 - `HANDOFF.md` —— 全部实测证据、根因与换机速查
-- `workflows/05_record_strict.json` —— 双链 bitwise 对照模板（旧节点）
-- `workflows/06_b25-49_hybrid.json` —— 两教师合并模板（旧节点，已带 `time_embedder_from`）
+- `workflows/v2_record_apply_ab.json` —— 双链 bitwise 对照模板
+- `workflows/v2_apply_auto.json` —— 跨 prompt 自动查表模板

@@ -1,0 +1,325 @@
+{
+  "1": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "共享文本编码器",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "2": {
+    "inputs": {
+      "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "共享视频 VAE",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "3": {
+    "inputs": {
+      "prompt": "A lone figure walking slowly through a neon-lit street at night, steady camera, shallow depth of field",
+      "width": 256,
+      "height": 128,
+      "length": 5,
+      "clip": [
+        "1",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3ImageToVideo",
+    "_meta": {
+      "title": "共享 conditioning + latent",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "4": {
+    "inputs": {
+      "noise_seed": 1
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "共享固定 seed",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "5": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "共享 sampler",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "6": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 8,
+      "denoise": 1.0,
+      "model": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "共享 sigma 网格（8 步）",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "7": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "A: FULL 34GB 教师",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "8": {
+    "inputs": {
+      "lora_name": "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "A: DMAD 8-step",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "9": {
+    "inputs": {
+      "shift_video": 12.0,
+      "shift_audio": 2.0,
+      "model": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "A: shift 12 / 2"
+    }
+  },
+  "10": {
+    "class_type": "H3AdaLN",
+    "inputs": {
+      "model": [
+        "9",
+        0
+      ],
+      "mode": "record",
+      "for_model": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "fill_reference_row": true,
+      "table": "(auto)"
+    },
+    "_meta": {
+      "title": "A: full teacher -> H3AdaLN(record)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "model": [
+        "10",
+        0
+      ],
+      "conditioning": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "基本引导器",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "12": {
+    "inputs": {
+      "noise": [
+        "4",
+        0
+      ],
+      "guider": [
+        "11",
+        0
+      ],
+      "sampler": [
+        "5",
+        0
+      ],
+      "sigmas": [
+        "6",
+        0
+      ],
+      "latent_image": [
+        "3",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "A: latent (原生)",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "13": {
+    "inputs": {
+      "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "B: PRUNED 21GB",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "14": {
+    "inputs": {
+      "lora_name": "dmad_minimax_h3_8step_full_critic_comfyui.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "B: DMAD 8-step",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "15": {
+    "inputs": {
+      "shift_video": 12.0,
+      "shift_audio": 2.0,
+      "model": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "B: shift 12 / 2"
+    }
+  },
+  "16": {
+    "class_type": "H3AdaLN",
+    "inputs": {
+      "model": [
+        "15",
+        0
+      ],
+      "mode": "apply",
+      "for_model": "(auto)",
+      "fill_reference_row": true,
+      "table": "(auto)",
+      "table_in": [
+        "10",
+        1
+      ],
+      "after": [
+        "12",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "B: pruned base -> H3AdaLN(apply, table_in)"
+    }
+  },
+  "17": {
+    "inputs": {
+      "model": [
+        "16",
+        0
+      ],
+      "conditioning": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "基本引导器",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "18": {
+    "inputs": {
+      "noise": [
+        "4",
+        0
+      ],
+      "guider": [
+        "17",
+        0
+      ],
+      "sampler": [
+        "5",
+        0
+      ],
+      "sigmas": [
+        "6",
+        0
+      ],
+      "latent_image": [
+        "3",
+        1
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "B: latent (表)",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "20": {
+    "inputs": {
+      "label_a": "full teacher (native)",
+      "label_b": "pruned + v2 table",
+      "latent_a": [
+        "12",
+        0
+      ],
+      "latent_b": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "H3LatentCompare",
+    "_meta": {
+      "title": "A/B bitwise compare"
+    }
+  }
+}

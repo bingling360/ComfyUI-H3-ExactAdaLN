@@ -108,7 +108,7 @@ def save_table(path, t_values, raw_by_key, meta, out_dtype="torch.bfloat16"):
     tensors = {"t_values": torch.tensor(t_values, dtype=torch.float32).contiguous()}
     t_count = len(t_values)
     if not t_count:
-        raise RuntimeError("H3ExactAdaLN: refusing to save an empty table (0 t rows)")
+        raise RuntimeError("H3AdaLN: refusing to save an empty table (0 t rows)")
     for key, value in raw_by_key.items():
         v = value.detach().to(torch.float32).cpu().contiguous()
         if v.ndim != 2 or v.shape[0] != t_count:
@@ -133,7 +133,7 @@ def load_table(path, device="cpu"):
     with safe_open(path, framework="pt", device="cpu") as f:
         meta = dict(f.metadata() or {})
     if meta.get("format") != FORMAT and meta.get("format") not in LEGACY_FORMATS:
-        raise RuntimeError("H3ExactAdaLN: unsupported table format {!r} in {}".format(
+        raise RuntimeError("H3AdaLN: unsupported table format {!r} in {}".format(
             meta.get("format"), path))
     t_values = sd["t_values"].to(torch.float32).tolist()
     raw = {k: v for k, v in sd.items() if k != "t_values"}
@@ -172,20 +172,20 @@ def merge_tables(table_a, table_b, split=25, final_from="a"):
 
     split = int(split)
     if not 0 <= split <= 50:
-        raise RuntimeError("H3AdaLNMerge: split must be 0..50, got {}".format(split))
+        raise RuntimeError("H3AdaLN: split must be 0..50, got {}".format(split))
     final_from = str(final_from).lower()
     if final_from not in ("a", "b"):
-        raise RuntimeError("H3AdaLNMerge: final_from must be 'a' or 'b'")
+        raise RuntimeError("H3AdaLN: final_from must be 'a' or 'b'")
 
     keys_a, keys_b = set(a.raw_by_key), set(b.raw_by_key)
     if keys_a != keys_b:
         raise RuntimeError(
-            "H3AdaLNMerge: projection sets differ -- only in A: {} | only in B: {}"
+            "H3AdaLN: projection sets differ -- only in A: {} | only in B: {}"
             .format(sorted(keys_a - keys_b)[:6], sorted(keys_b - keys_a)[:6]))
 
     if a.out_dtype != b.out_dtype:
         raise RuntimeError(
-            "H3AdaLNMerge: out_dtype differs (A={} B={}); re-record both tables "
+            "H3AdaLN: out_dtype differs (A={} B={}); re-record both tables "
             "with the same teacher dtype".format(a.out_dtype, b.out_dtype))
 
     fp_a = a.meta.get("lora_fingerprint", "")
@@ -205,7 +205,7 @@ def merge_tables(table_a, table_b, split=25, final_from="a"):
         fp_ok = same_fp or (not key_a or not key_b or key_a == key_b)
     if not fp_ok:
         raise RuntimeError(
-            "H3AdaLNMerge: LoRA fingerprint differs (A: fp={} keys={} | "
+            "H3AdaLN: LoRA fingerprint differs (A: fp={} keys={} | "
             "B: fp={} keys={}); both tables must be recorded with the same "
             "LoRA stack and strength".format(fp_a, keys_a, fp_b, keys_b))
 
@@ -226,11 +226,11 @@ def merge_tables(table_a, table_b, split=25, final_from="a"):
             order.append(j)
     if missing:
         raise RuntimeError(
-            "H3AdaLNMerge: B is missing {} of A's timesteps (first: {}). "
+            "H3AdaLN: B is missing {} of A's timesteps (first: {}). "
             "Record both tables on the same steps / scheduler / shifts / "
             "resolution.".format(len(missing), ["{:.7f}".format(t) for t in missing[:4]]))
     if len(order) != len(a.t_values) or len(set(order)) != len(order):
-        raise RuntimeError("H3AdaLNMerge: timestep alignment is not one-to-one")
+        raise RuntimeError("H3AdaLN: timestep alignment is not one-to-one")
 
     index = torch.as_tensor(order, dtype=torch.long)
     merged = {}
@@ -244,7 +244,7 @@ def merge_tables(table_a, table_b, split=25, final_from="a"):
             rows = rows.index_select(0, index.to(rows.device))
         if rows.shape != a.raw_by_key[key].shape:
             raise RuntimeError(
-                "H3AdaLNMerge: {} shape mismatch A={} B={} -- the two teachers "
+                "H3AdaLN: {} shape mismatch A={} B={} -- the two teachers "
                 "are different architectures".format(
                     key, tuple(a.raw_by_key[key].shape), tuple(rows.shape)))
         merged[key] = rows.contiguous()

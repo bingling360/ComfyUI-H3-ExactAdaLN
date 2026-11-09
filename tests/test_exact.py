@@ -47,20 +47,10 @@ from comfy.ldm.minimax.model import MiniMaxH3Model  # noqa: E402
 
 import torch.nn.functional as F  # noqa: E402
 
-import bake_engine  # noqa: E402
 import record_engine  # noqa: E402
 import sigma_plan  # noqa: E402
 import table_io  # noqa: E402
 import apply_engine  # noqa: E402
-
-
-class PatcherShim:
-    """Minimal ModelPatcher surface used by bake_engine (no patches, CPU)."""
-
-    def __init__(self, dm):
-        self.model = type("M", (), {"diffusion_model": dm})()
-        self.patches = {}
-        self.model_options = {}
 
 
 HIDDEN = 32
@@ -282,77 +272,22 @@ def main():
     check("sigma_plan: t_audio matches model.py float32 arithmetic",
           t_a == ref_t_a, "planner={:.17g} model={:.17g}".format(t_a, ref_t_a))
 
-    # ---- 7. offline bake reproduces the module's own math -------------
-    t_values = sigma_plan.bake_t_values(sigmas, 12.0, 3.0, 0.999, 1.0)
-    shim = PatcherShim(teacher)
-    raw, info = bake_engine.bake(shim, t_values, compute_dtype="bfloat16",
-                                device=torch.device("cpu"))
-    tv = torch.tensor(t_values, dtype=torch.float32)
-    t_emb = teacher.time_embedder(tv).to(torch.bfloat16)
-    ref = {}
-    for key in ("blocks.0", "blocks.1", "final_layer"):
-        ap = (teacher.blocks[int(key.split(".")[1])].adaln_proj
-              if key.startswith("blocks") else teacher.final_layer.adaln_proj)
-        with torch.no_grad():
-            ref[key] = F.linear(F.silu(t_emb), ap.linear.weight, ap.linear.bias)
-    bake_ok = all(torch.equal(raw[k], ref[k].float()) for k in ref)
-    check("bake: matches F.linear on the teacher's own weights", bake_ok,
-          "" if bake_ok else "max_abs=" + str({k: float(
-              (raw[k] - ref[k].float()).abs().max()) for k in ref}))
-    check("bake: reports the teacher's AdaLN dtype as out_dtype",
-          bake_engine.teacher_out_dtype(teacher) == "torch.bfloat16",
-          bake_engine.teacher_out_dtype(teacher))
-    check("bake: no module weight was mutated",
-          torch.equal(teacher.blocks[0].adaln_proj.linear.weight,
-                      ref_weight_snapshot["blocks.0"]), "")
-
-    # ---- 8. splice swaps only the selected block range ----------------
-    donor_w = torch.randn_like(teacher.blocks[0].adaln_proj.linear.weight)
-    donor_b = torch.randn_like(teacher.blocks[0].adaln_proj.linear.bias)
-    with tempfile.TemporaryDirectory() as tmp:
-        dpath = os.path.join(tmp, "donor.safetensors")
-        from safetensors.torch import save_file
-        save_file({
-            "diffusion_model.blocks.0.adaln_proj.linear.weight": donor_w.contiguous(),
-            "diffusion_model.blocks.0.adaln_proj.linear.bias": donor_b.contiguous(),
-        }, dpath)
-        raw2, info2 = bake_engine.bake(shim, t_values, compute_dtype="bfloat16",
-                                      device=torch.device("cpu"),
-                                      splice=dpath + ":0-0")
-    with torch.no_grad():
-        want0 = F.linear(F.silu(t_emb), donor_w, donor_b)
-    spliced0 = torch.equal(raw2["blocks.0"], want0.float())
-    untouched1 = torch.equal(raw2["blocks.1"], ref["blocks.1"].float())
-    check("splice: donor weight used for blocks.0", spliced0, "")
-    check("splice: blocks.1 still the teacher's", untouched1, "")
-    check("splice: fingerprint recorded in info",
-          bool(info2.get("splice_fingerprint")) and info2.get("splice_blocks") == "1",
-          str({k: v for k, v in info2.items() if k.startswith("splice")}))
-
-    # ---- 9. node schemas ---------------------------------------------
-
+    # ---- 7. node schemas ---------------------------------------------
+    import h3_unified as H
     import nodes as h3nodes
-    try:
-        import folder_paths  # noqa: F401
-        has_paths = True
-    except Exception:
-        has_paths = False
-    rec_in = h3nodes.H3AdaLNRecord.INPUT_TYPES()
-    save_in = h3nodes.H3ExactAdaLNSave.INPUT_TYPES()
-    apply_in = h3nodes.H3ExactAdaLNApply.INPUT_TYPES()
-    check("nodes: record returns MODEL+TABLE+STRING",
-          h3nodes.H3AdaLNRecord.RETURN_TYPES[:2] == ("MODEL", "H3_ADALN_TABLE"),
-          str(h3nodes.H3AdaLNRecord.RETURN_TYPES))
-    check("nodes: record/save/apply all expose an `after` ordering edge",
-          all("after" in cls for cls in (
-              rec_in.get("optional", {}), save_in.get("optional", {}),
-              apply_in.get("optional", {}))),
-          "")
+
+    spec = H.H3AdaLN.INPUT_TYPES()
+    check("nodes: H3AdaLN schema (model/mode + optional inputs)",
+          list(spec["required"]) == ["model", "mode"] and
+          set(spec["optional"]) == {"for_model", "fill_reference_row", "table",
+                                    "table_in", "after"}, str(spec))
+    check("nodes: exactly three core nodes",
+          set(h3nodes.NODE_CLASS_MAPPINGS) == {"H3LatentCompare"} and
+          set(H.NODE_CLASS_MAPPINGS) == {"H3AdaLN", "H3AdaLNHybrid"}, "")
     check("nodes: every registered class has a display name",
+          set(H.NODE_CLASS_MAPPINGS) == set(H.NODE_DISPLAY_NAME_MAPPINGS) and
           set(h3nodes.NODE_CLASS_MAPPINGS) ==
-          set(h3nodes.NODE_DISPLAY_NAME_MAPPINGS),
-          str(sorted(set(h3nodes.NODE_CLASS_MAPPINGS) ^
-                     set(h3nodes.NODE_DISPLAY_NAME_MAPPINGS))))
+          set(h3nodes.NODE_DISPLAY_NAME_MAPPINGS), "")
 
     print()
     if failures:

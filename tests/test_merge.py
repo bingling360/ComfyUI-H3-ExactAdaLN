@@ -1,4 +1,4 @@
-"""Numerical checks for H3AdaLNMerge. Pure CPU: no ComfyUI, no GPU.
+"""Numerical checks for the bX-49 merge path. Pure CPU: no ComfyUI, no GPU.
 
 Two synthetic tables with the same timesteps in *opposite* row order, so any
 implementation that merges by row index instead of by t value fails loudly.
@@ -184,16 +184,12 @@ def test_mid_version_digest_only():
 
 
 def test_node_schema():
-    import nodes as h3
-    spec = h3.H3AdaLNMerge.INPUT_TYPES()
-    assert list(spec["required"]) == ["table_a", "table_b", "split", "final_from"]
+    import h3_unified as H
+    spec = H.H3AdaLNHybrid.INPUT_TYPES()
+    assert list(spec["required"]) == ["model", "table_a", "table_b", "split"]
     assert spec["required"]["split"][1]["default"] == 25
-    assert "after" in spec["optional"]
-    assert h3.H3AdaLNMerge.RETURN_TYPES[:2] == ("H3_ADALN_TABLE", "STRING")
-    assert "H3AdaLNMerge" in h3.NODE_CLASS_MAPPINGS
-    info = h3.H3AdaLNMerge().run(A, B, split=2)
-    assert "merge" in info[1].lower()
-    assert info[0].meta["hybrid_split"] == "2"
+    assert H.H3AdaLNHybrid.RETURN_TYPES[:2] == ("MODEL", "H3_ADALN_TABLE")
+    assert "H3AdaLNHybrid" in H.NODE_CLASS_MAPPINGS
 
 
 check("merge: blocks >= split come from B, rest from A", test_block_split_and_t_alignment)
@@ -207,7 +203,7 @@ check("merge: legacy key-only table still merges, new tables stay strict",
       test_legacy_fingerprint_compat)
 check("merge: digest-only (mid-version) table merges on identical digest",
       test_mid_version_digest_only)
-check("merge: node schema and report", test_node_schema)
+check("merge: hybrid node schema", test_node_schema)
 
 print()
 if all(checks):
