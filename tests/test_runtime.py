@@ -316,20 +316,19 @@ def test_off_clears():
 
 
 def test_hybrid_merges_two_real_tables():
+    # two teachers recorded here, so the merge does not depend on what earlier
+    # tests happened to leave in the folder
     before = set(os.listdir(TABLE_DIR))
-    donor = tiny_model(seed=4242)
-    patcher = patcher_for(donor)
-    H().run(patcher, "record", fill_reference_row=False)  # match the other table
-    feed(donor, [1.0, 0.5])
-    patcher.cleanup()
+    for seed in (4242, 4343):
+        dm = tiny_model(seed=seed)
+        patcher = patcher_for(dm)
+        H().run(patcher, "record", fill_reference_row=False)
+        feed(dm, [1.0, 0.5])
+        patcher.cleanup()
 
     new = sorted(set(os.listdir(TABLE_DIR)) - before)
-    assert len(new) == 1, new
-    base_name = new[0]
-    others = sorted(f for f in os.listdir(TABLE_DIR)
-                    if f.startswith("h3_full_") and f != base_name)
-    assert others, "need a second table to merge"
-    other = others[0]
+    assert len(new) == 2, new
+    base_name, other = new
 
     target = tiny_model(curve=33, seed=9)
     patcher2 = patcher_for(target)
