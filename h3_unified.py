@@ -617,6 +617,14 @@ def save_table_smart(t_values, raw_by_key, meta, out_dtype, name_hint):
         merged["runs"] = str(int(meta_old.get("runs", "1") or 1) + 1)
         merged["shift_v"] = meta_old.get("shift_v", meta.get("shift_v", ""))
         merged["shift_a"] = meta_old.get("shift_a", meta.get("shift_a", ""))
+        # A merge rewrites the whole header with this run's fresh meta. Keep the
+        # existing base declaration unless this run explicitly declares a new
+        # one, otherwise every re-record silently drops the association and
+        # `table=(auto)` stops finding the table.
+        for _key in ("target_base", "target_name", "target_bases"):
+            _old_value = meta_old.get(_key, "")
+            if _old_value and not meta.get(_key):
+                merged[_key] = _old_value
         merged["t_rows"] = str(len(t_all))
         _atomic_write(existing, t_all, raw_all, merged, out_dtype)
         return existing, "merged", added, len(t_all)
@@ -721,34 +729,119 @@ def _curve_checkpoints():
     return paths
 
 
+DEFAULT_BASES_FILE = "_default_bases.json"
+
+
+def _bound_base(teacher_fp):
+    """Optional per-teacher default base, remembered from an explicit choice.
+
+    The association itself still lives in the table header; this file only
+    remembers which base the user picked, so `for_model=(auto)` does not have
+    to be set on every run. A missing or unreadable file is not an error.
+    """
+    if not teacher_fp:
+        return None
+    try:
+        path = os.path.join(table_folder(), DEFAULT_BASES_FILE)
+        if not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        value = data.get(teacher_fp)
+        return str(value) if value else None
+    except Exception as e:
+        logging.warning("H3AdaLN: cannot read %s (%s: %s); ignoring default "
+                        "base binding", DEFAULT_BASES_FILE, type(e).__name__, e)
+        return None
+
+
+def _remember_base(teacher_fp, choice):
+    """Persist one explicit `for_model` choice for future auto runs."""
+    if not teacher_fp or not choice:
+        return
+    try:
+        path = os.path.join(table_folder(), DEFAULT_BASES_FILE)
+        data = {}
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        if data.get(teacher_fp) == choice:
+            return
+        data[teacher_fp] = choice
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+        logging.info("H3AdaLN: remembered default base for teacher %s -> %s",
+                     teacher_fp, choice)
+    except Exception as e:
+        logging.warning("H3AdaLN: cannot save default base binding (%s: %s)",
+                        type(e).__name__, e)
+
+
+def _curve_groups(paths):
+    """Display helper: 21 path entries can be only 5 distinct bases."""
+    groups = {}
+    for path in paths:
+        try:
+            fp = base_fingerprint_from_file(path)
+        except Exception:
+            fp = "(unreadable)"
+        groups.setdefault(fp, set()).add(os.path.basename(path))
+    return ["  {} : {}{}".format(
+                fp, ", ".join(sorted(names)[:4]),
+                " ..." if len(names) > 4 else "")
+            for fp, names in sorted(groups.items())]
+
+
 def _target_of(model):
     """(base fingerprint, file name) this table is for, or None.
 
-    `for_model=(auto)` (the default) means "the curve base in the model folder":
-    with exactly one, that is unambiguous and nothing is asked. With several,
-    there is no way to tell which one you mean -- the table then carries no
-    target and apply falls back to "the only table for this LoRA".
+    `for_model=(auto)` first consults the per-teacher default in
+    `_default_bases.json`, then falls back to "the only curve base in the model
+    folder". With several candidates and no binding there is no way to tell
+    which one is meant, so the table carries no target -- and `table=(auto)`
+    will refuse to pick it (there is deliberately no undeclared fallback).
+    An explicit `for_model` choice is remembered for later runs.
     """
     cached = getattr(model, "_h3_rec_target", None)
     if cached is not None:
         return cached or None
 
     choice = str(getattr(model, "_h3_rec_for_model", AUTO) or AUTO).strip()
+    teacher_fp = str(getattr(model, "_h3_rec_fp", "") or "")
+    path = None
+    bound = False
+
     if choice in ("", NONE, AUTO):
-        found = _curve_checkpoints()
-        if len(found) != 1:
-            if not found:
-                logging.info("H3AdaLN: no pruned/curve checkpoint in the model "
-                             "folder, so the table carries no target base")
+        binding = _bound_base(teacher_fp)
+        if binding:
+            path = resolve_model_file(binding)
+            if path:
+                bound = True
             else:
-                logging.warning(
-                    "H3AdaLN: %d pruned checkpoints in the model folder, so this "
-                    "table carries no target base -- set for_model to name the "
-                    "right one:\n  %s", len(found),
-                    "\n  ".join(os.path.basename(p) for p in found))
-            model._h3_rec_target = ()
-            return None
-        path = found[0]
+                logging.warning("H3AdaLN: default base %r does not resolve; "
+                                "ignoring it", binding)
+        if not path:
+            found = _curve_checkpoints()
+            if len(found) != 1:
+                groups = _curve_groups(found)
+                if not found:
+                    logging.info("H3AdaLN: no pruned/curve checkpoint in the "
+                                 "model folder, so this table carries no "
+                                 "target base")
+                else:
+                    logging.warning(
+                        "H3AdaLN: %d curve checkpoints (%d distinct bases) in "
+                        "the model folder, so this table carries no target base "
+                        "-- set for_model once (it will be remembered), or add "
+                        "it to %s:\n%s",
+                        len(found), len(groups), DEFAULT_BASES_FILE,
+                        "\n".join(groups))
+                model._h3_rec_target = ()
+                model._h3_rec_bound = False
+                return None
+            path = found[0]
     else:
         path = resolve_model_file(choice)
         if not path:
@@ -756,35 +849,49 @@ def _target_of(model):
                             "checkpoint; the table will not carry a base "
                             "fingerprint", choice)
             model._h3_rec_target = ()
+            model._h3_rec_bound = False
             return None
+        _remember_base(teacher_fp, choice)
 
     try:
         fp = base_fingerprint_from_file(path)
     except Exception as e:
-        logging.warning("H3AdaLN: cannot fingerprint %s (%s: %s); the table will "
-                        "not carry a base fingerprint", path, type(e).__name__, e)
+        logging.warning("H3AdaLN: cannot fingerprint %s (%s: %s); the table "
+                        "will not carry a base fingerprint", path,
+                        type(e).__name__, e)
         model._h3_rec_target = ()
+        model._h3_rec_bound = False
         return None
     target = (fp, os.path.basename(path))
     model._h3_rec_target = target
+    model._h3_rec_bound = bound
     return target
 
 
-def _stop_recording(model):
-    """Drop this prompt's read-only hooks.
+# One live recorder per record-node instance (UNIQUE_ID), not one per model.
+# Two nodes in one prompt must capture at the same time: they share the
+# diffusion module, and clearing "every recorder on the dm" made the last node
+# evict the others. The id is stable across prompts for the same node, which is
+# exactly what stale-hook cleanup needs.
+_ACTIVE_RECORDERS = {}
 
-    Hook lifetime is per prompt, not per MODEL: ModelPatcher.clone() shares the
-    underlying nn.Module, so a recorder left behind would keep copying AdaLN
-    rows for every later run and hold the memory for them.
-    """
+
+def _stop_recording(model):
+    """Drop this node's read-only hooks and its registry entry."""
     recorder = getattr(model, "_h3_recorder", None)
+    uid = str(getattr(model, "_h3_rec_uid", "") or "")
     if recorder is not None:
         try:
             recorder.remove()
         except Exception:
             pass
         model._h3_recorder = None
-    _nodes._clear_registered(model, "_h3_recorders")
+    if uid:
+        _ACTIVE_RECORDERS.pop(uid, None)
+    try:
+        model._h3_rec_uid = ""
+    except Exception:
+        pass
 
 
 def _finish_record(model):
@@ -863,6 +970,19 @@ def _save_recorded(model):
 class H3AdaLN:
     """Record a table while the full teacher samples, or apply one to a pruned base."""
 
+    # ComfyUI caches node outputs by input signature. Record has side effects
+    # (hooks + ON_CLEANUP), so it must execute on every prompt even when its
+    # inputs look unchanged; otherwise a re-run silently produces no table.
+    # NOT_IDEMPOTENT only appends the node id to the cache signature
+    # (comfy_execution/caching.py:118); IS_CHANGED is what invalidates the
+    # cache across prompts. Record/apply have side effects (hooks, ON_CLEANUP,
+    # injection), so neither may be served from a cached output.
+    NOT_IDEMPOTENT = True
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return time.time()
+
     MODES = ["apply", "record", "off"]
 
     @classmethod
@@ -905,6 +1025,7 @@ class H3AdaLN:
                                "this same prompt (A/B verification)."}),
                 "after": ("*", {"tooltip": _AFTER_DOC}),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("MODEL", TABLE_TYPE, "STRING")
@@ -913,7 +1034,7 @@ class H3AdaLN:
     CATEGORY = _nodes.CATEGORY
 
     def run(self, model, mode, for_model=AUTO, fill_reference_row=True,
-            table=AUTO, table_in=None, after=None):
+            table=AUTO, table_in=None, after=None, unique_id=None):
         # `after` is intentionally unused: the edge alone orders the graph.
         mode = str(mode or "apply").lower()
         dm = _nodes._dm_of(model)
@@ -923,16 +1044,18 @@ class H3AdaLN:
         if dm is None:
             raise RuntimeError("H3AdaLN: expected a ComfyUI ModelPatcher")
         if mode == "record":
-            return self._record(model, dm, for_model, fill_reference_row)
+            return self._record(model, dm, for_model, fill_reference_row,
+                                unique_id)
         if mode == "apply":
             return self._apply(model, dm, table, table_in)
         raise RuntimeError("H3AdaLN: unknown mode {!r}".format(mode))
 
     # -- record -------------------------------------------------------
-    def _record(self, model, dm, for_model=AUTO, fill_reference_row=True):
+    def _record(self, model, dm, for_model=AUTO, fill_reference_row=True,
+                unique_id=None):
         for attr in ("_h3_pending_table", "_h3_rec_dm", "_h3_rec_fp",
                      "_h3_rec_adaln_fp", "_h3_saved", "_h3_rec_target",
-                     "_h3_rec_for_model"):
+                     "_h3_rec_for_model", "_h3_rec_uid"):
             if hasattr(model, attr):
                 try:
                     delattr(model, attr)
@@ -940,13 +1063,20 @@ class H3AdaLN:
                     pass
         model._h3_rec_for_model = str(for_model or AUTO)
 
-        previous = getattr(model, "_h3_recorder", None)
-        if previous is not None and getattr(previous, "rows", None):
+        uid = str(unique_id or "")
+        stale = _ACTIVE_RECORDERS.pop(uid, None) if uid else None
+        if stale is not None:
             logging.warning(
-                "H3AdaLN: another record node on this MODEL is already capturing; "
-                "only one recorder can be live, so this one takes over and the "
-                "other saves nothing. Use one record node per model.")
-        _nodes._clear_registered(model, "_h3_recorders")
+                "H3AdaLN: node %s still had a recorder from an earlier run; "
+                "dropping it before starting a new one", uid)
+            try:
+                stale.remove()
+            except Exception:
+                pass
+        # Deliberately do NOT clear other recorders on the shared diffusion
+        # module: a second record node in this same prompt owns its own hook
+        # and must keep it (one recorder per sampling chain). Hooks left by an
+        # earlier run are dropped above, keyed by this node's UNIQUE_ID.
 
         pins = ((float(sigma_plan.VISUAL_COND_TIMESTEP),
                  float(sigma_plan.AUDIO_COND_TIMESTEP))
@@ -956,6 +1086,9 @@ class H3AdaLN:
         hooked = recorder.register()
         _nodes._track_registered(model, "_h3_recorders", recorder)
         model._h3_recorder = recorder
+        model._h3_rec_uid = uid
+        if uid:
+            _ACTIVE_RECORDERS[uid] = recorder
 
         model_fp = model_fingerprint(dm)
         adaln_fp = _adaln_lora_fingerprint(model)
@@ -1001,9 +1134,11 @@ class H3AdaLN:
             "  for base   : {}".format(
                 "{} (fp {}){}".format(
                     target[1], target[0],
-                    " [auto]" if str(for_model or AUTO).strip() in ("", NONE, AUTO)
-                    else "") if target else
-                "(none) -- apply will fall back to 'the only table for this LoRA'"),
+                    " [bound]" if getattr(model, "_h3_rec_bound", False)
+                    else (" [auto]" if str(for_model or AUTO).strip()
+                          in ("", NONE, AUTO) else "")) if target else
+                "(none) -- table=(auto) will NOT find this table; set for_model "
+                "to the pruned base, or pick the file in `table`"),
             "  saves to   : {}/{}".format(table_folder(), hint),
             "",
             "  Rows are captured live and written when this run ends. Re-recording",
