@@ -157,6 +157,15 @@ menu.
 3. **Verify (optional).** `mode=off` on the same graph must produce a visibly
    different latent — if it does not, the table was never injected.
 
+**Make the recording run cheap.** The table depends only on the timesteps, not
+on resolution or frame count, so record at the smallest size your workflow
+accepts: H3's latent node allows `width`/`height` down to `32` (step `32`) and
+`length` down to `5` (step `17`, snapped to the `17k+5` grid). `256x128` or
+`320x192` with `5` frames is a safe practical floor — the full teacher then
+takes seconds per step instead of minutes. Keep the steps, scheduler, shifts
+and reference/keyframe setup identical to the run you will actually use. See
+[the node guide](docs/NODE_GUIDE.md) §4.6 for the exact limits and why.
+
 ### The `after` input (only for A/B in one prompt)
 
 A recorded table is empty until the sampler has run, so anything reading it in
