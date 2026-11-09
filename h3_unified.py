@@ -840,13 +840,13 @@ def _save_recorded(model):
             "H3AdaLN: %s now holds %d t rows (~%.1f GiB). Every extra schedule "
             "adds rows; delete the file and re-record if it gets out of hand.",
             os.path.basename(path), total, os.path.getsize(path) / (1 << 30))
-    pin = float(sigma_plan.VISUAL_COND_TIMESTEP)
-    if not any(abs(t - pin) < 1e-9 for t in table.t_values):
+    pin = sigma_plan.f32_image(sigma_plan.VISUAL_COND_TIMESTEP)
+    if not any(abs(t - pin) < 1e-6 for t in table.t_values):
         logging.warning(
-            "H3AdaLN: %s has no row for t=%.3f -- fill_reference_row was off and "
-            "this run had no keyframe/reference segment. A later reference/"
-            "keyframe workflow will need one more recording pass (it errors "
-            "before sampling, never silently).", os.path.basename(path), pin)
+            "H3AdaLN: %s has no row for t=%.3f -- a later keyframe/reference "
+            "workflow will need one more recording pass (it errors before "
+            "sampling, never silently). Enable fill_reference_row to add it "
+            "automatically.", os.path.basename(path), pin)
 
 
 # ---------------------------------------------------------------- nodes

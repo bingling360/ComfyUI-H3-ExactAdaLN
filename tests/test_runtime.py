@@ -292,6 +292,33 @@ def test_missing_reference_row_is_reported():
     assert any("no row for t=0.999" in m for m in seen), seen[-4:]
 
 
+def test_pinned_run_does_not_warn_about_a_missing_pin():
+    """f32_image(0.999) is 0.999000013 -- the check must not miss it."""
+    import logging
+
+    seen = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    root = logging.getLogger()
+    handler = Capture()
+    level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    try:
+        dm = tiny_model(seed=141)
+        patcher = patcher_for(dm)
+        H().run(patcher, "record")  # pins on by default
+        feed(dm, [1.0, 0.5])
+        patcher.cleanup()
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(level)
+    assert not any("no row for t=0.999" in m for m in seen), seen[-6:]
+
+
 def test_apply_arms_and_cleanup_unhooks():
     base, _path = student()
     patcher = patcher_for(base)
@@ -352,6 +379,8 @@ for name, fn in [
      test_auto_detects_the_only_base),
     ("record: the pinned 0.999 row equals a real reference batch",
      test_pinned_rows_match_a_real_reference_batch),
+    ("record: a pinned run never reports a missing 0.999 row",
+     test_pinned_run_does_not_warn_about_a_missing_pin),
     ("record: a text-only run reports the missing 0.999 row",
      test_missing_reference_row_is_reported),
     ("apply: resolves by declared base, hooks, cleanup unhooks",
