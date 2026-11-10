@@ -62,7 +62,14 @@ AUTO = "(auto)"
 NONE = "(none)"
 # Two rows for the same t may differ by this much and still count as the same
 # observation. Anything above it means the model / LoRA / dtype changed.
+# fp32 tables can be compared almost bitwise. AdaLN rows, however, are
+# captured from a bf16/fp16 forward and only then stored as fp32: two runs of
+# the SAME model can differ by a few low-precision ULPs (~1.5e-5 measured)
+# because of kernel / compiler / mixed-precision reduction order. A real
+# model or AdaLN-LoRA change moves these values by >=1e-2, so a dtype-aware
+# tolerance is safe and makes re-recording possible.
 CONFLICT_TOL = 1e-6
+LOW_PRECISION_TOL = 2e-4
 
 _AFTER_DOC = ("Ordering only, nothing is read from it. Connect the sampler's "
               "LATENT here when a table is produced and consumed inside one "
@@ -272,8 +279,19 @@ def resolve_for_model(model, dm, choice):
                    len(untagged),
                    "\n  ".join(os.path.basename(p) for p in untagged)))
     else:
-        why = ("{} table(s) exist but none matches this model's AdaLN LoRA "
-               "fingerprint ({!r})".format(len(scanned), want or "none"))
+        # The old message blamed the LoRA fingerprint for every mismatch. In
+        # practice the usual cause is target_base: the table was recorded for
+        # a different (pruned) checkpoint. Show both fields so it is obvious.
+        seen = ["  {} : target_base={} lora_fp={}".format(
+                    os.path.basename(p),
+                    str(m.get("target_base") or "(none)"),
+                    _norm_adaln_fp(m.get("adaln_lora_fingerprint", "")) or "none")
+                for p, m in scanned]
+        why = ("{} table(s) scanned, none declares target_base={} with "
+               "lora_fp={}:\n{}\n"
+               "Usually the loaded checkpoint is not the base this table was "
+               "recorded for (or the AdaLN/timestep LoRA stack changed)."
+               .format(len(scanned), base_fp, want or "none", "\n".join(seen)))
     raise RuntimeError(
         "H3AdaLN: no table for this model (base fp {}) -- {}.\n"
         "Record one with mode=record + for_model=<this checkpoint>, or set "
@@ -572,7 +590,9 @@ def _union(existing, t_new, raw_new, out_dtype):
             continue
         for key, rows in raw_new.items():
             delta = float((raw_old[key][j].float() - rows[i].float()).abs().max())
-            if delta > CONFLICT_TOL:
+            tol = (CONFLICT_TOL if "float32" in str(out_dtype)
+                   else max(CONFLICT_TOL, LOW_PRECISION_TOL))
+            if delta > tol:
                 raise RuntimeError(
                     "H3AdaLN: this run produced different AdaLN values for t={:.7f} "
                     "than {} (max delta {:.3e} on {}). The model, the AdaLN LoRA or "
@@ -674,10 +694,31 @@ def _inject(model, dm, table):
     model._h3_exact_runtime = runtime
 
     def _done(*_a, **_k):
+        # ON_CLEANUP fires once per sampling pass (first pass, refine, ...).
+        # ComfyUI never unregisters these callbacks and cloned ModelPatchers
+        # can inherit them, so report EVERY invocation with its own pass number
+        # and per-pass deltas. That is what shows whether a later pass still
+        # injected table rows instead of silently reverting to native AdaLN.
+        # Teardown stays once-only, so runtime behaviour is unchanged.
+        st = runtime.state
+        snap = (st["injected"], st["match_hits"], st["match_failures"],
+                st["native_steps"], st["wrapper_steps"])
+        prev = getattr(runtime, "_last_report", (0, 0, 0, 0, 0))
+        delta = [b - a for a, b in zip(prev, snap)]
+        runtime._last_report = snap
+        pass_no = getattr(runtime, "_report_count", 0) + 1
+        runtime._report_count = pass_no
         try:
-            logging.info("H3AdaLN: apply stats\n%s", runtime.summary())
+            logging.info(
+                "H3AdaLN: apply stats [pass %d]\n%s\n"
+                "  this pass     : injections=%d matched=%d "
+                "match_failures=%d native=%d wrapper_steps=%d",
+                pass_no, runtime.summary(), *delta)
         finally:
-            runtime.remove()
+            if pass_no == 1:
+                runtime.remove()
+                runtime.detach_payload()
+            apply_engine.recover_stale_malloc_graph()
 
     try:
         import comfy.patcher_extension as pe

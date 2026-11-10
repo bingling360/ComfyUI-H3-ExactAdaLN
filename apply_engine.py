@@ -28,6 +28,8 @@ No layout, no patches_replace and no transformer_options are required for the
 primary path.
 """
 
+import contextlib
+import functools
 import logging
 
 import torch
@@ -38,6 +40,54 @@ except ImportError:
     import sigma_plan
 
 
+def _outside_malloc_graph(fn):
+    """Run a forward hook OUTSIDE comfy-aimdo's malloc graph recording.
+
+    ComfyUI 0.44 wraps MiniMaxH3.forward in malloc_graph_begin/end and
+    compiles every CUDA allocation made inside it for DynamicVRAM prefetch.
+    A plain PyTorch hook that allocates (cdist, .to(device), index_select,
+    or a first-use 446 MB table upload) shows up as a "rogue" allocation,
+    breaks the graph, and after an OOM retry makes malloc_graph_push fail
+    with the opaque "aimdo memory compile error".
+    pause_malloc_graph() is ComfyUI's own escape hatch for exactly this.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            from comfy import model_prefetch
+            ctx = model_prefetch.pause_malloc_graph()
+        except Exception:
+            ctx = contextlib.nullcontext()
+        with ctx:
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+def recover_stale_malloc_graph():
+    """Adapt to ComfyUI 0.44: retire a graph left active by a failed forward.
+
+    MiniMaxH3.forward calls malloc_graph_begin() without a try/finally, so an
+    exception inside the recorded region (OOM, interrupt) leaves an active,
+    un-popped graph in comfy.model_prefetch.MALLOC_GRAPHS. The next sampling
+    attempt pushes onto that stale handle and aimdo reports "memory compile
+    error". ON_CLEANUP runs on both success and failure, so this is the right
+    place for the node to clean up after itself instead of patching ComfyUI.
+    """
+    try:
+        import threading
+        from comfy import model_prefetch as mp
+        graphs = getattr(mp, "MALLOC_GRAPHS", None)
+        if not graphs:
+            return
+        g = graphs.get(threading.get_ident())
+        if g is not None and getattr(g, "_comfy_active", False):
+            mp.cleanup_malloc_graph()
+            logging.info("H3AdaLN: retired a stale comfy-aimdo malloc graph "
+                         "left by an interrupted forward")
+    except Exception:
+        pass
+
+
 def _parse_dtype(name):
     return {"torch.bfloat16": torch.bfloat16, "bfloat16": torch.bfloat16,
             "torch.float16": torch.float16, "float16": torch.float16,
@@ -45,10 +95,43 @@ def _parse_dtype(name):
                 str(name), torch.bfloat16)
 
 
+# ---------------------------------------------------------------------------
+# Device-side table rows live here, owned by the module, NOT by a runtime.
+#
+# Why: ComfyUI fires ON_CLEANUP from model_patcher.cleanup() while DynamicVRAM
+# is unloading / streaming weights. Freeing a CUDA tensor at that moment calls
+# cudaFreeAsync on an allocator whose pool/stream may already be torn down;
+# the C++ tensor destructor then throws c10::AcceleratorError. An exception
+# thrown from a destructor cannot be caught by any Python try/except and ends
+# in std::terminate -> SIGABRT -> the entire ComfyUI process dies (and the
+# browser loses its websocket). Observed on 0.44 + cudaMallocAsync, especially
+# after an interrupted run.
+#
+# Sharing one cache also keeps VRAM flat: two Apply nodes (first pass + refine)
+# used to allocate two full ~446 MB copies and free both during cleanup.
+_SHARED_GPU = {"key": None, "rows": {}, "keys": {}}
+
+
+def _gpu_cache(identity, device, out_dtype):
+    d = torch.device(device)
+    dev = "{}:{}".format(d.type, d.index if d.index is not None else 0)
+    ck = (str(identity), dev, str(out_dtype))
+    if _SHARED_GPU["key"] != ck:
+        # Reached from a forward hook, i.e. while a node is executing with a
+        # live CUDA context -- a safe point to retire the previous table.
+        _SHARED_GPU["rows"] = {}
+        _SHARED_GPU["keys"] = {}
+        _SHARED_GPU["key"] = ck
+    return _SHARED_GPU["rows"], _SHARED_GPU["keys"], ck
+
+
 class ExactAdaLNRuntime:
     def __init__(self, t_values, raw_by_key, meta, dm, mode="strict"):
         self.t_values = list(t_values)
         self.raw_by_key = dict(raw_by_key)
+        # Frozen count: detach_payload() drops raw_by_key after the first
+        # cleanup, but later passes must still report the real projection count.
+        self._projections = len(raw_by_key)
         self.meta = dict(meta)
         self.dm = dm
         self.mode = mode
@@ -58,6 +141,10 @@ class ExactAdaLNRuntime:
         self.audio_aug = float(meta.get("audio_aug", sigma_plan.AUDIO_COND_TIMESTEP))
         self.previous_patch = None
         self.hook_handles = []
+        # Identity of the GPU-side cache shared by every runtime using this table.
+        self._gpu_identity = "{}|{}|{}".format(
+            meta.get("identity", ""), len(t_values), meta.get("created", ""))
+        self._shared_key = None
         self._device_cache = {}
         self._key_specs, self.match_mode = self._discover_key_sets(dm)
         self._key_cache = {}
@@ -89,8 +176,18 @@ class ExactAdaLNRuntime:
                 modes.append("time-embedder ({}-wide)".format(width))
         return specs, " + ".join(modes) if modes else "unavailable"
 
+    def _attach_shared(self, device):
+        """Bind to the process-wide GPU cache (never freed from cleanup)."""
+        rows, keys, ck = _gpu_cache(self._gpu_identity, device, self.out_dtype)
+        if self._shared_key == ck:
+            return
+        self._device_cache = rows
+        self._key_cache = keys
+        self._shared_key = ck
+
     def _keys_for(self, t_emb):
         """Per-row keys on t_emb's device/dtype, or None if width is unknown."""
+        self._attach_shared(t_emb.device)
         width = int(t_emb.shape[-1])
         kind = self._key_specs.get(width)
         if kind is None:
@@ -231,7 +328,21 @@ class ExactAdaLNRuntime:
         return fn(args)
 
     # -- injection --------------------------------------------------------
+    def _gather(self, key, indices, device):
+        """Upload only the 1-2 rows this step needs, from the CPU-side table.
+
+        Keeping the whole ~446 MB table resident on the GPU (or allocating it
+        during the first forward, inside comfy-aimdo's malloc graph) eats VRAM
+        that DynamicVRAM cannot account for and destabilises the compiled
+        allocation graph. Host RAM is cheap here; per-step H2D is a few MB.
+        """
+        idx = torch.as_tensor(indices, dtype=torch.long)
+        rows = self.raw_by_key[key].index_select(0, idx)
+        return rows.to(device=device, dtype=self.out_dtype).contiguous()
+
     def _raw(self, key, device):
+        """Legacy whole-table accessor. No longer used by the forward hook."""
+        self._attach_shared(device)
         cached = self._device_cache.get(key)
         if cached is not None and cached.device == device:
             return cached
@@ -308,13 +419,11 @@ class ExactAdaLNRuntime:
                     "(%s, %d rows, indices=%s, max_dist=%.3e)",
                     key, m, indices, self.state["max_match_distance"])
 
-            raw = self._raw(key, t_emb.device)
-            index = torch.as_tensor(indices, dtype=torch.long, device=raw.device)
-            gathered = raw.index_select(0, index)
+            gathered = self._gather(key, indices, t_emb.device)
             x = gathered.reshape(m * module.modalities,
                                  module.expand * module.hidden)
             return x.chunk(module.expand, dim=-1)
-        return hook
+        return _outside_malloc_graph(hook)
 
     # -- registration ------------------------------------------------------
     def register(self, model, use_sigma_wrapper=True, use_dit_patch=False):
@@ -367,8 +476,12 @@ class ExactAdaLNRuntime:
             except Exception:
                 pass
         self.hook_handles = []
-        self._device_cache.clear()
-        self._key_cache.clear()
+        # Detach, do NOT clear. These dicts are the module-wide GPU cache;
+        # clearing them inside ON_CLEANUP destroys CUDA tensors and can abort
+        # the whole process (see the note above _SHARED_GPU).
+        self._device_cache = {}
+        self._key_cache = {}
+        self._shared_key = None
         # Drop the wrapper too: re-running Apply on the same MODEL object would
         # otherwise stack one wrapper per run, each holding a dead runtime.
         model = getattr(self, "_wrapper_model", None)
@@ -388,15 +501,23 @@ class ExactAdaLNRuntime:
                 pass
             self._wrapper_model = None
 
+    def detach_payload(self):
+        """Drop heavy references; ON_CLEANUP callbacks are never unregistered."""
+        self.raw_by_key = {}
+        self.dm = None
+        self.meta = {}
+
     def summary(self):
         return "\n".join([
             "mode             : {}".format(self.mode),
             "injection mode   : {}".format(self.match_mode),
             "t rows in table  : {}".format(len(self.t_values)),
-            "projections      : {}".format(len(self.raw_by_key)),
+            "projections      : {}".format(
+                getattr(self, "_projections", len(self.raw_by_key))),
             "out dtype        : {}".format(self.out_dtype),
             "exact matches    : {}".format(self.state["match_hits"] -
                                            self.state["match_approx"]),
+            "injections       : {}".format(self.state["injected"]),
             "approx matches   : {} (max_dist={:.3e})".format(
                 self.state["match_approx"], self.state["max_match_distance"]),
             "match failures   : {}".format(self.state["match_failures"]),
