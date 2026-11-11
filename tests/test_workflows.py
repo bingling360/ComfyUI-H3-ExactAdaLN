@@ -78,6 +78,14 @@ def main():
         check("{}: {} nodes, valid structure".format(name, len(p)),
               not problems, problems)
 
+    for name in files:
+        bad = [nid for nid, node in load(name).items()
+               if isinstance(node, dict)
+               and node.get("class_type") == "H3AdaLN"
+               and (node.get("inputs") or {}).get("for_model") == "(auto)"]
+        check("{}: no for_model=(auto) in any H3AdaLN".format(name),
+              not bad, bad)
+
     by_name = {n: load(n) for n in files}
 
     ab = by_name.get("v2_record_apply_ab.json")

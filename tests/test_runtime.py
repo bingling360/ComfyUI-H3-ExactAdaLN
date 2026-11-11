@@ -208,8 +208,13 @@ def test_second_schedule_merges():
     assert "declared" in why, why
 
 
-def test_auto_detects_the_only_base():
-    """`for_model=(auto)`: the node finds the one curve checkpoint by itself."""
+def test_no_auto_base_detection():
+    """No for_model = no target_base, even with exactly one curve checkpoint.
+
+    Auto-detection was removed: which base a recording belongs to is an
+    explicit choice saved with the workflow, never a scan of the model folder
+    or a remembered per-teacher binding.
+    """
     other = tiny_model(curve=33, seed=71)  # a second base, so the first one stays clean
     path = checkpoint_of(other, "tiny-base2.safetensors")
     original = folder_paths.get_filename_list
@@ -219,8 +224,8 @@ def test_auto_detects_the_only_base():
         before = set(os.listdir(TABLE_DIR))
         dm = tiny_model(seed=77)
         patcher = patcher_for(dm)
-        _, _table, report = H().run(patcher, "record")  # for_model defaults to auto
-        assert "[auto]" in report, report
+        _, _table, report = H().run(patcher, "record")  # for_model defaults to (none)
+        assert "[auto]" not in report, report
         feed(dm, [1.0])
         patcher.cleanup()
 
@@ -228,14 +233,10 @@ def test_auto_detects_the_only_base():
         assert len(new) == 1, new
         _t, _raw, meta = plugin.table_io.load_table(
             os.path.join(TABLE_DIR, new[0]))
-        assert meta["target_base"] == plugin.h3_unified.base_fingerprint(other)
-        assert meta["target_name"] == os.path.basename(path)
-
-        # that base now resolves the table with no pick
-        got, why = plugin.h3_unified.resolve_for_model(
-            patcher_for(other), other, plugin.h3_unified.AUTO)
-        assert got == os.path.join(TABLE_DIR, new[0]), (got, why)
-        assert "declared" in why, why
+        assert "target_base" not in meta, meta
+        assert not os.path.isfile(
+            os.path.join(TABLE_DIR, "_default_bases.json")), \
+            "no hidden binding state may be written"
     finally:
         folder_paths.get_filename_list = original
 
@@ -375,8 +376,8 @@ for name, fn in [
      test_record_saves_on_cleanup),
     ("record: a second schedule merges into the same file",
      test_second_schedule_merges),
-    ("record: (auto) finds the only curve base and stamps it",
-     test_auto_detects_the_only_base),
+    ("record: no auto base detection; for_model must be explicit",
+     test_no_auto_base_detection),
     ("record: the pinned 0.999 row equals a real reference batch",
      test_pinned_rows_match_a_real_reference_batch),
     ("record: a pinned run never reports a missing 0.999 row",

@@ -125,7 +125,6 @@
         0
       ],
       "mode": "apply",
-      "for_model": "(auto)",
       "fill_reference_row": true,
       "table": "(auto)"
     },

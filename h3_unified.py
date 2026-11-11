@@ -6,14 +6,14 @@ existed to work around something the node can decide by itself:
   model_tag / lora_tag /    -> the table's identity is (AdaLN weights, AdaLN LoRA
   scheduler_tag / pass_tag     fingerprint, compute dtype), read off the model.
                                The file name follows from it, so nothing is typed.
-  table_text / table_b_text / -> nothing to pick. At record time the node finds
-  table_source (3 modes)        the pruned base by itself (the only curve-shaped
-                                checkpoint in the model folder) and writes its
-                                AdaLN fingerprint into the table header. At apply
-                                time it hashes the model in front of it and takes
-                                the table that declares that base. No "most
-                                recent" rule, no sidecar state -- the association
-                                travels inside the .safetensors.
+  table_text / table_b_text / -> nothing to pick at apply time. `for_model` is
+  table_source (3 modes)        the one explicit choice: which pruned base a
+                                recording is for. Its AdaLN fingerprint goes
+                                into the table header, so apply finds the table
+                                by hashing the model in front of it. No "most
+                                recent" rule, no auto-detection, no sidecar
+                                state -- the association travels inside the
+                                .safetensors.
   record_name                -> a run *merges* its rows into the table with the
                                 same identity, so re-recording never needs a name
                                 and two nodes on one model cannot split the t set
@@ -39,7 +39,6 @@ sampling segment, and rows from different schedules simply accumulate.
 """
 
 import hashlib
-import json
 import logging
 import os
 import time
@@ -186,8 +185,12 @@ def _scan_tables():
     return out
 
 
-def _model_choices(default=AUTO):
-    """Checkpoints this table can be declared for (record mode only)."""
+def _model_choices(default=NONE):
+    """Checkpoints this table can be declared for (record mode only).
+
+    There is no `(auto)` entry: the base is an explicit choice, and ComfyUI
+    keeps that value in the workflow so it only has to be made once.
+    """
     names = []
     try:
         import folder_paths
@@ -738,161 +741,43 @@ def _inject(model, dm, table):
 
 
 # ---------------------------------------------------------------- record
-def _curve_checkpoints():
-    """Checkpoints in the model folders that look like a pruned/curve base.
-
-    Header only: a base ships `adaln_t_table` and no `time_embedder`, a full
-    teacher is the opposite. That is what lets the record node find "the base"
-    without being told -- when there is exactly one, there is nothing to ask.
-    """
-    paths = []
-    try:
-        import folder_paths
-        names = list(folder_paths.get_filename_list("diffusion_models"))
-    except Exception:
-        return paths
-    try:
-        from safetensors import safe_open
-    except Exception:
-        return paths
-    for name in names:
-        path = resolve_model_file(name)
-        if not path or not path.lower().endswith(TABLE_EXT):
-            continue
-        try:
-            with safe_open(path, framework="pt", device="cpu") as f:
-                keys = set(f.keys())
-        except Exception:
-            continue
-        if "adaln_t_table" in keys and not any(
-                k.startswith("time_embedder.") for k in keys):
-            paths.append(path)
-    return paths
-
-
-DEFAULT_BASES_FILE = "_default_bases.json"
-
-
-def _bound_base(teacher_fp):
-    """Optional per-teacher default base, remembered from an explicit choice.
-
-    The association itself still lives in the table header; this file only
-    remembers which base the user picked, so `for_model=(auto)` does not have
-    to be set on every run. A missing or unreadable file is not an error.
-    """
-    if not teacher_fp:
-        return None
-    try:
-        path = os.path.join(table_folder(), DEFAULT_BASES_FILE)
-        if not os.path.isfile(path):
-            return None
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        value = data.get(teacher_fp)
-        return str(value) if value else None
-    except Exception as e:
-        logging.warning("H3AdaLN: cannot read %s (%s: %s); ignoring default "
-                        "base binding", DEFAULT_BASES_FILE, type(e).__name__, e)
-        return None
-
-
-def _remember_base(teacher_fp, choice):
-    """Persist one explicit `for_model` choice for future auto runs."""
-    if not teacher_fp or not choice:
-        return
-    try:
-        path = os.path.join(table_folder(), DEFAULT_BASES_FILE)
-        data = {}
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        if data.get(teacher_fp) == choice:
-            return
-        data[teacher_fp] = choice
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
-        logging.info("H3AdaLN: remembered default base for teacher %s -> %s",
-                     teacher_fp, choice)
-    except Exception as e:
-        logging.warning("H3AdaLN: cannot save default base binding (%s: %s)",
-                        type(e).__name__, e)
-
-
-def _curve_groups(paths):
-    """Display helper: 21 path entries can be only 5 distinct bases."""
-    groups = {}
-    for path in paths:
-        try:
-            fp = base_fingerprint_from_file(path)
-        except Exception:
-            fp = "(unreadable)"
-        groups.setdefault(fp, set()).add(os.path.basename(path))
-    return ["  {} : {}{}".format(
-                fp, ", ".join(sorted(names)[:4]),
-                " ..." if len(names) > 4 else "")
-            for fp, names in sorted(groups.items())]
+# The target base is always an explicit `for_model` choice. There is
+# deliberately no directory scan and no remembered binding: when the model
+# folder holds several similar pruned checkpoints, the node cannot know which
+# one is meant, and a hidden guess can silently produce a table that answers
+# wrongly. The choice is saved with the workflow, so it is made only once.
 
 
 def _target_of(model):
     """(base fingerprint, file name) this table is for, or None.
 
-    `for_model=(auto)` first consults the per-teacher default in
-    `_default_bases.json`, then falls back to "the only curve base in the model
-    folder". With several candidates and no binding there is no way to tell
-    which one is meant, so the table carries no target -- and `table=(auto)`
-    will refuse to pick it (there is deliberately no undeclared fallback).
-    An explicit `for_model` choice is remembered for later runs.
+    `for_model` is an explicit choice -- there is no auto mode. Without one the
+    table carries no `target_base`, and `table=(auto)` at apply time will refuse
+    to use it rather than guess which teacher it belongs to. The value is saved
+    with the workflow, so it only has to be chosen once.
     """
     cached = getattr(model, "_h3_rec_target", None)
     if cached is not None:
         return cached or None
 
-    choice = str(getattr(model, "_h3_rec_for_model", AUTO) or AUTO).strip()
-    teacher_fp = str(getattr(model, "_h3_rec_fp", "") or "")
-    path = None
-    bound = False
-
+    choice = str(getattr(model, "_h3_rec_for_model", NONE) or NONE).strip()
     if choice in ("", NONE, AUTO):
-        binding = _bound_base(teacher_fp)
-        if binding:
-            path = resolve_model_file(binding)
-            if path:
-                bound = True
-            else:
-                logging.warning("H3AdaLN: default base %r does not resolve; "
-                                "ignoring it", binding)
-        if not path:
-            found = _curve_checkpoints()
-            if len(found) != 1:
-                groups = _curve_groups(found)
-                if not found:
-                    logging.info("H3AdaLN: no pruned/curve checkpoint in the "
-                                 "model folder, so this table carries no "
-                                 "target base")
-                else:
-                    logging.warning(
-                        "H3AdaLN: %d curve checkpoints (%d distinct bases) in "
-                        "the model folder, so this table carries no target base "
-                        "-- set for_model once (it will be remembered), or add "
-                        "it to %s:\n%s",
-                        len(found), len(groups), DEFAULT_BASES_FILE,
-                        "\n".join(groups))
-                model._h3_rec_target = ()
-                model._h3_rec_bound = False
-                return None
-            path = found[0]
-    else:
-        path = resolve_model_file(choice)
-        if not path:
-            logging.warning("H3AdaLN: for_model=%r does not resolve to a "
-                            "checkpoint; the table will not carry a base "
-                            "fingerprint", choice)
-            model._h3_rec_target = ()
-            model._h3_rec_bound = False
-            return None
-        _remember_base(teacher_fp, choice)
+        legacy = ("(auto) is no longer supported; " if choice == AUTO else "")
+        logging.warning(
+            "H3AdaLN: no for_model was set (%spick the pruned base in the "
+            "for_model dropdown). This table carries no target_base, so "
+            "table=(auto) will NOT find it -- select it in `table` instead, "
+            "or record again with for_model set.", legacy)
+        model._h3_rec_target = ()
+        return None
+
+    path = resolve_model_file(choice)
+    if not path:
+        logging.warning("H3AdaLN: for_model=%r does not resolve to a "
+                        "checkpoint; the table will not carry a base "
+                        "fingerprint", choice)
+        model._h3_rec_target = ()
+        return None
 
     try:
         fp = base_fingerprint_from_file(path)
@@ -901,11 +786,9 @@ def _target_of(model):
                         "will not carry a base fingerprint", path,
                         type(e).__name__, e)
         model._h3_rec_target = ()
-        model._h3_rec_bound = False
         return None
     target = (fp, os.path.basename(path))
     model._h3_rec_target = target
-    model._h3_rec_bound = bound
     return target
 
 
@@ -1040,13 +923,14 @@ class H3AdaLN:
             },
             "optional": {
                 "for_model": (_model_choices(), {
-                    "default": AUTO,
-                    "tooltip": "record only, and normally left alone. (auto) = "
-                               "the curve base in the model folder; its AdaLN "
-                               "fingerprint is written into the table so apply "
-                               "finds it without any pick.\n"
-                               "Only name one explicitly when the folder holds "
-                               "several pruned checkpoints."}),
+                    "default": NONE,
+                    "tooltip": "record only: choose the pruned base this table "
+                               "is for. Its AdaLN fingerprint is written into "
+                               "the table header, so apply's table=(auto) finds "
+                               "it without any pick. The choice is saved with "
+                               "the workflow, so set it once.\n"
+                               "(none) = no target base is stored; apply then "
+                               "needs an explicit `table` pick."}),
                 "fill_reference_row": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "record only: also capture the fixed rows a "
@@ -1057,9 +941,9 @@ class H3AdaLN:
                                "extra batch; the sampling result is untouched."}),
                 "table": (_choices(), {
                     "default": AUTO,
-                    "tooltip": "(auto) = the table declared for this model "
-                               "(for_model at record time); failing that, the only "
-                               "table recorded with this AdaLN LoRA.\n"
+                    "tooltip": "(auto) = the only table whose header declares "
+                               "this model (for_model at record time). Nothing "
+                               "is guessed: an undeclared table is refused.\n"
                                "Pick a file only to override, for this run."}),
                 "table_in": (TABLE_TYPE, {
                     "tooltip": "Advanced: take the table from a node earlier in "
@@ -1074,7 +958,7 @@ class H3AdaLN:
     FUNCTION = "run"
     CATEGORY = _nodes.CATEGORY
 
-    def run(self, model, mode, for_model=AUTO, fill_reference_row=True,
+    def run(self, model, mode, for_model=NONE, fill_reference_row=True,
             table=AUTO, table_in=None, after=None, unique_id=None):
         # `after` is intentionally unused: the edge alone orders the graph.
         mode = str(mode or "apply").lower()
@@ -1092,17 +976,17 @@ class H3AdaLN:
         raise RuntimeError("H3AdaLN: unknown mode {!r}".format(mode))
 
     # -- record -------------------------------------------------------
-    def _record(self, model, dm, for_model=AUTO, fill_reference_row=True,
+    def _record(self, model, dm, for_model=NONE, fill_reference_row=True,
                 unique_id=None):
         for attr in ("_h3_pending_table", "_h3_rec_dm", "_h3_rec_fp",
                      "_h3_rec_adaln_fp", "_h3_saved", "_h3_rec_target",
-                     "_h3_rec_for_model", "_h3_rec_uid"):
+                     "_h3_rec_bound", "_h3_rec_for_model", "_h3_rec_uid"):
             if hasattr(model, attr):
                 try:
                     delattr(model, attr)
                 except Exception:
                     pass
-        model._h3_rec_for_model = str(for_model or AUTO)
+        model._h3_rec_for_model = str(for_model or NONE)
 
         uid = str(unique_id or "")
         stale = _ACTIVE_RECORDERS.pop(uid, None) if uid else None
@@ -1173,11 +1057,7 @@ class H3AdaLN:
                 "t=%.3f%s pre-computed" % (pins[0], " / t=%.3f" % pins[1] if len(pins) > 1 else "")
                 if pins else "off (text-only tables will lack t=0.999)"),
             "  for base   : {}".format(
-                "{} (fp {}){}".format(
-                    target[1], target[0],
-                    " [bound]" if getattr(model, "_h3_rec_bound", False)
-                    else (" [auto]" if str(for_model or AUTO).strip()
-                          in ("", NONE, AUTO) else "")) if target else
+                "{} (fp {})".format(target[1], target[0]) if target else
                 "(none) -- table=(auto) will NOT find this table; set for_model "
                 "to the pruned base, or pick the file in `table`"),
             "  saves to   : {}/{}".format(table_folder(), hint),

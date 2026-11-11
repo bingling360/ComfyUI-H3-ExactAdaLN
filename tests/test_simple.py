@@ -74,7 +74,9 @@ def test_schema():
                                       "table_in", "after"], spec["optional"]
     assert spec["required"]["mode"][0] == ["apply", "record", "off"]
     assert spec["optional"]["table"][0][0] == H.AUTO
-    assert spec["optional"]["for_model"][0][0] == H.AUTO
+    assert spec["optional"]["for_model"][0][0] == H.NONE
+    assert H.AUTO not in spec["optional"]["for_model"][0], \
+        "for_model must not offer an (auto) mode"
     assert spec["optional"]["fill_reference_row"][1]["default"] is True
     assert H.H3AdaLN.RETURN_TYPES == ("MODEL", H.TABLE_TYPE, "STRING")
 
@@ -335,13 +337,26 @@ def test_base_fingerprint_tracks_the_adaln_branch():
     assert k1 != k2, "the base fingerprint ignored the AdaLN weights"
 
 
-def test_choices_put_auto_first():
+def test_auto_only_on_table_picker():
+    """apply keeps its deterministic (auto) lookup; record has no auto mode."""
     clean()
     H.save_table_smart([0.0], rows([0.0]), meta(), "torch.bfloat16",
                        "h3_full_ccc_bf16.safetensors")
     names = H._choices()
     assert names[0] == H.AUTO
     assert "h3_full_ccc_bf16.safetensors" in names
+    models = H._model_choices()
+    assert models[0] == H.NONE, models
+    assert H.AUTO not in models, models
+
+
+def test_legacy_auto_value_is_not_a_mode():
+    """Old graphs still carrying `(auto)` are treated as 'not chosen'."""
+    model, _dm = _fake_model()
+    for value in (H.AUTO, H.NONE, ""):
+        model._h3_rec_for_model = value
+        model._h3_rec_target = None
+        assert H._target_of(model) is None, value
 
 
 # ---------------------------------------------------------------- end to end
@@ -417,6 +432,8 @@ def test_record_then_save():
     assert meta2["identity"].endswith(":base:fp32"), meta2["identity"]
     assert meta2["adaln_lora_fingerprint"] == "", meta2["adaln_lora_fingerprint"]
     assert "target_base" not in meta2, "no for_model was given, so no target"
+    assert not os.path.isfile(os.path.join(TABLE_DIR, "_default_bases.json")), \
+        "recording must not write hidden binding state"
 
     loaded = H.table_io.read_table_file(os.path.join(TABLE_DIR, files[0]))
     lines = H._inject(model, dm, loaded)
@@ -610,7 +627,10 @@ def test_base_fingerprint_survives_fp16_to_bf16_cast():
 
 check("base fp: identical across fp16 file / bf16 model",
       test_base_fingerprint_survives_fp16_to_bf16_cast)
-check("picker: (auto) first, then the files on disk", test_choices_put_auto_first)
+check("picker: (auto) only on table; for_model starts at (none)",
+      test_auto_only_on_table_picker)
+check("for_model: legacy (auto) value is not a mode",
+      test_legacy_auto_value_is_not_a_mode)
 check("record: pins 0.999/1.0 through the model's own batch",
       test_record_pins_the_reference_rows)
 check("record: with the switch off, no reference row is written",
@@ -618,6 +638,91 @@ check("record: with the switch off, no reference row is written",
 check("e2e: record -> ON_CLEANUP save -> inject", test_record_then_save)
 check("e2e: mode=off drops a previously injected runtime",
       test_off_clears_a_previous_injection)
+
+
+def test_auto_separates_lora_and_strength():
+    """One base, tables for two LoRA strengths: each run picks its own."""
+    clean()
+    _model, dm = _fake_model()
+    fp = H.base_fingerprint(dm)
+
+    def patched(strength, val):
+        m = type("M", (), {})()
+        m.patches = {"diffusion_model.blocks.0.adaln_proj.linear.weight": [
+            (strength, {"lora_A": torch.full((2, 2), val)}, 1.0, None, None)]}
+        return m
+
+    a = H._adaln_lora_fingerprint(patched(1.0, 1.0))
+    b = H._adaln_lora_fingerprint(patched(0.5, 1.0))
+    c = H._adaln_lora_fingerprint(patched(1.0, 2.0))
+    assert len({a, b, c}) == 3, (a, b, c)
+
+    for name, lora in (("a.safetensors", a), ("b.safetensors", b)):
+        H.save_table_smart(
+            [0.0], rows([0.0]),
+            dict(meta(), target_base=fp, adaln_lora_fingerprint=lora,
+                 identity="m1:{}:bf16".format(lora)),
+            "torch.bfloat16", name)
+
+    got_a = H.resolve_for_model(patched(1.0, 1.0), dm, H.AUTO)[0]
+    got_b = H.resolve_for_model(patched(0.5, 1.0), dm, H.AUTO)[0]
+    assert os.path.basename(got_a) == "a.safetensors", got_a
+    assert os.path.basename(got_b) == "b.safetensors", got_b
+
+    for label, m in (("an unrecorded strength", patched(0.8, 1.0)),
+                     ("a different LoRA", patched(1.0, 2.0))):
+        try:
+            H.resolve_for_model(m, dm, H.AUTO)
+        except RuntimeError as e:
+            assert "no table for this model" in str(e), str(e)
+        else:
+            raise AssertionError("{} silently resolved to a table".format(label))
+
+
+check("lookup: same base, different AdaLN LoRA / strength each pick their table",
+      test_auto_separates_lora_and_strength)
+
+
+def test_lora_change_starts_a_new_table():
+    """A schedule change grows one table; an AdaLN LoRA change starts a new one."""
+    clean()
+
+    def md(lora):
+        return dict(meta(), identity="m1:{}:bf16".format(lora or "base"),
+                    adaln_lora_fingerprint=lora or "")
+
+    t1 = [0.0, 0.5, 1.0]
+    p1, action1, _, total1 = H.save_table_smart(
+        t1, rows(t1), md("aaaa"), "torch.bfloat16", "with_lora_a.safetensors")
+    assert action1 == "saved" and total1 == 3
+
+    t2 = [0.5, 0.75, 1.0]
+    p2, action2, added2, total2 = H.save_table_smart(
+        t2, rows(t2), md("aaaa"), "torch.bfloat16", "with_lora_a.safetensors")
+    assert p2 == p1 and action2 == "merged" and added2 == 1 and total2 == 4, \
+        (action2, added2, total2)
+
+    # different LoRA = different modulation values for the SAME t, but a
+    # different identity, so a fresh file instead of a row merge.
+    p3, action3, _, total3 = H.save_table_smart(
+        t1, rows(t1, offset=7.0), md("bbbb"), "torch.bfloat16",
+        "with_lora_b.safetensors")
+    assert action3 == "saved" and p3 != p1 and total3 == 3, (action3, total3)
+    assert len(H.table_io.load_table(p1)[0]) == 4, "old table was modified"
+    assert len(os.listdir(TABLE_DIR)) == 2, os.listdir(TABLE_DIR)
+
+    # if the identity somehow did not change, merging different values is refused
+    try:
+        H.save_table_smart(t1, rows(t1, offset=99.0), md("aaaa"),
+                           "torch.bfloat16", "with_lora_a.safetensors")
+    except RuntimeError as e:
+        assert "different AdaLN values" in str(e), str(e)
+    else:
+        raise AssertionError("two LoRA value sets were merged into one table")
+
+
+check("storage: LoRA change starts a new table; schedule change adds rows",
+      test_lora_change_starts_a_new_table)
 
 shutil.rmtree(TABLE_DIR, ignore_errors=True)
 
