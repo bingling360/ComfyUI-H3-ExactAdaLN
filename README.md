@@ -73,7 +73,8 @@ git clone --depth 1 -b main https://github.com/bingling360/ComfyUI-H3-ExactAdaLN
 - 没有声明 `target_base` 的表（没设 `for_model`、或 v1 旧表）`table=(auto)` **不会**使用：宁可报错也不静默用错教师。请在 `table` 里显式指定一次，或重录时补上 `for_model`。
 - 同一个基座被两张表声明、或一张表都不匹配，都会明确报错并列出表头的 `target_base` 与 LoRA 指纹；`mode=off` 可显式不用表。
 - 不支持逐行 `denoise_mask` 的 timestep、HyperFlow 式 `(t, r)` 端点条件，以及绕过 `module.forward` 的 C++ / 融合 kernel。
-- bX-49 类混合模型：剪枝文件本身是「基座主体 + 捐赠者尾部」，无法直接在它上面录制；请在**完整的 bX-49 教师**上录一次（现成权重：`binglingzhimeng/MiniMax-H3-b25-49-full`）。`H3 AdaLN Hybrid` 拼接两张独立录的表只是近似路径，不是逐位解。
+- **混合模型（b25-49 等）**：剪枝版文件不能直接录制。请在对应的**完整教师**上录一次，现成权重见 [MiniMax-H3-b25-49-full](https://huggingface.co/binglingzhimeng/MiniMax-H3-b25-49-full)。
+- `H3 AdaLN Hybrid` 拼接两张独立录制的表只是近似方案，不是逐位解。追求逐位一致，请用上面的完整教师直接录制。
 - ComfyUI 缓存会制造假 PASS：换模型 / 换表 / 换 mode 后换 seed 或重启再对照。
 
 **附**：详细参数与排错见 [docs/NODE_GUIDE.md](docs/NODE_GUIDE.md)，设计说明见 [docs/unified-node.md](docs/unified-node.md)，[HANDOFF.md](HANDOFF.md) 是历史验证记录（节点行为以本文为准）。CPU 测试：`python tests/test_simple.py`、`tests/test_workflows.py`、`tests/test_merge.py`；`test_exact.py` / `test_runtime.py` 需要 ComfyUI 环境（`COMFYUI_DIR`）。
