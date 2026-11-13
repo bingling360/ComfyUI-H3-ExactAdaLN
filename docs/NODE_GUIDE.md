@@ -495,6 +495,29 @@ Bake 引擎已删除，依赖它们的 01~08 工作流也一并删除。现在 `
 `N row(s) were captured but never saved (the sampling path did not fire ON_CLEANUP)`。
 如果这段采样本身超过 60 s 一步，可能提前存一次不完整的表（下次会继续合并，不影响正确性）。
 
+**apply 侧同理，但更严重**：如果那一段采样用的不是你连进 `H3 AdaLN` 的那个模型
+（例如自定义节点内部重新加载/重建了 UNet），hook 和 wrapper 都不会跑，那段跑的是
+基座原生 AdaLN。报告现在会写：
+
+```
+INJECTION   : FAIL (no forward reached this runtime)
+  problems  : this runtime saw zero forwards. …AdaLN was NOT injected for this pass
+```
+
+看到这句就去查：该链的采样器拿到的是不是这个节点输出的 `model`。
+
+### 7.5.2 一个 diffusion model 上只能有一个 Apply 节点
+
+两个 `H3 AdaLN(apply)` 挂在同一个 UNET 输出上时，后 arm 的会摘掉前一个的 hook
+（否则两个 hook 会叠加、第二个测不到真实 delta）。被摘掉的那个之后会报
+`FAIL (no forward reached this runtime)`，日志里另有
+
+```
+TOOK OVER : another Apply node was already armed on this shared diffusion model
+```
+
+要两条链都注入，就让它们各自接一个 `UNETLoader`（两个独立 model 实例）。
+
 ### 7.6 SelfLift 的 30 dB 残差（不是 bug，别再改插件）
 
 SelfLift 在两段之间插入 clean endpoint → 学习式 `LatentResizer3D` 上采样
