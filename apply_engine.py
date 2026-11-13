@@ -156,7 +156,8 @@ class ExactAdaLNRuntime:
             "match_hits": 0, "match_failures": 0, "match_approx": 0,
             "max_match_distance": 0.0, "last_diag": "",
             "injected": 0, "native_steps": 0, "wrapper_steps": 0,
-            "sigma_misses": 0,
+            "sigma_misses": 0, "max_injection_delta": 0.0,
+            "injection_delta_measured": False,
         }
 
     # -- key construction ------------------------------------------------
@@ -420,6 +421,19 @@ class ExactAdaLNRuntime:
                     key, m, indices, self.state["max_match_distance"])
 
             gathered = self._gather(key, indices, t_emb.device)
+            # Proof that the table actually replaced the base's native AdaLN
+            # output. Only the FIRST hook on a module sees the native tensor;
+            # a second Apply node on the same diffusion model receives the
+            # already-replaced tuple. Never record an unmeasurable case as 0.
+            try:
+                if torch.is_tensor(output) and gathered.shape == output.shape:
+                    d = float((gathered.detach().to(torch.float32)
+                               - output.detach().to(torch.float32)).abs().max())
+                    self.state["max_injection_delta"] = max(
+                        self.state["max_injection_delta"], d)
+                    self.state["injection_delta_measured"] = True
+            except Exception:
+                pass
             x = gathered.reshape(m * module.modalities,
                                  module.expand * module.hidden)
             return x.chunk(module.expand, dim=-1)
@@ -526,6 +540,11 @@ class ExactAdaLNRuntime:
                 self.state["sigma_hits"], self.state["sigma_misses"],
                 self.state["wrapper_steps"]),
             "native steps     : {}".format(self.state["native_steps"]),
+            "max injection Δ  : {}".format(
+                "{:.6e} (table row vs native AdaLN)".format(
+                    self.state["max_injection_delta"])
+                if self.state["injection_delta_measured"]
+                else "UNAVAILABLE (another Apply hook already replaced output)"),
             "last sigma / t   : {} / {}".format(
                 self.state["last_sigma"],
                 ",".join("{:.7f}".format(t) for t in (self.state["last_t"] or [])[:6])

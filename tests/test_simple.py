@@ -420,7 +420,13 @@ def test_record_then_save():
 
     recorder = model._h3_recorder
     H._finish_record(model)
-    assert recorder.handles == [], "record hooks outlived the prompt"
+    # Hooks must survive the FIRST pass's ON_CLEANUP: a director chain runs a
+    # refine pass afterwards with its own sigmas, and those t rows must still
+    # be recorded. The next prompt detaches them via _stop_recording.
+    assert recorder.handles, "recorder hooks were removed before the refine pass"
+    assert model._h3_recorder is recorder
+    H._stop_recording(model)
+    assert recorder.handles == [], "next prompt must detach the old recorder"
     assert model._h3_recorder is None
     files = [f for f in os.listdir(TABLE_DIR) if f.endswith(".safetensors")]
     assert len(files) == 1, files

@@ -503,6 +503,33 @@ def identity_of(model_fp, adaln_fp, out_dtype):
     return "{}:{}:{}".format(model_fp, adaln_fp or "base", _short_dtype(out_dtype))
 
 
+def runtime_signature(model, dm):
+    """Environment that changes the numeric path of the teacher's AdaLN branch.
+
+    Deliberately excludes anything derived from `dm` (the teacher and the
+    pruned base have different structures), so the same value can be computed
+    at record time and at apply time. It is a *staleness hint*, not a proof:
+    only a live teacher re-check can prove the rows still match.
+    """
+    parts = []
+    for fn in (lambda: _nodes._comfy_version(),
+               lambda: torch.__version__,
+               lambda: str(_nodes._model_compute_dtype(model, dm)),
+               lambda: str(_adaln_lora_fingerprint(model)),
+               lambda: str(getattr(dm, "manual_cast_dtype", ""))):
+        try:
+            parts.append(str(fn()))
+        except Exception:
+            parts.append("?")
+    try:
+        import comfy.model_management as mm
+        parts.append(str(getattr(mm, "vram_state", "")))
+        parts.append(str(getattr(mm, "DISABLE_SMART_MEMORY", "")))
+    except Exception:
+        parts.append("?")
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+
+
 def auto_name(dm, model_fp, adaln_fp, out_dtype):
     parts = ["h3", "pruned" if _is_pruned(dm) else "full", model_fp[:6],
              _short_dtype(out_dtype)]
@@ -634,6 +661,23 @@ def save_table_smart(t_values, raw_by_key, meta, out_dtype, name_hint):
         t_all, raw_all, added, meta_old = _union(existing, t_values, raw_by_key,
                                                 out_dtype)
         if not added:
+            # Same schedule -> no new t rows, but a re-record MUST still
+            # refresh the provenance header. Otherwise a legacy table stays
+            # legacy forever (no runtime_signature / shift_source) and the
+            # VERDICT can never certify it, no matter how many times you
+            # re-record. One atomic rewrite, tensor rows unchanged.
+            refresh = ("runtime_signature", "shift_source", "shift_v",
+                       "shift_a", "record_mode", "repeat_conflicts",
+                       "max_repeat_delta")
+            if any(str(meta_old.get(k, "")) != str(meta.get(k, ""))
+                   for k in refresh if k in meta):
+                merged = dict(meta_old)
+                for k in refresh:
+                    if k in meta:
+                        merged[k] = meta[k]
+                merged["runs"] = str(int(meta_old.get("runs", "1") or 1) + 1)
+                _atomic_write(existing, t_all, raw_all, merged, out_dtype)
+                return existing, "header-refreshed", 0, len(t_all)
             return existing, "unchanged", 0, len(t_all)
         merged = dict(meta)
         merged["created"] = meta_old.get("created", meta.get("created", ""))
@@ -666,6 +710,101 @@ def _clear_runtime(model):
         except Exception:
             pass
         model._h3_exact_runtime = None
+
+
+def _verdict(runtime, table, delta, model, dm):
+    """Node-internal audit: did the table actually replace the base's AdaLN?
+
+    This is deliberately layered. The node can *prove* that a teacher-observed
+    row was injected on every step, but it cannot prove that the row still
+    equals today's full teacher without a live teacher reference. Saying
+    "no crash" or "injections=408" as if it proved equivalence is exactly the
+    mistake this report replaces.
+    """
+    st = runtime.state
+    injections, _matched, _failures, native, wrapper = delta
+    missing = sorted(st["missing"])
+    meta = table.meta or {}
+    sampled = injections > 0 or wrapper > 0 or native > 0
+    measured = bool(st.get("injection_delta_measured"))
+    delta_txt = ("{:.6e}".format(st["max_injection_delta"]) if measured
+                 else "UNAVAILABLE")
+
+    injection_problems = []
+    if not sampled:
+        injection_state = "N/A (no sampling in this pass)"
+    else:
+        if injections == 0:
+            injection_problems.append("no table row was injected this pass")
+        if native:
+            injection_problems.append("{} step(s) used the base's native AdaLN".format(native))
+        if missing:
+            injection_problems.append("{} timestep(s) absent from the table".format(len(missing)))
+        if injections and measured and st["max_injection_delta"] <= 0.0:
+            injection_problems.append("injected rows equal native AdaLN (table had no effect)")
+        injection_state = "PASS" if not injection_problems else "FAIL"
+    injection_ok = sampled and not injection_problems
+
+    provenance_problems = []
+    if meta.get("record_mode") != "observed during sampling":
+        provenance_problems.append("table was not observed from a teacher sampling run")
+    if str(meta.get("repeat_conflicts", "0")) != "0":
+        provenance_problems.append("recording had repeat conflicts")
+    try:
+        if float(meta.get("max_repeat_delta", 0) or 0) > 0.0:
+            provenance_problems.append("recording was non-deterministic")
+    except (TypeError, ValueError):
+        pass
+
+    baked_sig = meta.get("runtime_signature", "")
+    current_sig = runtime_signature(model, dm)
+    if not baked_sig:
+        runtime_state = "UNKNOWN (legacy table -- predates runtime signatures)"
+        provenance_problems.append("no runtime signature, equivalence not provable")
+    elif baked_sig != current_sig:
+        runtime_state = "STALE (table={} / now={})".format(baked_sig, current_sig)
+        provenance_problems.append("table was recorded under a different runtime")
+    else:
+        runtime_state = "MATCH ({})".format(baked_sig)
+
+    shift_note = "table header shift {}/{} (source: {})".format(
+        meta.get("shift_v", "?"), meta.get("shift_a", "?"),
+        meta.get("shift_source", "unknown"))
+    if meta.get("shift_source") not in (None, "transformer_options"):
+        shift_note += " -- NOT authoritative, header shift is a fallback"
+
+    provenance_ok = not provenance_problems
+    if not sampled:
+        equivalence = "NOT EVALUATED (no sampling in this pass)"
+    elif injection_ok and provenance_ok:
+        equivalence = ("ESTABLISHED BY CONSTRUCTION: every step injected a row "
+                       "that was observed from the teacher, under a matching "
+                       "runtime. Bitwise equality with the CURRENT full teacher "
+                       "still requires a live teacher re-check.")
+    elif not injection_ok:
+        equivalence = "NOT ESTABLISHED -- the table did not fully replace AdaLN"
+    else:
+        equivalence = ("NOT PROVEN -- re-record on this exact runtime; "
+                       "the existing rows cannot be certified against it")
+
+    def _fmt(items):
+        return ", ".join(items) if items else "none"
+
+    return "\n".join([
+        "  INJECTION   : {} | rows injected={} native={} missing_t={} "
+        "max_injection_delta={}".format(
+            injection_state, injections, native, len(missing), delta_txt),
+        "  problems    : {}".format(_fmt(injection_problems)),
+        "  PROVENANCE  : {} | record_mode={} repeat_conflicts={}".format(
+            "OK" if provenance_ok else "DEGRADED",
+            meta.get("record_mode", "?"), meta.get("repeat_conflicts", "?")),
+        "  problems    : {}".format(_fmt(provenance_problems)),
+        "  RUNTIME     : {}".format(runtime_state),
+        "  SHIFT META  : {}".format(shift_note),
+        "  EQUIVALENCE : {}".format(equivalence),
+        "  NOTE        : this node never claims bitwise equality with the full "
+        "teacher from stats alone; only a teacher-model re-check can.",
+    ])
 
 
 def _inject(model, dm, table):
@@ -702,7 +841,6 @@ def _inject(model, dm, table):
         # can inherit them, so report EVERY invocation with its own pass number
         # and per-pass deltas. That is what shows whether a later pass still
         # injected table rows instead of silently reverting to native AdaLN.
-        # Teardown stays once-only, so runtime behaviour is unchanged.
         st = runtime.state
         snap = (st["injected"], st["match_hits"], st["match_failures"],
                 st["native_steps"], st["wrapper_steps"])
@@ -717,10 +855,14 @@ def _inject(model, dm, table):
                 "  this pass     : injections=%d matched=%d "
                 "match_failures=%d native=%d wrapper_steps=%d",
                 pass_no, runtime.summary(), *delta)
+            logging.info("H3AdaLN: VERDICT [pass %d]\n%s",
+                         pass_no, _verdict(runtime, table, delta, model, dm))
         finally:
-            if pass_no == 1:
-                runtime.remove()
-                runtime.detach_payload()
+            # ON_CLEANUP fires after the FIRST sampling pass, but a director
+            # chain then runs a SECOND pass (refine / custom sigmas) with a
+            # different t set. Removing the hooks here silently drops that
+            # pass from injection and stats. Keep them alive; the next prompt
+            # removes them via _clear_runtime at the start of _inject.
             apply_engine.recover_stale_malloc_graph()
 
     try:
@@ -816,14 +958,45 @@ def _stop_recording(model):
         model._h3_rec_uid = ""
     except Exception:
         pass
+    # Drop the registrations we keep on the *shared* diffusion module. The
+    # hooks are gone after remove(), but leaving the objects in these buckets
+    # makes a later prompt look like it still has live recorders.
+    dm = getattr(model, "_h3_rec_dm", None)
+    if dm is not None:
+        try:
+            dm._h3_recorders = []
+        except Exception:
+            pass
+        try:
+            active = getattr(dm, "_h3_active_recorders", None)
+            if isinstance(active, dict) and uid:
+                active.pop(uid, None)
+        except Exception:
+            pass
 
 
 def _finish_record(model):
-    """ON_CLEANUP: write the rows this run captured."""
-    try:
-        _save_recorded(model)
-    finally:
+    """ON_CLEANUP: write the rows, but KEEP the hooks for later passes.
+
+    A director chain fires ON_CLEANUP after the first sampling pass and then
+    runs a refine pass with its own custom sigmas. Removing the recorder here
+    silently drops those t rows from the table (which is why the second pass
+    later reported 8 missing timesteps). Hooks are detached by the next
+    prompt's stale cleanup instead.
+    """
+    rec = getattr(model, "_h3_recorder", None)
+    if rec is not None and getattr(rec, "abandoned", False):
         _stop_recording(model)
+        return
+    _save_recorded(model)
+    # Keep the hook handles for later passes, but clear the tracking bucket so
+    # the shared module does not accumulate stale objects.
+    dm = getattr(model, "_h3_rec_dm", None)
+    if dm is not None:
+        try:
+            dm._h3_recorders = []
+        except Exception:
+            pass
 
 
 def _save_recorded(model):
@@ -882,12 +1055,23 @@ def _save_recorded(model):
             "adds rows; delete the file and re-record if it gets out of hand.",
             os.path.basename(path), total, os.path.getsize(path) / (1 << 30))
     pin = sigma_plan.f32_image(sigma_plan.VISUAL_COND_TIMESTEP)
-    if not any(abs(t - pin) < 1e-6 for t in table.t_values):
-        logging.warning(
-            "H3AdaLN: %s has no row for t=%.3f -- a later keyframe/reference "
-            "workflow will need one more recording pass (it errors before "
-            "sampling, never silently). Enable fill_reference_row to add it "
-            "automatically.", os.path.basename(path), pin)
+    # Check the MERGED file, not this run's row set. The old check looked at
+    # `table.t_values` (only what this run captured) while the log right above
+    # reports the on-disk total, which produced a false "no row for t=0.999 /
+    # enable fill_reference_row" warning even though the file had the row.
+    saved_t = table.t_values
+    try:
+        saved_t = table_io.load_table(path)[0]
+    except Exception:
+        pass
+    if not any(abs(t - pin) < 1e-6 for t in saved_t):
+        logging.error(
+            "H3AdaLN: %s has no row for t=%.3f after this run (checked the "
+            "merged file, not just this run's rows). Keyframe/reference "
+            "workflows will error before sampling. Re-record with "
+            "fill_reference_row=True and exactly ONE mode=record node (a pin "
+            "failure now aborts the save instead of being silently ignored).",
+            os.path.basename(path), pin)
 
 
 # ---------------------------------------------------------------- nodes
@@ -998,11 +1182,54 @@ class H3AdaLN:
                 stale.remove()
             except Exception:
                 pass
-        # Deliberately do NOT clear other recorders on the shared diffusion
-        # module: a second record node in this same prompt owns its own hook
-        # and must keep it (one recorder per sampling chain). Hooks left by an
-        # earlier run are dropped above, keyed by this node's UNIQUE_ID.
+        # Only the recorder with THIS node id is cleared above. Any other
+        # recorder left on the shared diffusion module (another record node in
+        # this prompt, or a zombie from a failed prompt) is handled below by
+        # taking ownership instead of raising, so the prompt always completes.
 
+        # Two record nodes on one diffusion module used to be allowed. Their
+        # hooks are attached to the SAME nn.Modules, so one recorder's pin
+        # batch is seen by the other as a real forward and the strict row/t
+        # check kills the 0.999 / 1.0 rows. A failed prompt can also leave a
+        # recorder behind (ON_CLEANUP never ran), which is why turning the
+        # second node to `off` did not make this error go away.
+        #
+        # Policy: never raise. There must be exactly one live recorder, so
+        # this node takes ownership by detaching the others (including
+        # zombies). The superseded recorders skip their own save quietly.
+        active = getattr(dm, "_h3_active_recorders", None)
+        if active is None:
+            active = {}
+            try:
+                dm._h3_active_recorders = active
+            except Exception:
+                active = {}
+        live = {k: r for k, r in active.items() if getattr(r, "handles", None)}
+        others = {k: r for k, r in live.items() if k != uid}
+        if others:
+            for k, r in others.items():
+                try:
+                    r.abandon()
+                except Exception:
+                    try:
+                        r.remove()
+                    except Exception:
+                        pass
+                active.pop(k, None)
+                _ACTIVE_RECORDERS.pop(k, None)
+            logging.warning(
+                "H3AdaLN: node %s took over the single recorder slot from %s "
+                "on this shared diffusion model (the earlier hooks were "
+                "detached, including any left by a failed prompt). Only this "
+                "node records now, so the 0.999/1.0 pins stay intact. Set the "
+                "other chain to off/apply to avoid the handover.",
+                uid, ", ".join(sorted(others)))
+        # Hooks now survive ON_CLEANUP for later passes, so the tracking bucket
+        # on the shared module is reset here (the new prompt's start).
+        try:
+            dm._h3_recorders = []
+        except Exception:
+            pass
         pins = ((float(sigma_plan.VISUAL_COND_TIMESTEP),
                  float(sigma_plan.AUDIO_COND_TIMESTEP))
                 if fill_reference_row else ())
@@ -1014,15 +1241,19 @@ class H3AdaLN:
         model._h3_rec_uid = uid
         if uid:
             _ACTIVE_RECORDERS[uid] = recorder
+            if active is not None:
+                active[uid] = recorder
 
         model_fp = model_fingerprint(dm)
         adaln_fp = _adaln_lora_fingerprint(model)
-        shift_v, shift_a = _nodes._auto_shifts(model)
+        shift_v, shift_a, shift_src = _nodes._auto_shifts(model, with_source=True)
         meta = {
             "teacher": "full fp {}".format(model_fp),
             "sigmas": "[]",
             "shift_v": str(float(shift_v)),
             "shift_a": str(float(shift_a)),
+            "shift_source": shift_src,
+            "runtime_signature": runtime_signature(model, dm),
             "visual_aug": str(sigma_plan.VISUAL_COND_TIMESTEP),
             "audio_aug": str(sigma_plan.AUDIO_COND_TIMESTEP),
             "compute_dtype": "recorded",
@@ -1050,8 +1281,8 @@ class H3AdaLN:
         target = _target_of(model)
         report = "\n".join([
             "H3 AdaLN · record",
-            "  teacher : fp {} · {} projections hooked · shift {}/{}".format(
-                model_fp, hooked, "%g" % shift_v, "%g" % shift_a),
+            "  teacher : fp {} · {} projections hooked · shift {}/{} [{}]".format(
+                model_fp, hooked, "%g" % shift_v, "%g" % shift_a, shift_src),
             "  adaln lora : {}".format(adaln_fp or "(none)"),
             "  extra rows : {}".format(
                 "t=%.3f%s pre-computed" % (pins[0], " / t=%.3f" % pins[1] if len(pins) > 1 else "")
@@ -1067,6 +1298,14 @@ class H3AdaLN:
             "  the same file instead of replacing it. Apply finds this table by",
             "  its target fingerprint -- no pick, no 'most recent' guess.",
         ])
+        if shift_src != "transformer_options":
+            logging.warning(
+                "H3AdaLN: shift %g/%g came from %s, NOT from the running "
+                "forward's transformer_options. A MiniMaxH3SigmaShift node placed "
+                "downstream of this node is invisible here, so the printed shift "
+                "is a fallback, not the workflow's shift. Captured t rows are "
+                "unaffected (they come from time_embedder's input).",
+                shift_v, shift_a, shift_src)
         logging.info("%s", report)
         return (model, table, report)
 

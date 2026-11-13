@@ -330,7 +330,12 @@ def test_apply_arms_and_cleanup_unhooks():
     assert len(runtime.hook_handles) == 3, len(runtime.hook_handles)
 
     patcher.cleanup()
-    assert runtime.hook_handles == [], "apply hooks survived cleanup"
+    # Injection hooks deliberately survive the FIRST pass's ON_CLEANUP: a
+    # director chain runs a refine pass afterwards with its own sigmas. The
+    # next prompt detaches them via _clear_runtime.
+    assert len(runtime.hook_handles) == 3, "refine pass must still be hooked"
+    plugin.h3_unified._clear_runtime(patcher)
+    assert runtime.hook_handles == [], "next prompt must detach the runtime"
 
 
 def test_off_clears():

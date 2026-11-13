@@ -27,19 +27,27 @@ CATEGORY = "MiniMaxH3/ExactAdaLN"
 TABLE_TYPE = "H3_ADALN_TABLE"
 
 
-def _auto_shifts(model):
+def _auto_shifts(model, with_source=False):
     """Video/audio shift as model.py:672-673 resolves them.
 
     The DiT reads `transformer_options` first and only then the module
     attribute, so reading `model_sampling` alone can disagree with what the
     forward pass actually used.
+
+    `with_source=True` also returns where the value came from. A director
+    workflow often places MiniMaxH3SigmaShift *downstream* of this node, so at
+    record time transformer_options carries no shift and the old code silently
+    reported the model default (12/3) as if it were the workflow's shift.
     """
+    def _ret(sv, sa, src):
+        return (float(sv), float(sa), src) if with_source else (float(sv), float(sa))
+
     try:
         to = model.model_options.get("transformer_options", {}) or {}
         sv = to.get("minimax_h3_sigma_shift_video")
         sa = to.get("minimax_h3_sigma_shift_audio")
         if sv is not None and sa is not None:
-            return float(sv), float(sa)
+            return _ret(sv, sa, "transformer_options")
     except Exception:
         pass
     try:
@@ -47,14 +55,16 @@ def _auto_shifts(model):
         sv = getattr(dm, "sigma_shift_video", None)
         sa = getattr(dm, "sigma_shift_audio", None)
         if sv is not None and sa is not None:
-            return float(sv), float(sa)
+            return _ret(sv, sa, "model_default_attribute")
     except Exception:
         pass
     try:
         ms = model.get_model_object("model_sampling")
-        return float(getattr(ms, "shift", 12.0)), float(getattr(ms, "audio_shift", 3.0))
+        return _ret(getattr(ms, "shift", 12.0), getattr(ms, "audio_shift", 3.0),
+                    "model_sampling")
     except Exception:
-        return sigma_plan.DEFAULT_VIDEO_SHIFT, sigma_plan.DEFAULT_AUDIO_SHIFT
+        return _ret(sigma_plan.DEFAULT_VIDEO_SHIFT,
+                    sigma_plan.DEFAULT_AUDIO_SHIFT, "hardcoded_default")
 
 
 def _patch_bytes(h, value, depth=0):
