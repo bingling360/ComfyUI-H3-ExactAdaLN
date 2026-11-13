@@ -110,17 +110,40 @@ t_a = 1 − shift(sigma; v, a)        ← sigma 经过一次单调重映射，�
 |---|---|
 | `model` | 必需。录制时挂只读 hook，应用时挂注入 hook |
 | `mode` | `apply`（默认）/ `record` / `off` |
+| `report_level` | `silent` / `brief`（默认）/ `debug`，见 §2.1 |
 | `for_model` | **录制时选一次**：从下拉里选这张表要给哪个剪枝基座用，节点只读它的 AdaLN 张量算指纹并写进表头。没有 `(auto)` 模式 —— 目录里有多个相似基座时只有你知道要用哪个，节点不扫描、不记忆、不猜测。选择会随 workflow 保存 |
-| `table` | 默认 `(auto)`，按表头指纹确定性查找；只有想临时强制用某张表时才动它 |
+| `table` | 默认 `(auto)`，按表头指纹确定性查找；只有想临时强制用某张表时才动它。**显式选文件**是唯一允许「表头 LoRA 指纹与当前模型不一致」的入口，此时报告里会标 `MISMATCH` |
 | `table_in` | 可选连线。同 prompt 做 A/B 时接上一条链录出的表 |
 | `after` | 可选连线。**仅排序**，同 prompt 录→用时接另一条链的 LATENT |
 
-输出：`model`、`table`、`report`（接一个文本显示节点就能看）。
+输出：`model`、`table`、`report`（见下）。
+
+### 2.1 报告：`report_level` 与 `H3 AdaLN Report`
+
+`report` 不再是一段提前算好的字符串，而是一个**活对象**：每段采样结束（`ON_CLEANUP`）时往里追加一段，最后才渲染。所以它能说清「第 1 段注入了几次」「第 2 段的 t 集合变了没有」——这些数在节点执行的那一刻还不存在。
+
+| 级别 | 行为 |
+|---|---|
+| `silent` | 只有错误会打日志。热路径不做任何统计，最省时间 |
+| `brief` | 每段采样一块：注入次数、匹配失败、缺哪些 t、注入增量、PROVENANCE / RUNTIME / EQUIVALENCE 判定 |
+| `debug` | 再加每步 trace（sigma / shift / token 数 / t_emb 形状 / 命中的行号 / 最近距离）、完整计数器、forward 列表，并往 `output/h3_adaln/reports/` 写一份 txt |
+
+想看详细报告：把 `H3 AdaLN` 的 `report` 接到 **`H3 AdaLN Report`** 节点，再把该节点的 `after` 接到采样链的最后（采样器的 LATENT 或解码后的 IMAGE），这样它一定在采样之后才求值。`H3 AdaLN Report` 的输出是普通 STRING，可以接 `Preview Any` / `Show Text`。
+
+> 直接接 `Preview Any` 也可以，但没有 `after` 排序时它可能在采样前就被求值，那时只有「已武装」那段。
+
+报告里每段都会有一行 `PASS DIFF`，比较本段与上一段的 sigma / t 集合 / token 数 / shift —— 二采、SelfLift 这类高低模链路里「第二段到底换了什么」就看这一行。
 
 ### `H3 AdaLN Hybrid`（只有 bX-49 混合模型用）
 
-`model`、`table_a`、`table_b`、`split`。合并结果会落盘并注入当前模型。
-`final_layer` 固定取 A（bX-49 就是这么拼的）。
+`model`、`table_a`、`table_b`、`split`，以及可选的 `final_from`（`a`/`b`，默认 `a`；bX-49 保留 donor 的 `final_layer` 时改成 `b`）、`for_model`（声明这张混合表给哪个基座，好让 apply 的 `(auto)` 找到它）和 `report_level`。合并结果会落盘并注入当前模型。
+
+两张表的 AdaLN LoRA 指纹必须一致，否则直接拒绝合并。
+
+### `H3 AdaLN Report`（调试用）
+
+`report`（接 H3 AdaLN / Hybrid 的输出）、`after`（排序用）、`save_file`（debug 级别时写 txt）。
+输出 `text`（STRING），接 `Preview Any` 或 `Show Text`。
 
 ### `H3 Latent Compare`（验证用）
 
@@ -400,8 +423,9 @@ ComfyUI 0.44.2 / torch 2.12.1 / GTX 1660 SUPER 6GB / 16GB 内存：
 
 | 节点 | 用途 |
 |---|---|
-| `H3 AdaLN` | `record` / `apply` / `off`，日常只需要这一个 |
+| `H3 AdaLN` | `record` / `apply` / `off`，日常只需要这一个；`report_level` 控制报告 |
 | `H3 AdaLN Hybrid` | bX-49 两表合并（见 §4.5，不精确，优先用全量混合教师） |
+| `H3 AdaLN Report` | 把 `report` 活对象渲染成文本，接在采样之后（见 §2.1） |
 | `H3 Latent Compare` | A/B 逐位对照 |
 
 v1 的 Record / Bake / Save / Load / Merge / Apply / LatentSave 节点和离线

@@ -20,6 +20,7 @@ expression in Python float64 produces a t a few ulp away, and TimeEmbedder's
 `t_emb` (and therefore a different table row).
 """
 
+import math
 import struct
 
 import torch
@@ -179,34 +180,52 @@ def runtime_unique_t(sigma_v, layout, shift_v=DEFAULT_VIDEO_SHIFT,
     return sorted({t_v, t_a} | {seg_t[k] for k in kinds})
 
 
-def build_index(table_t, decimals=9, tolerance=1e-6):
+def f32_ulp(value):
+    """Spacing between `value` and the next float32, in float32 units.
+
+    Used to bound the "close enough" window of a t lookup. A fixed 1e-6 was
+    ~17 ulp at t=1.0, which is wide enough to *silently snap a missing
+    timestep onto its neighbour* -- the exact failure mode build_index() is
+    supposed to refuse.
+    """
+    v = abs(float(value))
+    if v == 0.0 or not math.isfinite(v):
+        return 2.0 ** -24
+    _mant, exp = math.frexp(v)
+    return 2.0 ** (exp - 24)
+
+
+def build_index(table_t, decimals=9, tolerance=None, max_ulp=2.0):
     """Map a float t to a table row index.
 
     Keys are the float32 image, so an exact hit is the normal case (the runtime
-    feeds the same float32 value the table was recorded with). `tolerance` only
-    rescues genuine fp round-trips and is deliberately tight: a loose tolerance
-    silently snaps a *missing* timestep onto a neighbouring row, which is the
-    failure mode that makes a wrong table look like a numerical difference.
+    feeds the same float32 value the table was recorded with). The nearest-row
+    fallback only rescues a genuine fp round-trip: the window is `max_ulp`
+    float32 ULPs, not a decimal epsilon, so a *missing* timestep stays missing
+    instead of being snapped onto a neighbouring row.
     """
     coarse = {round(float(t), decimals): i for i, t in enumerate(table_t)}
+    rows = [float(t) for t in table_t]
 
     def lookup(t):
         key = round(float(t), decimals)
         if key in coarse:
             return coarse[key]
+        u = f32_ulp(t)
         best_i, best_d = None, None
-        for i, v in enumerate(table_t):
-            d = abs(float(v) - float(t))
+        for i, v in enumerate(rows):
+            d = abs(v - float(t))
             if best_d is None or d < best_d:
                 best_i, best_d = i, d
-        if best_d is not None and best_d <= tolerance:
-            return best_i
-        return None
+        if best_d is None:
+            return None
+        window = tolerance if tolerance is not None else max_ulp * max(u, f32_ulp(rows[best_i]))
+        return best_i if best_d <= window else None
 
     return lookup
 
 
-def missing_t_values(table_t, wanted, tolerance=1e-6):
+def missing_t_values(table_t, wanted, tolerance=None):
     """Which of `wanted` have no row in `table_t` (diagnostics helper)."""
     lookup = build_index(table_t, tolerance=tolerance)
     return [float(t) for t in wanted if lookup(float(t)) is None]

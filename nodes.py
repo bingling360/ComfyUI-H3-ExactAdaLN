@@ -1,9 +1,10 @@
-"""Shared helpers and the verification node for ComfyUI-H3-ExactAdaLN.
+"""Shared helpers, the report object and the verification nodes.
 
-The plugin exposes three nodes (see h3_unified.py and __init__.py):
+The plugin exposes four nodes (see h3_unified.py and __init__.py):
 
   H3 AdaLN          record / apply / off  -- the only node needed day to day
   H3 AdaLN Hybrid   bX-49 donor merge (only when no full hybrid teacher exists)
+  H3 AdaLN Report   render the live run report after sampling (debug helper)
   H3 Latent Compare A/B verification of two LATENT outputs
 
 Everything that used to live here (Record / Bake / Save / Load / Merge / Apply /
@@ -15,6 +16,8 @@ and the v1 workflows that referenced those nodes are gone.
 import hashlib
 import logging
 import os
+import threading
+import time
 
 import torch
 
@@ -25,6 +28,128 @@ except ImportError:  # pragma: no cover - direct-file loading fallback
 
 CATEGORY = "MiniMaxH3/ExactAdaLN"
 TABLE_TYPE = "H3_ADALN_TABLE"
+REPORT_TYPE = "H3_ADALN_REPORT"
+
+# ---------------------------------------------------------------- reporting
+# Three levels, because the two goals are opposites:
+#
+#   silent  nothing is logged and almost nothing is collected -- the hot path
+#           (one forward hook per projection per step) must not pay for
+#           diagnostics that nobody reads.
+#   brief   one block per sampling pass: what was injected, what was not.
+#   debug   per-forward traces, key distances, timings, per-section dumps.
+#
+# The same object is handed downstream as the node's `report` output, so a
+# preview node placed after sampling renders exactly what the console got --
+# and can render it *later*, when the numbers actually exist.
+REPORT_LEVELS = ("silent", "brief", "debug")
+
+
+class Report:
+    """Append-only diagnostic log shared between a node and its cleanup hook."""
+
+    def __init__(self, title, level="brief"):
+        self.title = str(title)
+        self.level = level if level in REPORT_LEVELS else "brief"
+        self.created = time.time()
+        self._order = []
+        self._data = {}
+        self._lock = threading.Lock()
+
+    @property
+    def debug(self):
+        return self.level == "debug"
+
+    @property
+    def silent(self):
+        return self.level == "silent"
+
+    def add(self, section, text="", debug_only=False):
+        if self.level == "silent":
+            return
+        if debug_only and self.level != "debug":
+            return
+        with self._lock:
+            bucket = self._data.get(section)
+            if bucket is None:
+                bucket = []
+                self._data[section] = bucket
+                self._order.append(section)
+            bucket.append(str(text))
+
+    def extend(self, section, lines, debug_only=False):
+        for line in lines:
+            self.add(section, line, debug_only)
+
+    def sections(self):
+        with self._lock:
+            return list(self._order)
+
+    def render(self, max_lines=6000):
+        if self.silent:
+            return ("{}: report_level=silent -- diagnostics are off "
+                    "(set report_level to brief or debug to see them)").format(self.title)
+        head = [self.title,
+                "  level={}  started={}  elapsed={:.1f}s".format(
+                    self.level,
+                    time.strftime("%H:%M:%S", time.localtime(self.created)),
+                    time.time() - self.created),
+                ""]
+        out = list(head)
+        for section in self._order:
+            body = self._data.get(section) or []
+            if not body:
+                continue
+            out.append("[{}]".format(section))
+            out.extend(body)
+            out.append("")
+        if len(out) > max_lines:
+            out = out[:max_lines] + ["... truncated at {} lines".format(max_lines)]
+        return "\n".join(out).rstrip()
+
+    def __str__(self):
+        return self.render()
+
+    def __contains__(self, item):
+        # Keeps `"something" in node_output[2]` working -- callers (and tests)
+        # used to get a plain string here.
+        return str(item) in self.render()
+
+    def __len__(self):
+        return len(self.render())
+
+    def log(self, logger_name="H3AdaLN"):
+        """Print the whole report so far -- used once, at node execution."""
+        if self.silent:
+            return
+        logging.getLogger(logger_name).info("%s", self.render())
+
+    def log_section(self, section, logger_name="H3AdaLN"):
+        """Print one section. Passes log themselves, so the console gets each
+        pass once instead of re-printing everything before it."""
+        if self.silent:
+            return
+        with self._lock:
+            body = list(self._data.get(section) or [])
+        if not body:
+            return
+        logging.getLogger(logger_name).info(
+            "%s [%s]\n%s", self.title, section, "\n".join(body))
+
+
+def report_folder():
+    """Where debug-level report files land (created on demand)."""
+    try:
+        import folder_paths
+        base = os.path.join(folder_paths.get_output_directory(), "h3_adaln", "reports")
+    except Exception:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "reports")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        return None
+    return base
 
 
 def _auto_shifts(model, with_source=False):
@@ -312,7 +437,6 @@ class H3LatentCompare:
         if same_source:
             lines.append("WARNING: both LATENT inputs resolve to the same tensor "
                          "objects -- check the wiring")
-        if same_source:
             verdict = ("INCONCLUSIVE - both LATENT inputs resolve to the same "
                        "tensor objects; a self-comparison always looks bitwise")
         elif compared == 0:
@@ -347,10 +471,76 @@ class H3LatentCompare:
         return {"ui": {"text": [report]}, "result": (report,)}
 
 
+class H3AdaLNReport:
+    """Render the live run report produced by H3 AdaLN / H3 AdaLN Hybrid.
+
+    The heavy numbers (injections per pass, which t rows were used, max match
+    distance, whether a later pass silently reverted to native AdaLN) only exist
+    *after* sampling. So the H3 AdaLN node cannot put them in a STRING at
+    execution time -- it hands out a live report object instead, and this node
+    turns it into text once the graph has actually run.
+
+    Connect `after` to whatever is last (the sampler's LATENT, or the decoded
+    image) so ComfyUI schedules this node at the end. Without `after` it may be
+    evaluated before sampling and report only the arming step.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "report": (REPORT_TYPE, {
+                    "tooltip": "The `report` output of H3 AdaLN / Hybrid."}),
+            },
+            "optional": {
+                "after": ("*", {"tooltip":
+                                "Ordering only: connect the last node's output "
+                                "(sampler LATENT / decoded image) so this report "
+                                "is rendered AFTER sampling."}),
+                "save_file": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Write a .txt next to the ComfyUI output folder "
+                               "when report_level=debug."}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+    CATEGORY = CATEGORY
+
+    def run(self, report, after=None, save_file=True):
+        if report is None:
+            text = ("H3 AdaLN report: nothing was passed in. Connect the "
+                    "`report` output of H3 AdaLN / H3 AdaLN Hybrid.")
+        elif hasattr(report, "render"):
+            text = report.render()
+        else:
+            text = str(report)
+
+        if save_file and getattr(report, "debug", False):
+            folder = report_folder()
+            if folder:
+                try:
+                    path = os.path.join(folder, "report_{}_{}.txt".format(
+                        "debug", time.strftime("%Y%m%d_%H%M%S")))
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(text + "\n")
+                    text += "\n\nreport file: {}".format(path)
+                except Exception as e:  # noqa: BLE001
+                    logging.warning("H3AdaLNReport: cannot write report file: %s", e)
+
+        logging.info("%s", text)
+        return {"ui": {"text": [text]}, "result": (text,)}
+
+
 NODE_CLASS_MAPPINGS = {
+    "H3AdaLNReport": H3AdaLNReport,
     "H3LatentCompare": H3LatentCompare,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "H3AdaLNReport": "H3 AdaLN Report (after sampling)",
     "H3LatentCompare": "H3 Latent Compare (verification)",
 }

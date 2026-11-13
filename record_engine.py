@@ -88,7 +88,7 @@ class AdaLNRecorder:
     """Live, read-only capture of AdaLN rows keyed by the float32 timestep."""
 
     def __init__(self, model, dm, mode="strict", tag="", te_override=None,
-                 pin_targets=()):
+                 pin_targets=(), full_check_forwards=2):
         self.model = model
         self.dm = dm
         # Timesteps the run itself may never produce but a later workflow can ask
@@ -105,6 +105,9 @@ class AdaLNRecorder:
         self.pin_errors = {}    # pin t -> why the pre-computation failed
         self.pin_skipped = set()  # pins this run produced by itself
         self.abandoned = False  # another record node took over our module
+        self.sealed = False     # hooks detached; nothing more will be captured
+        self.saved_once = False  # a save already happened for this prompt
+        self.passes = 0         # ON_CLEANUP invocations that produced a save
         # Optional override when a caller swapped `time_embedder` for another
         # checkpoint's; the hook must land on the object the forward will
         # actually run, not on the original module.
@@ -119,12 +122,25 @@ class AdaLNRecorder:
         self.forwards = 0
         self.finished_t = []
         self.conflicts = 0
+        self.conflict_detail = []   # (t, key, delta) -- which block disagreed
         self.max_repeat_delta = 0.0
         self.sigma_seen = []
         self.errors = []
+        self.warnings = []
         self._cur_t = None
         self._cur_forward = -1
         self._canary_key = None
+        # Comparing the same t on EVERY projection costs a full device->host
+        # copy of all 51 rows, so it is done for the first N forwards only:
+        # that is where a mid-run AdaLN change shows up. Afterwards only the
+        # canary block is cross-checked, which is free.
+        self.full_check_forwards = max(1, int(full_check_forwards))
+        self.compared = 0
+        self.skipped = 0
+        self.forward_trace = []     # [(forward idx, [t...], n_rows)]
+        self.trace_cap = 64
+        self._labels_cache = None
+        self.pins_report = ""
 
     # -- registration ----------------------------------------------------
     def register(self):
@@ -162,6 +178,18 @@ class AdaLNRecorder:
         ON_CLEANUP; `_finish_record` checks this flag and quietly skips it.
         """
         self.abandoned = True
+        self.remove()
+
+    def seal(self):
+        """Detach for good: this recorder will not capture another row.
+
+        ON_CLEANUP fires once per sampling pass, so the hooks have to survive
+        the first one (a director chain runs a refine pass afterwards). But a
+        recorder that outlives its prompt keeps writing rows into a dict that
+        is never saved, and -- because `mode="strict"` used to raise -- could
+        abort a completely unrelated prompt. Sealing is the explicit end.
+        """
+        self.sealed = True
         self.remove()
 
     # -- hooks -----------------------------------------------------------
@@ -227,10 +255,21 @@ class AdaLNRecorder:
                     "H3AdaLN: cannot pre-compute %s at t=%.3f (%s: %s); "
                     "this run will NOT be saved", key, pin, type(e).__name__, e)
 
-    def _fail(self, message):
+    def _fail(self, message, fatal=None):
+        """Record a problem, and raise only while this recorder is authoritative.
+
+        After the first save the hooks may still be attached for a later pass
+        of the same prompt -- but they also survive into unrelated prompts that
+        happen to sample the same diffusion module. Raising there crashed a
+        prompt that had nothing to do with recording, so past the first save a
+        strict recorder reports instead of raising.
+        """
         self.errors.append(message)
-        if self.mode == "strict":
+        if fatal is None:
+            fatal = (self.mode == "strict") and not self.saved_once
+        if fatal:
             raise RuntimeError(message)
+        self.warnings.append(message)
         logging.warning("H3AdaLN: %s", message)
 
     def _linear_hook(self, key, ap, expected):
@@ -272,16 +311,27 @@ class AdaLNRecorder:
                 self._fail("H3AdaLN: dtype changed mid-run ({} -> {})"
                            .format(self.out_dtype, output.dtype))
 
-            labels = [sigma_plan.f32_image(t) for t in t_values]
+            labels = self._labels(t_values)
             new_rows = [i for i, t in enumerate(labels) if key not in self.rows.get(t, {})]
-            check_rows = [i for i, t in enumerate(labels)
-                          if key == self._canary_key and t in self.rows and key in self.rows[t]]
-            if not new_rows and not check_rows:
+            repeat_rows = [i for i, t in enumerate(labels)
+                           if t in self.rows and key in self.rows[t]]
+            # Past the warm-up forwards a projection that has nothing new to
+            # learn only needs the canary cross-check, and even that is skipped
+            # for the other 50 blocks -- copying 336 MB per forward to re-check
+            # rows that never change is what made recording slow.
+            cold = self.forwards > self.full_check_forwards
+            if not new_rows and (key != self._canary_key or cold):
+                self.skipped += 1
+                return None
+            if not new_rows and not repeat_rows:
+                self.skipped += 1
                 return None
 
-            # One bulk device->host copy per projection instead of one per row:
-            # the first forward moves ~336 MB (51 x [T, 96768] fp32) and every
-            # later forward only the canary projection.
+            if key == self._canary_key and len(self.forward_trace) < self.trace_cap:
+                self.forward_trace.append(
+                    (self._cur_forward, tuple(round(t, 7) for t in t_values[:8]), m))
+
+            # One bulk device->host copy per projection instead of one per row.
             rows_cpu = output.detach().to(torch.float32).to("cpu")
             if new_rows and self._canary_key == key:
                 logging.info("H3AdaLN: first rows captured at t=%s",
@@ -292,17 +342,31 @@ class AdaLNRecorder:
                 slot[key] = rows_cpu[i]
                 if len(slot) == 1:
                     self.t_order.append(t)
-            for i in check_rows:
-                # The same t must produce the same row on every step / every
-                # CFG pass. A non-zero delta means the run is not deterministic
-                # and the table would be a coin flip, so surface it instead of
-                # silently keeping sample 1.
+            # The same t must produce the same row on every step / every CFG
+            # pass, for EVERY block -- a LoRA or a weight change that only
+            # touches blocks 20..49 left blocks.0 identical, so a canary-only
+            # check reported "0 conflicts" and silently kept sample 1.
+            if cold and key != self._canary_key:
+                repeat_rows = []
+            for i in repeat_rows:
                 delta = float((self.rows[labels[i]][key] - rows_cpu[i]).abs().max())
+                self.compared += 1
                 if delta > 0.0:
                     self.conflicts += 1
                     self.max_repeat_delta = max(self.max_repeat_delta, delta)
+                    if len(self.conflict_detail) < 8:
+                        self.conflict_detail.append((labels[i], key, delta))
             return None
         return hook
+
+    def _labels(self, t_values):
+        """float32 image of the current forward's timesteps, cached per forward."""
+        cached = self._labels_cache
+        if cached is not None and cached[0] == self._cur_forward:
+            return cached[1]
+        labels = [sigma_plan.f32_image(t) for t in t_values]
+        self._labels_cache = (self._cur_forward, labels)
+        return labels
 
     # -- results ---------------------------------------------------------
     def build(self):
@@ -346,6 +410,8 @@ class AdaLNRecorder:
             self.rows[key_t] = dict(entries)
             self.t_order.append(key_t)
 
+        self.pins_report = self._pins_report()
+
         t_values = sorted(self.rows)
         raw = {}
         for key in self.proj_keys:
@@ -368,15 +434,39 @@ class AdaLNRecorder:
         }
         return t_values, raw, extra
 
+    def _pins_report(self):
+        parts = []
+        for pin in self.pin_targets:
+            if pin in self.pin_skipped:
+                state = "produced by this run"
+            elif sigma_plan.f32_image(pin) in self.rows:
+                state = "captured"
+            elif pin in self.pinned:
+                state = "pre-computed"
+            else:
+                state = "MISSING"
+            parts.append("t={:.3f} {}".format(pin, state))
+        return ", ".join(parts) if parts else "off (fill_reference_row=False)"
+
     def summary(self):
-        return "\n".join([
-            "recorder         : {} projections hooked".format(len(self.proj_keys)),
+        rows = sorted(self.rows)
+        lines = [
+            "recorder         : {} projections hooked (canary {})".format(
+                len(self.proj_keys), self._canary_key),
             "forwards seen    : {}".format(self.forwards),
-            "distinct t rows  : {}".format(len(self.rows)),
+            "distinct t rows  : {}".format(len(rows)),
             "recorded dtype   : {}".format(self.out_dtype or "(not yet)"),
-            "repeat conflicts : {} (max_delta={:.3e})".format(
-                self.conflicts, self.max_repeat_delta),
-            "t values         : {}".format(
-                ", ".join("{:.7f}".format(t) for t in sorted(self.rows)[:10]) +
-                (" ..." if len(self.rows) > 10 else "") or "none yet"),
-        ])
+            "repeat conflicts : {} (max_delta={:.3e}, {} re-compared, {} skipped)".format(
+                self.conflicts, self.max_repeat_delta, self.compared, self.skipped),
+        ]
+        if self.conflict_detail:
+            lines.append("conflict detail  : {}".format(
+                "; ".join("t={:.7f} {} d={:.3e}".format(t, k, d)
+                          for t, k, d in self.conflict_detail[:4])))
+        lines.append("t values         : {}".format(
+            ", ".join("{:.7f}".format(t) for t in rows[:12]) +
+            (" ... ({} more)".format(len(rows) - 12) if len(rows) > 12 else "")
+            or "none yet"))
+        if self.pins_report:
+            lines.append("pinned rows      : {}".format(self.pins_report))
+        return "\n".join(lines)

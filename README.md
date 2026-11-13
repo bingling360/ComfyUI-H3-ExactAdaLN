@@ -23,9 +23,12 @@ H3 的 AdaLN 分支输出只依赖 timestep：`modulation = adaln_proj(time_embe
 
 | 节点 | 输入 | 作用 |
 |---|---|---|
-| `H3 AdaLN` | `model`, `mode` (`apply` / `record` / `off`), `for_model`, `table`, 可选 `table_in` / `after` | 录制表、注入表、直通对照，三合一 |
-| `H3 AdaLN Hybrid` | `model`, `table_a`, `table_b`, `split` | bX-49 混合教师：按块拼接两张表（仅这一种模型用） |
+| `H3 AdaLN` | `model`, `mode` (`apply` / `record` / `off`), `report_level`, `for_model`, `table`, 可选 `table_in` / `after` | 录制表、注入表、直通对照，三合一 |
+| `H3 AdaLN Hybrid` | `model`, `table_a`, `table_b`, `split`, 可选 `final_from` / `for_model` / `report_level` | bX-49 混合教师：按块拼接两张表（仅这一种模型用） |
+| `H3 AdaLN Report` | `report`（接上两个节点的输出）, 可选 `after` | 采样结束后渲染详细运行报告，输出 STRING |
 | `H3 Latent Compare` | 两个 LATENT | 输出 `equal` / `max_abs` / `PSNR`，验证是否逐位一致 |
+
+`report_level` 三档：`silent`（只报错，最省时间）/ `brief`（每段采样一块结论）/ `debug`（每步 trace + 完整计数器 + 落 txt）。想在不改动工作流的情况下看详细报告，把 `report` 接到 `H3 AdaLN Report`，并把它的 `after` 接到采样链末端。
 
 表的行为：
 

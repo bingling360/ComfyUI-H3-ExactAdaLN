@@ -27,14 +27,64 @@ FORMAT = "h3_exact_adaln/v2"
 LEGACY_FORMATS = ("h3_exact_adaln/v1",)
 BLOCK_PREFIX = "blocks."
 FINAL_KEY = "final_layer"
+# sha256("")[:16] -- what a pre-2026-11 recorder wrote when the model had no
+# AdaLN LoRA. Normalised to "" so old and new tables compare equal.
+EMPTY_DIGEST = "e3b0c44298fc1c14"
+
+
+def _adaln_fp_of(meta):
+    """The AdaLN-LoRA digest of a table, from either header generation.
+
+    v2 recorders write `adaln_lora_fingerprint`. The merge check used to read
+    `lora_fingerprint`, a key nothing ever wrote, so `"" == ""` made every
+    merge pass -- two tables recorded under different AdaLN LoRAs merged
+    silently. Read the field that exists, and treat a missing one as empty.
+    """
+    if "adaln_lora_fingerprint" in meta:
+        fp = meta.get("adaln_lora_fingerprint") or ""
+    elif "lora_fingerprint" in meta:
+        fp = meta.get("lora_fingerprint") or ""   # v1 / pre-2026-11 header
+    else:
+        fp = ""
+    fp = str(fp)
+    return "" if fp == EMPTY_DIGEST else fp
+
+
+def _lora_identity(meta):
+    """(weight_digest, key_digest, raw_digest) for a header, any generation.
+
+    Three header generations exist and the merge check has to cope with all of
+    them, because a bX-49 hybrid is assembled from whatever recordings happen
+    to be on disk:
+
+      v2   `adaln_lora_fingerprint`            weight-aware, no key digest
+      mid  `lora_fingerprint` = weight digest,
+           `lora_fingerprint_keys`            key digest alongside
+      v1   `lora_fingerprint` = key digest     names only
+
+    A lone `lora_fingerprint` cannot be told apart as weight- or name-digest,
+    so `raw_digest` carries it: if both sides literally agree on it, that is
+    as much proof as either generation can offer.
+    """
+    raw = str(meta.get("lora_fingerprint") or "")
+    raw = "" if raw == EMPTY_DIGEST else raw
+    if "adaln_lora_fingerprint" in meta:
+        return _adaln_fp_of(meta), "", raw
+    keys = str(meta.get("lora_fingerprint_keys") or "")
+    keys = "" if keys == EMPTY_DIGEST else keys
+    if keys:
+        return raw, keys, raw
+    return "", raw, raw
 
 
 class AdaLNTable:
     """In-memory value passed between nodes as the H3_ADALN_TABLE type.
 
-    A table produced by Record starts out *live*: the node hands the sampler a
-    recorder handle and the rows only exist once sampling has run. `finalize()`
-    pulls them in; every consumer calls it before touching the data.
+    A table produced by Record stays *live*: the node hands the sampler a
+    recorder handle and the rows only exist once sampling has run.
+    `finalize()` pulls them in and can be called again after a later sampling
+    pass has captured more timesteps -- a director chain fires ON_CLEANUP once
+    per pass, and each pass must be able to add its rows.
     """
 
     def __init__(self, t_values, raw_by_key, meta, source=None, recorder=None):
@@ -43,25 +93,36 @@ class AdaLNTable:
         self.meta = dict(meta)
         self.source = source
         self.recorder = recorder
+        self._pulled_rows = 0
 
     @property
     def is_live(self):
-        return self.recorder is not None and not self.raw_by_key
+        return self.recorder is not None
 
     def finalize(self, required=True):
-        """Materialise a live (recording) table. Idempotent."""
-        if not self.is_live:
-            return self
+        """Materialise (or refresh) a live table. Safe to call repeatedly."""
         rec = self.recorder
-        if not rec.rows:
+        if rec is None:
+            return self
+        rows = len(getattr(rec, "rows", {}) or {})
+        if rows == 0:
             if required:
                 rec.build()  # raises with the actionable message
+            return self
+        if self.raw_by_key and rows == self._pulled_rows:
             return self
         t_values, raw, extra = rec.build()
         self.t_values = t_values
         self.raw_by_key = raw
         self.meta.update(extra)
         self.meta["t_count"] = str(len(t_values))
+        # `build()` may add the pinned rows, so the row count that now matters is
+        # the one after the build, not the one that triggered it.
+        self._pulled_rows = len(getattr(rec, "rows", {}) or {})
+        return self
+
+    def release(self):
+        """Drop the recorder handle once this table will not grow any more."""
         self.recorder = None
         return self
 
@@ -83,15 +144,16 @@ class AdaLNTable:
             "format       : {}".format(meta.get("format", FORMAT)),
             "source       : {}".format(self.source or "(in-memory, not saved yet)"),
             "teacher      : {}".format(meta.get("teacher", "?")),
-            "provenance   : {}".format(meta.get("record_mode", "offline bake")),
-            "lora tag     : {}".format(meta.get("lora_tag", "?")),
-            "lora fp      : {} ({} non-AdaLN keys)".format(
-                meta.get("lora_fingerprint", "?"), meta.get("lora_patch_count", "?")),
+            "provenance   : {}".format(meta.get("record_mode", "?")),
+            "identity     : {}".format(meta.get("identity", "?")),
+            "adaln lora fp: {}".format(meta.get("adaln_lora_fingerprint") or "none"),
+            "target base  : {}".format(meta.get("target_base") or "none"),
             "sigmas       : {}".format(str(meta.get("sigmas", "[]"))[:180]),
             "shift_v/a    : {} / {}".format(meta.get("shift_v", "?"), meta.get("shift_a", "?")),
             "compute dtype: {}".format(meta.get("compute_dtype", "?")),
             "out dtype    : {}".format(self.out_dtype),
-            "t rows       : {}".format(rows if not self.is_live else "(live recorder)"),
+            "t rows       : {}{}".format(
+                rows, "  (live recorder, may grow)" if self.is_live else ""),
             "projections  : {}".format(self.projections()),
             "table size   : {:.1f} MiB".format(self.size_bytes() / (1 << 20)),
         ])
@@ -188,26 +250,32 @@ def merge_tables(table_a, table_b, split=25, final_from="a"):
             "H3AdaLN: out_dtype differs (A={} B={}); re-record both tables "
             "with the same teacher dtype".format(a.out_dtype, b.out_dtype))
 
-    fp_a = a.meta.get("lora_fingerprint", "")
-    fp_b = b.meta.get("lora_fingerprint", "")
-    keys_a = a.meta.get("lora_fingerprint_keys", "")
-    keys_b = b.meta.get("lora_fingerprint_keys", "")
-    same_fp = (not fp_a or not fp_b or fp_a == fp_b)
-    if keys_a and keys_b:
-        # Both tables carry the weight-aware digest: compare it strictly, so a
-        # different LoRA with the same key set is still rejected.
-        fp_ok = same_fp
+    wa, ka, ra = _lora_identity(a.meta)
+    wb, kb, rb = _lora_identity(b.meta)
+    if not (wa or ka or ra) and not (wb or kb or rb):
+        fp_ok, fp_a, fp_b = True, "", ""          # neither declares an AdaLN LoRA
+    elif ra and rb and ra == rb:
+        fp_ok, fp_a, fp_b = True, ra, rb          # same literal digest
+    elif wa and wb:
+        fp_ok, fp_a, fp_b = (wa == wb), wa, wb    # both weight-aware: strict
+    elif ka and kb:
+        fp_ok, fp_a, fp_b = (ka == kb), ka, kb    # both name-only: compare names
     else:
-        # One side predates the weight-aware digest. Accept an identical
-        # digest, otherwise fall back to the key-name digest (older tables
-        # store that value in `lora_fingerprint`).
-        key_a, key_b = (keys_a or fp_a), (keys_b or fp_b)
-        fp_ok = same_fp or (not key_a or not key_b or key_a == key_b)
+        # Mixed generations: accept only if a value both sides actually carry
+        # agrees. Otherwise the two sides cannot be shown to match.
+        common_a = {v for v in (wa, ka, ra) if v}
+        common_b = {v for v in (wb, kb, rb) if v}
+        fp_ok = bool(common_a & common_b)
+        fp_a, fp_b = (wa or ka or ra), (wb or kb or rb)
     if not fp_ok:
         raise RuntimeError(
-            "H3AdaLN: LoRA fingerprint differs (A: fp={} keys={} | "
-            "B: fp={} keys={}); both tables must be recorded with the same "
-            "LoRA stack and strength".format(fp_a, keys_a, fp_b, keys_b))
+            "H3AdaLN: the two tables were recorded with different AdaLN/timestep "
+            "LoRAs (A: fp={} | B: fp={} | A: {} | B: {}). Blocks from the two "
+            "sides would not describe the same modulation, so the merged table "
+            "would be wrong everywhere except at t=0. Re-record both on their "
+            "full teachers with the same LoRA stack.".format(
+                fp_a or "none", fp_b or "none",
+                a.meta.get("teacher", "?"), b.meta.get("teacher", "?")))
 
     try:
         from . import sigma_plan
@@ -272,12 +340,26 @@ def merge_tables(table_a, table_b, split=25, final_from="a"):
         # as-is, and only the former matches the assembled hybrid.
         "hybrid_te_from_a": a.meta.get("time_embedder_from", ""),
         "hybrid_te_from_b": b.meta.get("time_embedder_from", ""),
-        "hybrid_lora_fp_a": keys_a or fp_a,
-        "hybrid_lora_fp_b": keys_b or fp_b,
+        "hybrid_lora_fp_a": fp_a,
+        "hybrid_lora_fp_b": fp_b,
         "t_count": str(len(a.t_values)),
         "out_dtype": a.out_dtype,
         "format": FORMAT,
     })
+    # A hybrid table replaces a *bX-49* checkpoint, which is neither A nor B.
+    # Inheriting A's target_base made the hybrid claim to be the table of A's
+    # pruned base -- so `table=(auto)` on that base found two tables and
+    # refused, and the hybrid could never be found for the file it is for.
+    for _key in ("target_base", "target_name", "target_bases"):
+        meta.pop(_key, None)
+    # Only a weight-aware digest may be written back as `adaln_lora_fingerprint`;
+    # a v1 key-name digest there would then be compared against a v2 model
+    # fingerprint and refuse every apply.
+    weight_fp = wa or wb
+    if weight_fp:
+        meta["adaln_lora_fingerprint"] = weight_fp
+    else:
+        meta.pop("adaln_lora_fingerprint", None)
     return AdaLNTable(a.t_values, merged, meta)
 
 

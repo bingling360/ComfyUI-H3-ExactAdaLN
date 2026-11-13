@@ -125,6 +125,7 @@
         0
       ],
       "mode": "apply",
+      "report_level": "brief",
       "fill_reference_row": true,
       "table": "(auto)"
     },

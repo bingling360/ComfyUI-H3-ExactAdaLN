@@ -134,6 +134,7 @@
         0
       ],
       "mode": "record",
+      "report_level": "brief",
       "for_model": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
       "fill_reference_row": true,
       "table": "(auto)"
@@ -240,6 +241,7 @@
         0
       ],
       "mode": "apply",
+      "report_level": "brief",
       "fill_reference_row": true,
       "table": "(auto)",
       "table_in": [

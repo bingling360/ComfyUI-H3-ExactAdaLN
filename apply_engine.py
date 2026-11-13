@@ -96,33 +96,18 @@ def _parse_dtype(name):
 
 
 # ---------------------------------------------------------------------------
-# Device-side table rows live here, owned by the module, NOT by a runtime.
+# Why no cache of the whole table on the GPU
 #
-# Why: ComfyUI fires ON_CLEANUP from model_patcher.cleanup() while DynamicVRAM
-# is unloading / streaming weights. Freeing a CUDA tensor at that moment calls
-# cudaFreeAsync on an allocator whose pool/stream may already be torn down;
-# the C++ tensor destructor then throws c10::AcceleratorError. An exception
-# thrown from a destructor cannot be caught by any Python try/except and ends
-# in std::terminate -> SIGABRT -> the entire ComfyUI process dies (and the
-# browser loses its websocket). Observed on 0.44 + cudaMallocAsync, especially
-# after an interrupted run.
+# The ~446 MB table is never uploaded whole. `_gather` copies only the 1-2 rows
+# a step needs (a few MB) straight from the CPU copy, so nothing large is
+# allocated inside comfy-aimdo's malloc graph -- a first-use upload there shows
+# up as a "rogue" allocation and breaks the compiled prefetch graph.
 #
-# Sharing one cache also keeps VRAM flat: two Apply nodes (first pass + refine)
-# used to allocate two full ~446 MB copies and free both during cleanup.
-_SHARED_GPU = {"key": None, "rows": {}, "keys": {}}
-
-
-def _gpu_cache(identity, device, out_dtype):
-    d = torch.device(device)
-    dev = "{}:{}".format(d.type, d.index if d.index is not None else 0)
-    ck = (str(identity), dev, str(out_dtype))
-    if _SHARED_GPU["key"] != ck:
-        # Reached from a forward hook, i.e. while a node is executing with a
-        # live CUDA context -- a safe point to retire the previous table.
-        _SHARED_GPU["rows"] = {}
-        _SHARED_GPU["keys"] = {}
-        _SHARED_GPU["key"] = ck
-    return _SHARED_GPU["rows"], _SHARED_GPU["keys"], ck
+# It also means no CUDA tensor is owned by this module, so there is nothing to
+# free from ON_CLEANUP. That matters: cleanup can run while DynamicVRAM is
+# tearing down the allocator, and freeing a CUDA tensor at that moment makes the
+# C++ destructor throw, which ends in std::terminate -> SIGABRT -> the whole
+# ComfyUI process dies. Keeping the rows on the host sidesteps it entirely.
 
 
 class ExactAdaLNRuntime:
@@ -141,11 +126,6 @@ class ExactAdaLNRuntime:
         self.audio_aug = float(meta.get("audio_aug", sigma_plan.AUDIO_COND_TIMESTEP))
         self.previous_patch = None
         self.hook_handles = []
-        # Identity of the GPU-side cache shared by every runtime using this table.
-        self._gpu_identity = "{}|{}|{}".format(
-            meta.get("identity", ""), len(t_values), meta.get("created", ""))
-        self._shared_key = None
-        self._device_cache = {}
         self._key_specs, self.match_mode = self._discover_key_sets(dm)
         self._key_cache = {}
         self.use_match = bool(self._key_specs)
@@ -158,7 +138,20 @@ class ExactAdaLNRuntime:
             "injected": 0, "native_steps": 0, "wrapper_steps": 0,
             "sigma_misses": 0, "max_injection_delta": 0.0,
             "injection_delta_measured": False,
+            # Diagnostics that only the report reads. Kept as plain numbers so
+            # the hot path pays nothing for them beyond an int increment.
+            "last_segs": 0, "last_tokens": 0, "per_row_timestep": False,
+            "layout_changes": 0, "shift_changes": 0, "hook_seconds": 0.0,
+            "first_dist": None, "first_key": None, "gather_bytes": 0,
+            "last_shift": None,
         }
+        self.trace = []            # one entry per forward, blocks.0 only
+        self.trace_cap = 96
+        self._trace_key = ("blocks.0" if "blocks.0" in raw_by_key
+                           else (next(iter(raw_by_key)) if raw_by_key else ""))
+        self._last_report = (0, 0, 0, 0, 0)
+        self._report_count = 0
+        self._pass_sig = None
 
     # -- key construction ------------------------------------------------
     def _discover_key_sets(self, dm):
@@ -177,18 +170,8 @@ class ExactAdaLNRuntime:
                 modes.append("time-embedder ({}-wide)".format(width))
         return specs, " + ".join(modes) if modes else "unavailable"
 
-    def _attach_shared(self, device):
-        """Bind to the process-wide GPU cache (never freed from cleanup)."""
-        rows, keys, ck = _gpu_cache(self._gpu_identity, device, self.out_dtype)
-        if self._shared_key == ck:
-            return
-        self._device_cache = rows
-        self._key_cache = keys
-        self._shared_key = ck
-
     def _keys_for(self, t_emb):
         """Per-row keys on t_emb's device/dtype, or None if width is unknown."""
-        self._attach_shared(t_emb.device)
         width = int(t_emb.shape[-1])
         kind = self._key_specs.get(width)
         if kind is None:
@@ -223,11 +206,15 @@ class ExactAdaLNRuntime:
         keys, kind = self._keys_for(t_emb)
         if keys is None:
             return None, float("inf"), 0.0, "no key set for width {}".format(t_emb.shape[-1])
-        x = t_emb.detach().to(torch.float32)
+        x = t_emb.detach()
         if x.ndim != 2 or x.shape[-1] != keys.shape[-1]:
             return None, float("inf"), 0.0, "shape {} vs keys {}".format(
                 tuple(x.shape), tuple(keys.shape))
-        dist = torch.cdist(x, keys)
+        # Both sides must be in ONE dtype: torch.cdist refuses mixed input, and
+        # casting only t_emb to float32 while the keys stayed bf16 raised
+        # "expected scalar type Float but found BFloat16" on the very first
+        # step. bf16 -> fp32 is lossless, so the distance stays exact.
+        dist = torch.cdist(x.to(torch.float32), keys.to(torch.float32))
         idx = dist.argmin(dim=1)
         mind = dist.gather(1, idx[:, None]).squeeze(1)
         # float32 rounding only; anything above one ulp of the key magnitude is
@@ -243,8 +230,36 @@ class ExactAdaLNRuntime:
         layout = payload.get("layout")
         if layout is None:
             layout = (transformer_options or {}).get("minimax_h3_layout")
+        # Diagnostics for the second pass. A refine / SelfLift step changes the
+        # token count (higher resolution) while keeping the same t grid, so a
+        # mismatch here separates "the schedule moved" from "only the picture
+        # got bigger" -- two failures that used to look identical.
+        segs = getattr(layout, "segments", None) or []
+        tokens = 0
+        for item in segs:
+            try:
+                tokens += int(item[1]) - int(item[0])
+            except (TypeError, IndexError, ValueError):
+                pass
+        if segs and self.state["last_segs"] and (
+                len(segs), tokens) != (self.state["last_segs"], self.state["last_tokens"]):
+            self.state["layout_changes"] += 1
+        self.state["last_segs"] = len(segs)
+        self.state["last_tokens"] = tokens
+        if torch.is_tensor(timestep) and timestep.numel() > 1:
+            flat = timestep.detach().flatten()
+            if float(flat.max()) != float(flat.min()):
+                # Per-row timesteps (denoise_mask) are not reconstructable from
+                # one sigma; only the t_emb match handles them. Say so instead
+                # of silently mapping every row with row 0's timestep.
+                self.state["per_row_timestep"] = True
         sigma = sigma_plan.sigma_from_timestep(timestep)
         shift_v, shift_a = sigma_plan.shifts_from_options(transformer_options, self.dm)
+        prev_shift = self.state.get("last_shift")
+        if prev_shift is not None and (
+                abs(prev_shift[0] - shift_v) > 1e-9 or abs(prev_shift[1] - shift_a) > 1e-9):
+            self.state["shift_changes"] += 1
+        self.state["last_shift"] = (shift_v, shift_a)
         unique_t = sigma_plan.runtime_unique_t(
             sigma, layout, shift_v, shift_a, self.visual_aug, self.audio_aug)
         indices = [self.lookup(t) for t in unique_t]
@@ -341,16 +356,6 @@ class ExactAdaLNRuntime:
         rows = self.raw_by_key[key].index_select(0, idx)
         return rows.to(device=device, dtype=self.out_dtype).contiguous()
 
-    def _raw(self, key, device):
-        """Legacy whole-table accessor. No longer used by the forward hook."""
-        self._attach_shared(device)
-        cached = self._device_cache.get(key)
-        if cached is not None and cached.device == device:
-            return cached
-        tensor = self.raw_by_key[key].to(device=device, dtype=self.out_dtype).contiguous()
-        self._device_cache[key] = tensor
-        return tensor
-
     def _strict_error(self, key, t_emb, detail):
         missing = sorted(self.state["missing"])
         rows = ["H3AdaLN: cannot map {} rows to table rows.".format(
@@ -380,6 +385,8 @@ class ExactAdaLNRuntime:
             m = int(t_emb.shape[0])
             indices = None
             detail = ""
+            how = "native"
+            maxd, tol, note = float("inf"), 0.0, ""
 
             if self.use_match:
                 indices, maxd, tol, note = self._match_indices(t_emb)
@@ -387,6 +394,7 @@ class ExactAdaLNRuntime:
                     self.state["max_match_distance"], maxd)
                 if indices is not None and maxd <= tol:
                     self.state["match_hits"] += 1
+                    how = "exact" if maxd == 0.0 else "approx"
                     if maxd > 0.0:
                         self.state["match_approx"] += 1
                 else:
@@ -404,8 +412,11 @@ class ExactAdaLNRuntime:
                 if fallback is not None and len(fallback) == m:
                     indices = fallback
                     self.state["sigma_hits"] += 1
+                    how = "sigma-fallback"
                 else:
                     detail = self.state["last_diag"] or "no key set and no sigma mapping"
+
+            self._trace(key, t_emb, indices, maxd, tol, how, note)
 
             if indices is None or len(indices) != m:
                 self.state["native_steps"] += 1
@@ -414,30 +425,70 @@ class ExactAdaLNRuntime:
                 return None
 
             self.state["injected"] += 1
-            if self.state["injected"] == 1:
+            if self.state["first_key"] is None:
+                # Report the distance of THIS hook, not the running maximum over
+                # all 51 (which was already contaminated by later blocks).
+                self.state["first_key"] = key
+                self.state["first_dist"] = maxd
                 logging.info(
                     "H3AdaLN: first injection confirmed during sampling "
-                    "(%s, %d rows, indices=%s, max_dist=%.3e)",
-                    key, m, indices, self.state["max_match_distance"])
+                    "(%s, %d rows, indices=%s, max_dist=%.3e, via %s)",
+                    key, m, indices, maxd, how)
 
             gathered = self._gather(key, indices, t_emb.device)
-            # Proof that the table actually replaced the base's native AdaLN
-            # output. Only the FIRST hook on a module sees the native tensor;
-            # a second Apply node on the same diffusion model receives the
-            # already-replaced tuple. Never record an unmeasurable case as 0.
-            try:
-                if torch.is_tensor(output) and gathered.shape == output.shape:
-                    d = float((gathered.detach().to(torch.float32)
-                               - output.detach().to(torch.float32)).abs().max())
-                    self.state["max_injection_delta"] = max(
-                        self.state["max_injection_delta"], d)
-                    self.state["injection_delta_measured"] = True
-            except Exception:
-                pass
             x = gathered.reshape(m * module.modalities,
                                  module.expand * module.hidden)
-            return x.chunk(module.expand, dim=-1)
+            out = x.chunk(module.expand, dim=-1)
+            # Proof that the table actually replaced the base's native AdaLN
+            # output. AdalnProj returns a TUPLE of chunks, not a tensor, so the
+            # old `torch.is_tensor(output)` test never matched and the delta was
+            # permanently "UNAVAILABLE" on the real model.
+            self._measure_delta(key, output, out)
+            return out
         return _outside_malloc_graph(hook)
+
+    def _measure_delta(self, key, old, new):
+        """Record |table row - base AdaLN| for this step, if measurable."""
+        if torch.is_tensor(old) and torch.is_tensor(new):
+            pairs = [(old, new)]
+        elif isinstance(old, (tuple, list)) and isinstance(new, (tuple, list)) \
+                and len(old) == len(new):
+            pairs = [(a, b) for a, b in zip(old, new)
+                     if torch.is_tensor(a) and torch.is_tensor(b)]
+        else:
+            return
+        delta = 0.0
+        for a, b in pairs:
+            if a.shape != b.shape:
+                return
+            delta = max(delta, float((b.detach().to(torch.float32)
+                                      - a.detach().to(torch.float32)).abs().max()))
+        if not pairs:
+            return
+        self.state["max_injection_delta"] = max(
+            self.state["max_injection_delta"], delta)
+        self.state["injection_delta_measured"] = True
+
+    def _trace(self, key, t_emb, indices, maxd, tol, how, note):
+        """One report line per forward -- recorded on the first projection only."""
+        self.state["last_emb_width"] = int(t_emb.shape[-1])
+        if key != self._trace_key or len(self.trace) >= self.trace_cap:
+            return
+        self.trace.append({
+            "forward": self.state["wrapper_steps"],
+            "module": key,
+            "rows": int(t_emb.shape[0]),
+            "width": int(t_emb.shape[-1]),
+            "indices": list(indices) if indices is not None else None,
+            "max_dist": float(maxd),
+            "tol": float(tol),
+            "how": how,
+            "note": note,
+            "sigma": self.state.get("last_sigma"),
+            "tokens": self.state.get("last_tokens"),
+            "segs": self.state.get("last_segs"),
+            "shift": self.state.get("last_shift"),
+        })
 
     # -- registration ------------------------------------------------------
     def register(self, model, use_sigma_wrapper=True, use_dit_patch=False):
@@ -490,12 +541,9 @@ class ExactAdaLNRuntime:
             except Exception:
                 pass
         self.hook_handles = []
-        # Detach, do NOT clear. These dicts are the module-wide GPU cache;
-        # clearing them inside ON_CLEANUP destroys CUDA tensors and can abort
-        # the whole process (see the note above _SHARED_GPU).
-        self._device_cache = {}
+        # Key tensors are per-runtime and cheap; dropping the reference is
+        # enough (nothing here owns a CUDA allocation).
         self._key_cache = {}
-        self._shared_key = None
         # Drop the wrapper too: re-running Apply on the same MODEL object would
         # otherwise stack one wrapper per run, each holding a dead runtime.
         model = getattr(self, "_wrapper_model", None)
@@ -515,41 +563,96 @@ class ExactAdaLNRuntime:
                 pass
             self._wrapper_model = None
 
+    def begin_pass(self):
+        """Close out one sampling pass; returns this pass's counter deltas.
+
+        Called from ON_CLEANUP, i.e. once per sampling call, so a director
+        chain reports pass 1 and pass 2 separately instead of one cumulative
+        blob where a pass that injected nothing hides inside the total.
+        """
+        snap = (self.state["injected"], self.state["match_hits"],
+                self.state["match_failures"], self.state["native_steps"],
+                self.state["wrapper_steps"])
+        prev = self._last_report
+        self._last_report = snap
+        self._report_count += 1
+        return [b - a for a, b in zip(prev, snap)]
+
     def detach_payload(self):
         """Drop heavy references; ON_CLEANUP callbacks are never unregistered."""
         self.raw_by_key = {}
         self.dm = None
         self.meta = {}
 
+    def seal(self):
+        """Detach the hooks AND release the table rows.
+
+        A runtime that is never re-armed otherwise keeps its ~335 MB host copy
+        alive through the ON_CLEANUP closure forever -- four applies in one
+        session was a 1.3 GB leak.
+        """
+        self.remove()
+        self.detach_payload()
+
+    def trace_lines(self, limit=None):
+        """Per-forward mapping trace, for the debug report."""
+        out = []
+        for i, item in enumerate(self.trace[:limit] if limit else self.trace):
+            sigma = item.get("sigma")
+            shift = item.get("shift")
+            out.append(
+                "step {:<3} {:<10} sigma={} shift={}/{} tokens={} segs={} "
+                "t_emb={}x{} -> rows={} {} max_dist={:.3e}".format(
+                    item["forward"], item["how"],
+                    "{:.7f}".format(sigma) if isinstance(sigma, float) else sigma,
+                    "{:g}".format(shift[0]) if shift else "?",
+                    "{:g}".format(shift[1]) if shift else "?",
+                    item.get("tokens"), item.get("segs"),
+                    item.get("rows"), item.get("width"),
+                    item.get("indices"), "" if item["how"] != "approx"
+                    else "(nearest)", item.get("max_dist", 0.0)))
+        if len(self.trace) >= self.trace_cap:
+            out.append("... trace truncated at {} forwards".format(self.trace_cap))
+        return out
+
     def summary(self):
-        return "\n".join([
+        st = self.state
+        lines = [
             "mode             : {}".format(self.mode),
             "injection mode   : {}".format(self.match_mode),
             "t rows in table  : {}".format(len(self.t_values)),
             "projections      : {}".format(
                 getattr(self, "_projections", len(self.raw_by_key))),
             "out dtype        : {}".format(self.out_dtype),
-            "exact matches    : {}".format(self.state["match_hits"] -
-                                           self.state["match_approx"]),
-            "injections       : {}".format(self.state["injected"]),
+            "exact matches    : {}".format(st["match_hits"] - st["match_approx"]),
             "approx matches   : {} (max_dist={:.3e})".format(
-                self.state["match_approx"], self.state["max_match_distance"]),
-            "match failures   : {}".format(self.state["match_failures"]),
-            "last diagnostic  : {}".format(self.state["last_diag"] or "none"),
+                st["match_approx"], st["max_match_distance"]),
+            "match failures   : {}".format(st["match_failures"]),
+            "injections       : {}".format(st["injected"]),
+            "native steps     : {}".format(st["native_steps"]),
             "sigma fallbacks  : {} hit / {} miss (wrapper steps {})".format(
-                self.state["sigma_hits"], self.state["sigma_misses"],
-                self.state["wrapper_steps"]),
-            "native steps     : {}".format(self.state["native_steps"]),
-            "max injection Δ  : {}".format(
-                "{:.6e} (table row vs native AdaLN)".format(
-                    self.state["max_injection_delta"])
-                if self.state["injection_delta_measured"]
+                st["sigma_hits"], st["sigma_misses"], st["wrapper_steps"]),
+            "first injection  : {} at max_dist={}".format(
+                st["first_key"], "?" if st["first_dist"] is None
+                else "{:.3e}".format(st["first_dist"])),
+            "max injection D  : {}".format(
+                "{:.6e} (table row vs native AdaLN)".format(st["max_injection_delta"])
+                if st["injection_delta_measured"]
                 else "UNAVAILABLE (another Apply hook already replaced output)"),
             "last sigma / t   : {} / {}".format(
-                self.state["last_sigma"],
-                ",".join("{:.7f}".format(t) for t in (self.state["last_t"] or [])[:6])
+                st["last_sigma"],
+                ",".join("{:.7f}".format(t) for t in (st["last_t"] or [])[:6])
                 or "none"),
+            "last layout      : {} segments, {} tokens".format(
+                st["last_segs"], st["last_tokens"]),
+            "layout changes   : {}  shift changes: {}".format(
+                st["layout_changes"], st["shift_changes"]),
+            "per-row t        : {}".format(
+                "YES (denoise_mask: only the t_emb match is reliable)"
+                if st["per_row_timestep"] else "no"),
+            "last diagnostic  : {}".format(st["last_diag"] or "none"),
             "missing t values : {}".format(
-                ", ".join("{:.7f}".format(t) for t in sorted(self.state["missing"])[:12])
+                ", ".join("{:.7f}".format(t) for t in sorted(st["missing"])[:12])
                 or "none"),
-        ])
+        ]
+        return "\n".join(lines)

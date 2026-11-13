@@ -20,6 +20,7 @@ loaded. Tables written by the test are removed again at the end.
 """
 
 import importlib.util
+import logging
 import os
 import shutil
 import sys
@@ -106,13 +107,18 @@ def patcher_for(dm):
 
 
 def feed(dm, t_list):
-    """One AdaLN pass: what the DiT does per denoising step."""
+    """One AdaLN pass: what the DiT does per denoising step.
+
+    Calls `adaln_proj(...)`, not `adaln_proj.linear(...)`: that is the real
+    call site (it applies silu and returns chunks), and it is the one the apply
+    hook replaces. Recording hooks the inner linear, so both fire here.
+    """
     t = torch.tensor(t_list, dtype=torch.float32)
     dtype = dm.blocks[0].adaln_proj.linear.weight.dtype
     emb = dm.time_embedder(t).to(dtype)  # model.py:751 does exactly this cast
     for block in dm.blocks:
-        block.adaln_proj.linear(emb)
-    dm.final_layer.adaln_proj.linear(emb)
+        block.adaln_proj(emb)
+    dm.final_layer.adaln_proj(emb)
 
 
 FOLDER = os.path.join(folder_paths.models_dir, "h3_exact_adaln")
@@ -147,7 +153,8 @@ def test_registration():
     assert "H3AdaLN" in plugin.NODE_CLASS_MAPPINGS
     assert "H3AdaLNHybrid" in plugin.NODE_CLASS_MAPPINGS
     spec_i = H.INPUT_TYPES()
-    assert list(spec_i["required"]) == ["model", "mode"], list(spec_i["required"])
+    assert list(spec_i["required"]) == ["model", "mode", "report_level"], \
+        list(spec_i["required"])
     assert list(spec_i["optional"]) == ["for_model", "fill_reference_row",
                                       "table", "table_in", "after"]
     assert os.path.isdir(FOLDER), "register_folder() did not create {}".format(FOLDER)
@@ -334,8 +341,110 @@ def test_apply_arms_and_cleanup_unhooks():
     # director chain runs a refine pass afterwards with its own sigmas. The
     # next prompt detaches them via _clear_runtime.
     assert len(runtime.hook_handles) == 3, "refine pass must still be hooked"
+    assert "[pass 1]" in report, report          # per-pass audit exists
+    assert "INJECTION" in report and "EQUIVALENCE" in report, report
+    assert "no sampling in this pass" in report, report
+
+    patcher.cleanup()
+    assert "[pass 2]" in report, "a second pass must get its own section"
+    assert "PASS DIFF" in report, report
+
     plugin.h3_unified._clear_runtime(patcher)
     assert runtime.hook_handles == [], "next prompt must detach the runtime"
+    assert not runtime.raw_by_key, "next prompt must release the table rows"
+
+
+def test_apply_hook_end_to_end():
+    """Drive the real AdalnProj.forward so the hook, cdist and delta all run.
+
+    This is the path the tests used to skip: recording hooks `.linear`, so a
+    fixture that only called `.linear` never exercised the injection hook -- and
+    the injection hook crashed on the first step because torch.cdist refuses a
+    float32 query against bf16 keys.
+    """
+    dm = tiny_model(seed=777)
+    patcher = patcher_for(dm)
+    _, table, _rep = H().run(patcher, "record", fill_reference_row=False)
+    feed(dm, [1.0, 0.5])
+    patcher.cleanup()
+    name = os.path.basename(table.source)
+    assert name.endswith(".safetensors"), name
+
+    _, _t, rep = H().run(patcher, "apply", table=name, report_level="debug")
+    feed(dm, [1.0, 0.5])
+    patcher.cleanup()
+
+    assert "injected=3" in rep, rep          # 2 blocks + final_layer
+    assert "exact=3" in rep, rep
+    assert "max delta : UNAVAILABLE" not in rep, rep
+    assert "NOT ESTABLISHED" not in rep, rep
+    plugin.h3_unified._clear_runtime(patcher)
+
+
+def test_two_passes_are_both_saved():
+    """ON_CLEANUP fires per pass; a refine pass must add rows, not be dropped."""
+    before = set(os.listdir(TABLE_DIR))
+    dm = tiny_model(seed=909)
+    patcher = patcher_for(dm)
+    _, _table, report = H().run(patcher, "record", fill_reference_row=False)
+    feed(dm, [1.0, 0.5])
+    patcher.cleanup()                      # pass 1
+    feed(dm, [0.25, 0.1])                  # refine pass, different t
+    patcher.cleanup()                      # pass 2
+
+    new = sorted(set(os.listdir(TABLE_DIR)) - before)
+    assert len(new) == 1, new
+    t_values = plugin.table_io.load_table(os.path.join(TABLE_DIR, new[0]))[0]
+    assert len(t_values) == 4, t_values
+    assert "pass 2" in report, report
+    assert "merged" in str(report) or "saved" in str(report), report
+
+
+def test_lora_mismatch_is_reported_not_silent():
+    base, _path = student()
+    path, _why = plugin.h3_unified.resolve_for_model(
+        patcher_for(base), base, plugin.h3_unified.AUTO)
+    table = plugin.table_io.read_table_file(path)
+    table.meta["adaln_lora_fingerprint"] = "deadbeefdeadbeef"
+
+    patcher = patcher_for(base)
+    try:
+        plugin.h3_unified._inject(patcher, base, table)
+    except RuntimeError as e:
+        assert "LoRA" in str(e), str(e)
+    else:
+        raise AssertionError("a table with a foreign AdaLN LoRA was injected silently")
+
+    rep = plugin.nodes.Report("t", "brief")
+    plugin.h3_unified._inject(patcher, base, table, rep, allow_lora_mismatch=True)
+    assert "MISMATCH" in rep, rep
+    plugin.h3_unified._clear_runtime(patcher)
+
+
+def test_silent_level_stays_silent():
+    base, _path = student()
+    patcher = patcher_for(base)
+    seen = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    root = logging.getLogger()
+    handler = Capture()
+    old_level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        _, _, rep = H().run(patcher, "apply", table=plugin.h3_unified.AUTO,
+                            report_level="silent")
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(old_level)
+    assert "diagnostics are off" in str(rep), str(rep)
+    noise = [m for m in seen if m.startswith("H3AdaLN:")]
+    assert not noise, noise
+    plugin.h3_unified._clear_runtime(patcher)
 
 
 def test_off_clears():
@@ -391,6 +500,14 @@ for name, fn in [
      test_missing_reference_row_is_reported),
     ("apply: resolves by declared base, hooks, cleanup unhooks",
      test_apply_arms_and_cleanup_unhooks),
+    ("record: a second sampling pass adds rows instead of losing them",
+     test_two_passes_are_both_saved),
+    ("apply: real AdalnProj forward is replaced (cdist + delta)",
+     test_apply_hook_end_to_end),
+    ("apply: a foreign AdaLN LoRA is refused, not injected silently",
+     test_lora_mismatch_is_reported_not_silent),
+    ("report: report_level=silent emits nothing",
+     test_silent_level_stays_silent),
     ("off: drops a live runtime", test_off_clears),
     ("hybrid: merges two real tables and injects",
      test_hybrid_merges_two_real_tables),

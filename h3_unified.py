@@ -26,8 +26,16 @@ existed to work around something the node can decide by itself:
 
 What is left:
 
-  H3 AdaLN          model, mode, for_model, table, [table_in], [after]
-  H3 AdaLN Hybrid   model, table_a, table_b, split            bX-49 donor merge
+  H3 AdaLN          model, mode, report_level, for_model, table,
+                    [table_in], [after]
+  H3 AdaLN Hybrid   model, table_a, table_b, split, [final_from],
+                    [for_model], [report_level]        bX-49 donor merge
+
+`report_level` (silent / brief / debug) decides how much the run says. The
+`report` output is a live object rather than a string: the numbers that matter
+(injections per pass, which t rows a later pass used, whether a refine pass
+silently reverted to native AdaLN) only exist after sampling. Feed it to
+`H3 AdaLN Report` with its `after` input wired to the end of the graph.
 
 The invariant that makes this enough:
 
@@ -56,6 +64,7 @@ except ImportError:  # direct-file loading / tests
 
 FOLDER_KEY = "h3_exact_adaln"
 TABLE_TYPE = _nodes.TABLE_TYPE
+REPORT_TYPE = _nodes.REPORT_TYPE
 TABLE_EXT = ".safetensors"
 AUTO = "(auto)"
 NONE = "(none)"
@@ -69,6 +78,9 @@ NONE = "(none)"
 # tolerance is safe and makes re-recording possible.
 CONFLICT_TOL = 1e-6
 LOW_PRECISION_TOL = 2e-4
+# How many ON_CLEANUP saves one record run may make. A director chain has two
+# or three passes; anything beyond that is a recorder that outlived its prompt.
+MAX_RECORD_PASSES = 8
 
 _AFTER_DOC = ("Ordering only, nothing is read from it. Connect the sampler's "
               "LATENT here when a table is produced and consumed inside one "
@@ -267,7 +279,7 @@ def resolve_for_model(model, dm, choice):
         return mine[0], "declared for this model"
     if len(mine) > 1:
         raise RuntimeError(
-            "H3AdaLN: {} tables are all declared for this model://n  {}\n"
+            "H3AdaLN: {} tables are all declared for this model:\n  {}\n"
             "That means two teachers were recorded for the same base. Keep one, "
             "or pick the one you want in `table`.".format(
                 len(mine), "\n  ".join(os.path.basename(p) for p in mine)))
@@ -503,6 +515,9 @@ def identity_of(model_fp, adaln_fp, out_dtype):
     return "{}:{}:{}".format(model_fp, adaln_fp or "base", _short_dtype(out_dtype))
 
 
+SIG_VERSION = "sig2"
+
+
 def runtime_signature(model, dm):
     """Environment that changes the numeric path of the teacher's AdaLN branch.
 
@@ -510,8 +525,15 @@ def runtime_signature(model, dm):
     pruned base have different structures), so the same value can be computed
     at record time and at apply time. It is a *staleness hint*, not a proof:
     only a live teacher re-check can prove the rows still match.
+
+    It must also exclude everything that varies between two ordinary sessions.
+    `vram_state` used to be in here, and it is a process-global decided from
+    whatever VRAM happened to be free at startup -- so recording on Monday and
+    applying on Tuesday reported STALE for a perfectly good table, and the
+    verdict became noise. The version prefix lets an old signature be reported
+    as "legacy" instead of "mismatch".
     """
-    parts = []
+    parts = [SIG_VERSION]
     for fn in (lambda: _nodes._comfy_version(),
                lambda: torch.__version__,
                lambda: str(_nodes._model_compute_dtype(model, dm)),
@@ -521,13 +543,11 @@ def runtime_signature(model, dm):
             parts.append(str(fn()))
         except Exception:
             parts.append("?")
-    try:
-        import comfy.model_management as mm
-        parts.append(str(getattr(mm, "vram_state", "")))
-        parts.append(str(getattr(mm, "DISABLE_SMART_MEMORY", "")))
-    except Exception:
-        parts.append("?")
-    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+    # The version prefix is part of the RETURNED value, not only of the hashed
+    # input: the audit compares `baked.startswith(SIG_VERSION)` to tell "this
+    # table predates the current signature rules" from "this table is stale".
+    return "{}-{}".format(SIG_VERSION, hashlib.sha1(
+        "|".join(parts).encode()).hexdigest()[:10])
 
 
 def auto_name(dm, model_fp, adaln_fp, out_dtype):
@@ -668,7 +688,12 @@ def save_table_smart(t_values, raw_by_key, meta, out_dtype, name_hint):
             # re-record. One atomic rewrite, tensor rows unchanged.
             refresh = ("runtime_signature", "shift_source", "shift_v",
                        "shift_a", "record_mode", "repeat_conflicts",
-                       "max_repeat_delta")
+                       "max_repeat_delta",
+                       # Re-recording the same teacher for a DIFFERENT base used
+                       # to leave the old declaration in place (the identity does
+                       # not include target_base), so the table silently kept
+                       # pointing at the previous checkpoint.
+                       "target_base", "target_name", "target_bases")
             if any(str(meta_old.get(k, "")) != str(meta.get(k, ""))
                    for k in refresh if k in meta):
                 merged = dict(meta_old)
@@ -702,33 +727,86 @@ def save_table_smart(t_values, raw_by_key, meta, out_dtype, name_hint):
 
 
 # ---------------------------------------------------------------- runtime
-def _clear_runtime(model):
-    _nodes._clear_registered(model, "_h3_exact_runtimes")
-    if getattr(model, "_h3_exact_runtime", None) is not None:
+def _clear_runtime(model, seal=True):
+    """Detach (and by default release) every runtime this model still carries."""
+    rt = getattr(model, "_h3_exact_runtime", None)
+    if rt is not None:
         try:
-            model._h3_exact_runtime.remove()
+            rt.seal() if seal else rt.remove()
         except Exception:
             pass
         model._h3_exact_runtime = None
+    dm = _nodes._dm_of(model)
+    for obj in list(getattr(dm, "_h3_exact_runtimes", []) or []):
+        if obj is rt:
+            continue
+        try:
+            obj.seal() if seal else obj.remove()
+        except Exception:
+            pass
+    _nodes._clear_registered(model, "_h3_exact_runtimes")
 
 
-def _verdict(runtime, table, delta, model, dm):
-    """Node-internal audit: did the table actually replace the base's AdaLN?
+def _set_callback_once(model, key, fn):
+    """Register exactly ONE ON_CLEANUP callback under `key`, replacing the old.
 
-    This is deliberately layered. The node can *prove* that a teacher-observed
-    row was injected on every step, but it cannot prove that the row still
-    equals today's full teacher without a live teacher reference. Saying
-    "no crash" or "injections=408" as if it proved equivalence is exactly the
-    mistake this report replaces.
+    ComfyUI's `add_callback` only appends and nothing ever removes, so a fresh
+    closure per apply meant four applies in one session left four callbacks --
+    each holding an ExactAdaLNRuntime with its ~335 MB host copy of the table,
+    and each printing a stale verdict on every later run. Writing into the
+    callback dict by key is what ComfyUI itself does; `add_callback` stays as
+    the fallback for builds that do not expose `callbacks`.
     """
+    try:
+        import comfy.patcher_extension as pe
+        bucket = model.callbacks.setdefault(pe.CallbacksMP.ON_CLEANUP, {})
+        bucket[key] = [fn]
+        return True
+    except Exception:
+        try:
+            model.add_callback(pe.CallbacksMP.ON_CLEANUP, fn)
+            return False
+        except Exception:
+            return False
+
+
+def _pass_signature(runtime):
+    """What a single pass looked like -- used to diff pass 1 against pass 2."""
     st = runtime.state
-    injections, _matched, _failures, native, wrapper = delta
+    shift = st.get("last_shift")
+    last = runtime.trace[-1] if runtime.trace else {}
+    return {
+        "sigma": st.get("last_sigma"),
+        "t": tuple(round(t, 7) for t in (st.get("last_t") or ())),
+        "rows": last.get("rows"),
+        "tokens": st.get("last_tokens"),
+        "segs": st.get("last_segs"),
+        "shift": shift,
+        "width": last.get("width") or st.get("last_emb_width"),
+    }
+
+
+def _describe_pass(sig):
+    if not sig:
+        return "none"
+    shift = sig.get("shift")
+    return ("sigma={} rows={} t={} tokens={} segs={} shift={}/{}".format(
+        "{:.7f}".format(sig["sigma"]) if isinstance(sig["sigma"], float) else "?",
+        sig.get("rows"),
+        ",".join("{:.7f}".format(t) for t in sig["t"][:6]) or "?",
+        sig["tokens"], sig["segs"],
+        "{:g}".format(shift[0]) if shift else "?",
+        "{:g}".format(shift[1]) if shift else "?"))
+
+
+def _audit(runtime, table, delta, model, dm, lora_mismatch=False, pass_no=1):
+    """Audit one sampling pass. Returns (lines, summary dict)."""
+    st = runtime.state
+    injections, matched, failures, native, wrapper = delta
     missing = sorted(st["missing"])
     meta = table.meta or {}
     sampled = injections > 0 or wrapper > 0 or native > 0
     measured = bool(st.get("injection_delta_measured"))
-    delta_txt = ("{:.6e}".format(st["max_injection_delta"]) if measured
-                 else "UNAVAILABLE")
 
     injection_problems = []
     if not sampled:
@@ -737,17 +815,23 @@ def _verdict(runtime, table, delta, model, dm):
         if injections == 0:
             injection_problems.append("no table row was injected this pass")
         if native:
-            injection_problems.append("{} step(s) used the base's native AdaLN".format(native))
+            injection_problems.append(
+                "{} step(s) used the base's native AdaLN".format(native))
         if missing:
-            injection_problems.append("{} timestep(s) absent from the table".format(len(missing)))
-        if injections and measured and st["max_injection_delta"] <= 0.0:
-            injection_problems.append("injected rows equal native AdaLN (table had no effect)")
+            injection_problems.append(
+                "{} timestep(s) absent from the table".format(len(missing)))
+        if lora_mismatch:
+            injection_problems.append(
+                "table was recorded under a different AdaLN LoRA")
         injection_state = "PASS" if not injection_problems else "FAIL"
     injection_ok = sampled and not injection_problems
 
     provenance_problems = []
-    if meta.get("record_mode") != "observed during sampling":
-        provenance_problems.append("table was not observed from a teacher sampling run")
+    record_mode = str(meta.get("record_mode", ""))
+    merged = record_mode.startswith("merged from two recorded tables")
+    if record_mode != "observed during sampling" and not merged:
+        provenance_problems.append(
+            "table provenance is {!r}, not an observed teacher run".format(record_mode))
     if str(meta.get("repeat_conflicts", "0")) != "0":
         provenance_problems.append("recording had repeat conflicts")
     try:
@@ -756,77 +840,120 @@ def _verdict(runtime, table, delta, model, dm):
     except (TypeError, ValueError):
         pass
 
-    baked_sig = meta.get("runtime_signature", "")
+    baked_sig = str(meta.get("runtime_signature", "") or "")
     current_sig = runtime_signature(model, dm)
     if not baked_sig:
-        runtime_state = "UNKNOWN (legacy table -- predates runtime signatures)"
-        provenance_problems.append("no runtime signature, equivalence not provable")
+        runtime_state = "UNKNOWN (table predates runtime signatures)"
+        provenance_problems.append("no runtime signature -- equivalence not provable")
+    elif not baked_sig.startswith(SIG_VERSION):
+        runtime_state = "LEGACY ({}, current {})".format(baked_sig, current_sig)
+        provenance_problems.append(
+            "table carries a pre-{} signature; re-record to certify it".format(SIG_VERSION))
     elif baked_sig != current_sig:
-        runtime_state = "STALE (table={} / now={})".format(baked_sig, current_sig)
+        runtime_state = "STALE (table={} now={})".format(baked_sig, current_sig)
         provenance_problems.append("table was recorded under a different runtime")
     else:
         runtime_state = "MATCH ({})".format(baked_sig)
 
-    shift_note = "table header shift {}/{} (source: {})".format(
+    shift_note = "header {}/{} (source: {})".format(
         meta.get("shift_v", "?"), meta.get("shift_a", "?"),
         meta.get("shift_source", "unknown"))
     if meta.get("shift_source") not in (None, "transformer_options"):
-        shift_note += " -- NOT authoritative, header shift is a fallback"
+        shift_note += " -- NOT authoritative, the header shift is a fallback"
 
     provenance_ok = not provenance_problems
     if not sampled:
         equivalence = "NOT EVALUATED (no sampling in this pass)"
-    elif injection_ok and provenance_ok:
-        equivalence = ("ESTABLISHED BY CONSTRUCTION: every step injected a row "
-                       "that was observed from the teacher, under a matching "
-                       "runtime. Bitwise equality with the CURRENT full teacher "
-                       "still requires a live teacher re-check.")
     elif not injection_ok:
         equivalence = "NOT ESTABLISHED -- the table did not fully replace AdaLN"
+    elif provenance_ok:
+        equivalence = ("ESTABLISHED BY CONSTRUCTION: every step injected a row "
+                       "observed from the teacher, under a matching runtime")
     else:
-        equivalence = ("NOT PROVEN -- re-record on this exact runtime; "
-                       "the existing rows cannot be certified against it")
+        equivalence = ("NOT PROVEN -- {}; re-record on this exact runtime to "
+                       "certify it".format("; ".join(provenance_problems)))
 
     def _fmt(items):
         return ", ".join(items) if items else "none"
 
-    return "\n".join([
-        "  INJECTION   : {} | rows injected={} native={} missing_t={} "
-        "max_injection_delta={}".format(
-            injection_state, injections, native, len(missing), delta_txt),
-        "  problems    : {}".format(_fmt(injection_problems)),
-        "  PROVENANCE  : {} | record_mode={} repeat_conflicts={}".format(
-            "OK" if provenance_ok else "DEGRADED",
-            meta.get("record_mode", "?"), meta.get("repeat_conflicts", "?")),
-        "  problems    : {}".format(_fmt(provenance_problems)),
-        "  RUNTIME     : {}".format(runtime_state),
-        "  SHIFT META  : {}".format(shift_note),
-        "  EQUIVALENCE : {}".format(equivalence),
-        "  NOTE        : this node never claims bitwise equality with the full "
-        "teacher from stats alone; only a teacher-model re-check can.",
-    ])
+    lines = [
+        "INJECTION   : {} | injected={} matched={} failures={} native={} "
+        "wrapper_steps={}".format(injection_state, injections, matched,
+                                  failures, native, wrapper),
+        "  problems  : {}".format(_fmt(injection_problems)),
+        "  max delta : {}".format(
+            "{:.6e} (cumulative, table row vs base AdaLN)".format(
+                st["max_injection_delta"]) if measured
+            else "UNAVAILABLE (could not read the base output)"),
+        "  match     : exact={} approx={} max_dist={:.3e} first={} @ {}".format(
+            st["match_hits"] - st["match_approx"], st["match_approx"],
+            st["max_match_distance"], st["first_key"],
+            "?" if st["first_dist"] is None else "{:.3e}".format(st["first_dist"])),
+        "  layout    : {} segs / {} tokens, {} change(s); shift changes={}".format(
+            st["last_segs"], st["last_tokens"], st["layout_changes"],
+            st["shift_changes"]),
+        "  per-row t : {}".format(
+            "YES -- denoise_mask; only the t_emb match is reliable"
+            if st["per_row_timestep"] else "no"),
+        "PROVENANCE  : {} | mode={} conflicts={}".format(
+            "OK" if provenance_ok else "DEGRADED", record_mode or "?",
+            meta.get("repeat_conflicts", "?")),
+        "  problems  : {}".format(_fmt(provenance_problems)),
+        "RUNTIME     : {}".format(runtime_state),
+        "SHIFT META  : {}".format(shift_note),
+        "EQUIVALENCE : {}".format(equivalence),
+    ]
+    if injections and measured and st["max_injection_delta"] <= 0.0:
+        lines.append(
+            "NOTE        : the injected rows are bit-identical to this model's own "
+            "AdaLN -- expected when the table was recorded from THIS model, "
+            "suspicious when it was recorded from a teacher")
+    if lora_mismatch:
+        lines.insert(0, "LORA        : MISMATCH -- table fp={} model fp={} "
+                        "(explicit `table` pick, injection allowed)".format(
+                            meta.get("adaln_lora_fingerprint") or "none",
+                            _adaln_lora_fingerprint(model) or "none"))
+    summary = {
+        "ok": bool(injection_ok and provenance_ok),
+        "injected": injections, "native": native, "missing": len(missing),
+        "equivalence": equivalence,
+    }
+    return lines, summary
 
 
-def _inject(model, dm, table):
-    """Replace all 51 AdaLN projections with the table's rows. Returns report lines."""
+def _inject(model, dm, table, rep=None, source="", allow_lora_mismatch=False):
+    """Replace all 51 AdaLN projections with the table's rows."""
+    if rep is None:
+        rep = _nodes.Report("H3 AdaLN · apply", "silent")
     table.finalize(required=True)
 
-    baked = table.meta.get("adaln_lora_fingerprint", "")
-    current = _adaln_lora_fingerprint(model)
-    if baked and current and baked != current:
+    baked = _norm_adaln_fp(table.meta.get("adaln_lora_fingerprint", ""))
+    current = _norm_adaln_fp(_adaln_lora_fingerprint(model))
+    lora_mismatch = baked != current
+    if lora_mismatch and not allow_lora_mismatch:
         raise RuntimeError(
-            "H3AdaLN: this table was recorded with a different AdaLN/timestep LoRA "
-            "(table={} model={}). Only time_embedder / adaln_proj LoRAs matter -- "
-            "re-record on the full teacher with that LoRA loaded.".format(baked, current))
+            "H3AdaLN: this table was recorded with a different AdaLN/timestep "
+            "LoRA (table={} model={}). Only time_embedder / adaln_proj LoRAs "
+            "matter -- re-record on the full teacher with that LoRA loaded, or "
+            "set `table` to a specific file to override this check."
+            .format(baked or "none", current or "none"))
+    if lora_mismatch:
+        # Explicit override. Never silent: the report and the verdict both say
+        # so, and the rows are known to belong to a different modulation.
+        logging.warning(
+            "H3AdaLN: injecting a table recorded with AdaLN LoRA %s into a "
+            "model with %s -- allowed because `table` was picked explicitly, "
+            "but the output will not match either side.",
+            baked or "none", current or "none")
 
-    notes = []
+    warnings = []
     model_dtype = _nodes._model_compute_dtype(model, dm)
     if model_dtype is not None:
         want = _short_dtype(table.out_dtype)
         got = _short_dtype(model_dtype)
         if want != got:
-            notes.append("WARNING: table is {} but this model computes in {} -- the "
-                         "result will NOT be bitwise".format(want, got))
+            warnings.append("table is {} but this model computes in {} -- the "
+                            "result will NOT be bitwise".format(want, got))
 
     _clear_runtime(model)
     runtime = apply_engine.ExactAdaLNRuntime(
@@ -837,49 +964,94 @@ def _inject(model, dm, table):
 
     def _done(*_a, **_k):
         # ON_CLEANUP fires once per sampling pass (first pass, refine, ...).
-        # ComfyUI never unregisters these callbacks and cloned ModelPatchers
-        # can inherit them, so report EVERY invocation with its own pass number
-        # and per-pass deltas. That is what shows whether a later pass still
-        # injected table rows instead of silently reverting to native AdaLN.
-        st = runtime.state
-        snap = (st["injected"], st["match_hits"], st["match_failures"],
-                st["native_steps"], st["wrapper_steps"])
-        prev = getattr(runtime, "_last_report", (0, 0, 0, 0, 0))
-        delta = [b - a for a, b in zip(prev, snap)]
-        runtime._last_report = snap
-        pass_no = getattr(runtime, "_report_count", 0) + 1
-        runtime._report_count = pass_no
+        # ComfyUI never unregisters these callbacks, so this one is installed
+        # under a fixed key and replaced on the next apply -- never appended.
+        delta = runtime.begin_pass()
+        pass_no = runtime._report_count
+        prev_sig = runtime._pass_sig
+        sig = _pass_signature(runtime)
+        runtime._pass_sig = sig
         try:
-            logging.info(
-                "H3AdaLN: apply stats [pass %d]\n%s\n"
-                "  this pass     : injections=%d matched=%d "
-                "match_failures=%d native=%d wrapper_steps=%d",
-                pass_no, runtime.summary(), *delta)
-            logging.info("H3AdaLN: VERDICT [pass %d]\n%s",
-                         pass_no, _verdict(runtime, table, delta, model, dm))
+            section = "pass {}".format(pass_no)
+            lines, summary = _audit(runtime, table, delta, model, dm,
+                                    lora_mismatch, pass_no)
+            if prev_sig is not None:
+                changed = [k for k in ("sigma", "t", "rows", "tokens", "segs",
+                                       "shift", "width")
+                           if prev_sig.get(k) != sig.get(k)]
+                lines.append("PASS DIFF   : {} vs pass {} -> changed: {}".format(
+                    "identical" if not changed else "DIFFERENT",
+                    pass_no - 1, ", ".join(changed) or "nothing"))
+                lines.append("  pass {}: {}".format(pass_no - 1, _describe_pass(prev_sig)))
+                lines.append("  pass {}: {}".format(pass_no, _describe_pass(sig)))
+            else:
+                lines.append("PASS DIFF   : first pass in this prompt ({})".format(
+                    _describe_pass(sig)))
+            rep.add(section, "this pass     : injections={} matched={} "
+                             "failures={} native={} wrapper_steps={}".format(*delta))
+            rep.extend(section, lines)
+            trace_section = "{} · trace".format(section)
+            counters_section = "{} · counters".format(section)
+            if rep.debug:
+                rep.extend(trace_section, runtime.trace_lines())
+                rep.extend(counters_section, runtime.summary().splitlines())
+            if pass_no == 1:
+                rep.add("summary", "{} : {}".format(
+                    "PASS" if summary["ok"] else "FAIL", summary["equivalence"]))
+            rep.log_section(section)
+            rep.log_section(trace_section)
+            rep.log_section(counters_section)
+        except Exception as e:  # never let reporting break the prompt
+            logging.warning("H3AdaLN: could not build the apply report (%s: %s)",
+                            type(e).__name__, e)
         finally:
             # ON_CLEANUP fires after the FIRST sampling pass, but a director
-            # chain then runs a SECOND pass (refine / custom sigmas) with a
-            # different t set. Removing the hooks here silently drops that
-            # pass from injection and stats. Keep them alive; the next prompt
-            # removes them via _clear_runtime at the start of _inject.
+            # chain then runs a SECOND pass (refine / SelfLift / custom sigmas)
+            # with a different t set. Removing the hooks here silently drops
+            # that pass from injection and stats. Keep them alive until the
+            # next prompt re-arms via _clear_runtime.
             apply_engine.recover_stale_malloc_graph()
 
-    try:
-        import comfy.patcher_extension as pe
-        model.add_callback(pe.CallbacksMP.ON_CLEANUP, _done)
-    except Exception:
-        pass
+    _set_callback_once(model, "h3_adaln_apply", _done)
+
+    rep.add("exec", "source      : {}".format(source or "(table_in)"))
+    rep.add("exec", "table       : {}".format(
+        os.path.basename(table.source or "") or "(in memory)"))
+    rep.add("exec", "identity    : {}".format(table.meta.get("identity", "?")))
+    rep.add("exec", "t rows      : {} {}".format(
+        len(table.t_values),
+        "[" + ", ".join("{:.7f}".format(t) for t in table.t_values[:8]) +
+        (", ..." if len(table.t_values) > 8 else "") + "]"))
+    rep.add("exec", "projections : {}".format(table.projections()))
+    rep.add("exec", "dtype       : table {} / model {}".format(
+        _short_dtype(table.out_dtype),
+        _short_dtype(model_dtype) if model_dtype is not None else "unknown"))
+    rep.add("exec", "lora fp     : table {} / model {} {}".format(
+        baked or "none", current or "none",
+        "<- MISMATCH (explicit pick)" if lora_mismatch else ""))
+    rep.add("exec", "target base : {} ({})".format(
+        table.meta.get("target_base") or "none",
+        table.meta.get("target_name") or "-"))
+    rep.add("exec", "signature   : table {} / now {}".format(
+        table.meta.get("runtime_signature") or "none", runtime_signature(model, dm)))
+    rep.add("exec", "shift       : {}/{} [{}]".format(
+        table.meta.get("shift_v", "?"), table.meta.get("shift_a", "?"),
+        table.meta.get("shift_source", "unknown")))
+    rep.add("exec", "hooked      : {} projections armed".format(hooked))
+    for w in warnings:
+        rep.add("exec", "WARNING     : {}".format(w))
+        logging.warning("H3AdaLN: %s", w)
 
     lines = [
-        "  table  : {} · {} t rows · {} projections · {}".format(
+        "  table  : {} · {} t rows · {} projections · {} {}".format(
             os.path.basename(table.source or "") or "(in memory)",
-            len(table.t_values), table.projections(), _short_dtype(table.out_dtype)),
-        "  armed  : {} projections; per-step stats are written to the log when "
-        "this run ends".format(hooked),
-    ] + ["  " + n for n in notes]
-    logging.info("H3AdaLN: apply\n%s", "\n".join(lines))
+            len(table.t_values), table.projections(),
+            _short_dtype(table.out_dtype),
+            "· LoRA MISMATCH" if lora_mismatch else ""),
+        "  armed  : {} projections; per-pass stats are in the report".format(hooked),
+    ] + ["  " + n for n in warnings]
     return lines
+
 
 
 # ---------------------------------------------------------------- record
@@ -888,6 +1060,34 @@ def _inject(model, dm, table):
 # folder holds several similar pruned checkpoints, the node cannot know which
 # one is meant, and a hidden guess can silently produce a table that answers
 # wrongly. The choice is saved with the workflow, so it is made only once.
+
+
+def target_from_choice(choice):
+    """(base fingerprint, file name) for a `for_model` value, or None."""
+    choice = str(choice or NONE).strip()
+    if choice in ("", NONE, AUTO):
+        legacy = ("(auto) is no longer supported; " if choice == AUTO else "")
+        logging.warning(
+            "H3AdaLN: no for_model was set (%spick the pruned base in the "
+            "for_model dropdown). This table carries no target_base, so "
+            "table=(auto) will NOT find it -- select it in `table` instead, "
+            "or record again with for_model set.", legacy)
+        return None
+
+    path = resolve_model_file(choice)
+    if not path:
+        logging.warning("H3AdaLN: for_model=%r does not resolve to a "
+                        "checkpoint; the table will not carry a base "
+                        "fingerprint", choice)
+        return None
+
+    try:
+        return (base_fingerprint_from_file(path), os.path.basename(path))
+    except Exception as e:
+        logging.warning("H3AdaLN: cannot fingerprint %s (%s: %s); the table "
+                        "will not carry a base fingerprint", path,
+                        type(e).__name__, e)
+        return None
 
 
 def _target_of(model):
@@ -901,36 +1101,8 @@ def _target_of(model):
     cached = getattr(model, "_h3_rec_target", None)
     if cached is not None:
         return cached or None
-
-    choice = str(getattr(model, "_h3_rec_for_model", NONE) or NONE).strip()
-    if choice in ("", NONE, AUTO):
-        legacy = ("(auto) is no longer supported; " if choice == AUTO else "")
-        logging.warning(
-            "H3AdaLN: no for_model was set (%spick the pruned base in the "
-            "for_model dropdown). This table carries no target_base, so "
-            "table=(auto) will NOT find it -- select it in `table` instead, "
-            "or record again with for_model set.", legacy)
-        model._h3_rec_target = ()
-        return None
-
-    path = resolve_model_file(choice)
-    if not path:
-        logging.warning("H3AdaLN: for_model=%r does not resolve to a "
-                        "checkpoint; the table will not carry a base "
-                        "fingerprint", choice)
-        model._h3_rec_target = ()
-        return None
-
-    try:
-        fp = base_fingerprint_from_file(path)
-    except Exception as e:
-        logging.warning("H3AdaLN: cannot fingerprint %s (%s: %s); the table "
-                        "will not carry a base fingerprint", path,
-                        type(e).__name__, e)
-        model._h3_rec_target = ()
-        return None
-    target = (fp, os.path.basename(path))
-    model._h3_rec_target = target
+    target = target_from_choice(getattr(model, "_h3_rec_for_model", NONE))
+    model._h3_rec_target = target or ()
     return target
 
 
@@ -976,19 +1148,21 @@ def _stop_recording(model):
 
 
 def _finish_record(model):
-    """ON_CLEANUP: write the rows, but KEEP the hooks for later passes.
+    """ON_CLEANUP: merge this pass's rows into the table, keep the hooks.
 
     A director chain fires ON_CLEANUP after the first sampling pass and then
-    runs a refine pass with its own custom sigmas. Removing the recorder here
-    silently drops those t rows from the table (which is why the second pass
-    later reported 8 missing timesteps). Hooks are detached by the next
-    prompt's stale cleanup instead.
+    runs a refine / SelfLift pass with its own custom sigmas. Removing the
+    recorder here silently drops those t rows, and sealing the *save* after the
+    first pass does the same: the rows are captured but never written. So every
+    pass saves what is new, and the recorder only detaches when a pass produced
+    nothing new (i.e. the sampling that just ended was not part of this
+    recording) or the pass budget is exhausted.
     """
     rec = getattr(model, "_h3_recorder", None)
     if rec is not None and getattr(rec, "abandoned", False):
         _stop_recording(model)
         return
-    _save_recorded(model)
+    _save_recorded(model, seal_when_idle=True)
     # Keep the hook handles for later passes, but clear the tracking bucket so
     # the shared module does not accumulate stale objects.
     dm = getattr(model, "_h3_rec_dm", None)
@@ -999,14 +1173,35 @@ def _finish_record(model):
             pass
 
 
-def _save_recorded(model):
+def _save_recorded(model, seal_when_idle=False):
     table = getattr(model, "_h3_pending_table", None)
-    if table is None or getattr(model, "_h3_saved", False):
+    if table is None:
         return
+    rec = table.recorder
+    rep = getattr(model, "_h3_report", None)
+    if rec is None or getattr(rec, "sealed", False):
+        return
+    if getattr(model, "_h3_recorder", None) is not rec:
+        return
+
+    rows_now = len(getattr(rec, "rows", {}) or {})
+    saved_rows = int(getattr(model, "_h3_saved_rows", 0) or 0)
+    if rows_now <= saved_rows:
+        if seal_when_idle and saved_rows:
+            # This sampling run added nothing: it is either a repeat pass of the
+            # same prompt (nothing to write) or a later prompt reusing the same
+            # model. Either way the recording is finished -- detach, so the
+            # hooks stop filling a dict nobody will ever save.
+            _seal_recorder(model, rep,
+                           "a sampling pass produced no new rows")
+        return
+
     try:
         table.finalize(required=True)
     except Exception as e:
         logging.error("H3AdaLN: nothing saved -- %s", e)
+        if rep is not None:
+            rep.add("record", "SAVE FAILED : {}".format(e))
         return
 
     conflicts = int(table.meta.get("repeat_conflicts", "0") or 0)
@@ -1016,6 +1211,16 @@ def _save_recorded(model):
             "modulations in one run (max delta %s), so the AdaLN branch changed "
             "mid-run -- record again with one model and one LoRA stack.",
             conflicts, table.meta.get("max_repeat_delta", "?"))
+        if rep is not None:
+            rep.add("record", "REFUSED     : {} repeat conflict(s), max delta {} "
+                              "-- the AdaLN branch changed mid-run; nothing written"
+                              .format(conflicts, table.meta.get("max_repeat_delta", "?")))
+            rep.extend("record · conflicts", [
+                "t={:.7f}  {}  delta={:.3e}".format(t, k, d)
+                for t, k, d in rec.conflict_detail])
+            rep.log_section("record")
+            rep.log_section("record · conflicts")
+        _seal_recorder(model, rep, "repeat conflicts made this run unusable")
         return
 
     dm = getattr(model, "_h3_rec_dm", None)
@@ -1029,7 +1234,7 @@ def _save_recorded(model):
         "teacher": "full fp {} ({} projections)".format(
             model_fp, table.projections()),
         "t_rows": str(len(table.t_values)),
-        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "created": table.meta.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S"),
         "runs": "1",
         "comfyui_version": _nodes._comfy_version(),
     })
@@ -1044,9 +1249,16 @@ def _save_recorded(model):
             auto_name(dm, model_fp, adaln_fp, out_dtype))
     except Exception as e:
         logging.error("H3AdaLN: save failed -- %s: %s", type(e).__name__, e)
+        if rep is not None:
+            rep.add("record", "SAVE FAILED : {}: {}".format(type(e).__name__, e))
+        _seal_recorder(model, rep, "the save failed")
         return
 
-    model._h3_saved = True
+    model._h3_saved_rows = rows_now
+    model._h3_save_passes = int(getattr(model, "_h3_save_passes", 0) or 0) + 1
+    rec.saved_once = True
+    rec.passes = model._h3_save_passes
+    table.source = path
     logging.info("H3AdaLN: %s %s (%d new rows, %d total, %.0f MiB)", action, path,
                  added, total, os.path.getsize(path) / (1 << 20))
     if total > 200:
@@ -1054,24 +1266,80 @@ def _save_recorded(model):
             "H3AdaLN: %s now holds %d t rows (~%.1f GiB). Every extra schedule "
             "adds rows; delete the file and re-record if it gets out of hand.",
             os.path.basename(path), total, os.path.getsize(path) / (1 << 30))
+
+    if rep is not None:
+        section = "pass {}".format(model._h3_save_passes)
+        rep.add(section, "record      : {} {}".format(action, os.path.basename(path)))
+        rep.add(section, "this pass   : +{} rows ({} total, {:.0f} MiB)".format(
+            added, total, os.path.getsize(path) / (1 << 20)))
+        rep.add(section, "table       : {} t rows / {} projections / {}".format(
+            len(table.t_values), table.projections(), _short_dtype(out_dtype)))
+        rep.add(section, "t values    : {}".format(
+            ", ".join("{:.7f}".format(t) for t in table.t_values[:12]) +
+            (" ... ({} more)".format(len(table.t_values) - 12)
+             if len(table.t_values) > 12 else "")))
+        rep.add(section, "pins        : {}".format(rec.pins_report or "-"))
+        rep.add(section, "forwards    : {} seen, {} compared, {} skipped".format(
+            rec.forwards, rec.compared, rec.skipped))
+        rep.add(section, "conflicts   : {} (max delta {:.3e})".format(
+            rec.conflicts, rec.max_repeat_delta))
+        if rec.warnings:
+            rep.extend(section, ["WARNING     : " + w for w in rec.warnings[-6:]])
+        if rep.debug and rec.forward_trace:
+            rep.extend("{} · forwards".format(section), [
+                "forward {:<3} rows={} t={}".format(i, n, ", ".join(
+                    "{:.7f}".format(v) for v in ts))
+                for i, ts, n in rec.forward_trace])
+        rep.log_section(section)
+        rep.log_section("{} · forwards".format(section))
+
     pin = sigma_plan.f32_image(sigma_plan.VISUAL_COND_TIMESTEP)
-    # Check the MERGED file, not this run's row set. The old check looked at
-    # `table.t_values` (only what this run captured) while the log right above
-    # reports the on-disk total, which produced a false "no row for t=0.999 /
-    # enable fill_reference_row" warning even though the file had the row.
     saved_t = table.t_values
     try:
         saved_t = table_io.load_table(path)[0]
     except Exception:
         pass
     if not any(abs(t - pin) < 1e-6 for t in saved_t):
-        logging.error(
-            "H3AdaLN: %s has no row for t=%.3f after this run (checked the "
-            "merged file, not just this run's rows). Keyframe/reference "
-            "workflows will error before sampling. Re-record with "
-            "fill_reference_row=True and exactly ONE mode=record node (a pin "
-            "failure now aborts the save instead of being silently ignored).",
-            os.path.basename(path), pin)
+        msg = ("{} has no row for t={:.3f} after this run (checked the merged "
+               "file, not just this run's rows). Keyframe/reference workflows "
+               "will error before sampling.").format(os.path.basename(path), pin)
+        if rec.pin_targets:
+            logging.error("H3AdaLN: %s", msg)
+            if rep is not None:
+                rep.add("record", "WARNING     : " + msg)
+        else:
+            # fill_reference_row=False is a documented choice; reporting it as an
+            # ERROR made every text-only recording look like a failure.
+            logging.info("H3AdaLN: %s (fill_reference_row=False, so this is "
+                         "expected)", msg)
+            if rep is not None:
+                rep.add("record", "note        : " + msg +
+                        " -- expected, fill_reference_row=False")
+
+    if seal_when_idle and added == 0:
+        _seal_recorder(model, rep, "this pass added no rows")
+    elif model._h3_save_passes >= MAX_RECORD_PASSES:
+        _seal_recorder(model, rep, "pass budget reached ({} saves)"
+                       .format(model._h3_save_passes))
+
+
+def _seal_recorder(model, rep, why):
+    """Detach the recorder for good and say why."""
+    rec = getattr(model, "_h3_recorder", None)
+    if rec is None:
+        return
+    passes = int(getattr(model, "_h3_save_passes", 0) or 0)
+    if passes >= MAX_RECORD_PASSES:
+        why = "pass budget reached ({} saves)".format(passes)
+    try:
+        rec.seal()
+    except Exception:
+        pass
+    model._h3_recorder = None
+    if rep is not None:
+        rep.add("record", "sealed      : {} -- hooks detached; a new record run "
+                          "re-arms automatically".format(why))
+    logging.info("H3AdaLN: recording closed (%s)", why)
 
 
 # ---------------------------------------------------------------- nodes
@@ -1104,6 +1372,19 @@ class H3AdaLN:
                                "record: capture one while this (full) model samples; "
                                "it is written when the run ends.\n"
                                "off: pass through, for an A/B control run."}),
+                "report_level": (_nodes.REPORT_LEVELS, {
+                    "default": "brief",
+                    "tooltip": "How much this node says.\n"
+                               "silent: nothing but errors -- fastest, no "
+                               "per-step bookkeeping.\n"
+                               "brief: one block per sampling pass (what was "
+                               "injected, what was not).\n"
+                               "debug: per-forward traces, key distances, "
+                               "timings, full counter dump, plus a .txt under "
+                               "output/h3_adaln/reports/.\n"
+                               "The same text is available on the `report` "
+                               "output: connect it to `H3 AdaLN Report` and put "
+                               "that node AFTER sampling."}),
             },
             "optional": {
                 "for_model": (_model_choices(), {
@@ -1128,7 +1409,10 @@ class H3AdaLN:
                     "tooltip": "(auto) = the only table whose header declares "
                                "this model (for_model at record time). Nothing "
                                "is guessed: an undeclared table is refused.\n"
-                               "Pick a file only to override, for this run."}),
+                               "Pick a file only to override, for this run -- "
+                               "an explicit pick also allows a table whose AdaLN "
+                               "LoRA fingerprint does not match (it is reported "
+                               "as a MISMATCH, never silently)."}),
                 "table_in": (TABLE_TYPE, {
                     "tooltip": "Advanced: take the table from a node earlier in "
                                "this same prompt (A/B verification)."}),
@@ -1137,40 +1421,50 @@ class H3AdaLN:
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("MODEL", TABLE_TYPE, "STRING")
+    RETURN_TYPES = ("MODEL", TABLE_TYPE, _nodes.REPORT_TYPE)
     RETURN_NAMES = ("model", "table", "report")
     FUNCTION = "run"
     CATEGORY = _nodes.CATEGORY
 
-    def run(self, model, mode, for_model=NONE, fill_reference_row=True,
-            table=AUTO, table_in=None, after=None, unique_id=None):
+    def run(self, model, mode, report_level="brief", for_model=NONE,
+            fill_reference_row=True, table=AUTO, table_in=None, after=None,
+            unique_id=None):
         # `after` is intentionally unused: the edge alone orders the graph.
         mode = str(mode or "apply").lower()
+        level = report_level if report_level in _nodes.REPORT_LEVELS else "brief"
         dm = _nodes._dm_of(model)
         if mode == "off":
             _clear_runtime(model)
-            return (model, table_in, "H3 AdaLN · off\n  model untouched (A/B control)")
+            _stop_recording(model)
+            rep = _nodes.Report("H3 AdaLN · off", level)
+            rep.add("exec", "model untouched (A/B control); any previous "
+                            "runtime and recorder on this model were detached")
+            rep.log()
+            return (model, table_in, rep)
         if dm is None:
             raise RuntimeError("H3AdaLN: expected a ComfyUI ModelPatcher")
         if mode == "record":
             return self._record(model, dm, for_model, fill_reference_row,
-                                unique_id)
+                                unique_id, level)
         if mode == "apply":
-            return self._apply(model, dm, table, table_in)
+            return self._apply(model, dm, table, table_in, level)
         raise RuntimeError("H3AdaLN: unknown mode {!r}".format(mode))
 
     # -- record -------------------------------------------------------
     def _record(self, model, dm, for_model=NONE, fill_reference_row=True,
-                unique_id=None):
+                unique_id=None, level="brief"):
         for attr in ("_h3_pending_table", "_h3_rec_dm", "_h3_rec_fp",
-                     "_h3_rec_adaln_fp", "_h3_saved", "_h3_rec_target",
-                     "_h3_rec_bound", "_h3_rec_for_model", "_h3_rec_uid"):
+                     "_h3_rec_adaln_fp", "_h3_saved", "_h3_saved_rows",
+                     "_h3_save_passes", "_h3_rec_target", "_h3_rec_bound",
+                     "_h3_rec_for_model", "_h3_rec_uid"):
             if hasattr(model, attr):
                 try:
                     delattr(model, attr)
                 except Exception:
                     pass
         model._h3_rec_for_model = str(for_model or NONE)
+        rep = _nodes.Report("H3 AdaLN · record", level)
+        model._h3_report = rep
 
         uid = str(unique_id or "")
         stale = _ACTIVE_RECORDERS.pop(uid, None) if uid else None
@@ -1179,7 +1473,7 @@ class H3AdaLN:
                 "H3AdaLN: node %s still had a recorder from an earlier run; "
                 "dropping it before starting a new one", uid)
             try:
-                stale.remove()
+                stale.seal()
             except Exception:
                 pass
         # Only the recorder with THIS node id is cleared above. Any other
@@ -1224,6 +1518,10 @@ class H3AdaLN:
                 "node records now, so the 0.999/1.0 pins stay intact. Set the "
                 "other chain to off/apply to avoid the handover.",
                 uid, ", ".join(sorted(others)))
+            rep.add("exec", "TOOK OVER   : detached recorder(s) of node(s) {} -- "
+                            "only one recorder may live on a shared diffusion "
+                            "model, otherwise the 0.999/1.0 pins get corrupted"
+                            .format(", ".join(sorted(others))))
         # Hooks now survive ON_CLEANUP for later passes, so the tracking bucket
         # on the shared module is reset here (the new prompt's start).
         try:
@@ -1247,19 +1545,31 @@ class H3AdaLN:
         model_fp = model_fingerprint(dm)
         adaln_fp = _adaln_lora_fingerprint(model)
         shift_v, shift_a, shift_src = _nodes._auto_shifts(model, with_source=True)
+        sig = runtime_signature(model, dm)
         meta = {
-            "teacher": "full fp {}".format(model_fp),
+            "teacher": "full fp {} ({} projections)".format(model_fp, hooked),
             "sigmas": "[]",
             "shift_v": str(float(shift_v)),
             "shift_a": str(float(shift_a)),
             "shift_source": shift_src,
-            "runtime_signature": runtime_signature(model, dm),
+            "runtime_signature": sig,
             "visual_aug": str(sigma_plan.VISUAL_COND_TIMESTEP),
             "audio_aug": str(sigma_plan.AUDIO_COND_TIMESTEP),
             "compute_dtype": "recorded",
             "out_dtype": "unknown",
             "record_mode": "observed during sampling",
             "format": table_io.FORMAT,
+            # Stamped up front, not only at save time: a table handed straight to
+            # an Apply node in the same prompt (table_in) is injected before any
+            # save happened, and without these it looked like a table recorded
+            # under a different LoRA.
+            "identity": identity_of(
+                model_fp, adaln_fp,
+                _nodes._model_compute_dtype(model, dm) or torch.bfloat16),
+            "model_fingerprint": model_fp,
+            "adaln_lora_fingerprint": adaln_fp or "",
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "runs": "1",
         }
         table = table_io.AdaLNTable([], {}, meta, recorder=recorder)
 
@@ -1268,65 +1578,89 @@ class H3AdaLN:
         model._h3_rec_fp = model_fp
         model._h3_rec_adaln_fp = adaln_fp
         model._h3_saved = False
-        try:
-            import comfy.patcher_extension as pe
-            model.add_callback(pe.CallbacksMP.ON_CLEANUP,
-                               lambda *a, **k: _finish_record(model))
-        except Exception as e:
-            logging.warning("H3AdaLN: cannot hook save-on-cleanup (%s: %s); the "
-                            "table will exist in memory only",
-                            type(e).__name__, e)
+        model._h3_saved_rows = 0
+        model._h3_save_passes = 0
+        if not _set_callback_once(model, "h3_adaln_record",
+                                  lambda *a, **k: _finish_record(model)):
+            logging.warning("H3AdaLN: cannot hook save-on-cleanup; the table "
+                            "will exist in memory only")
 
         hint = auto_name(dm, model_fp, adaln_fp, "<dtype>")
         target = _target_of(model)
-        report = "\n".join([
-            "H3 AdaLN · record",
-            "  teacher : fp {} · {} projections hooked · shift {}/{} [{}]".format(
-                model_fp, hooked, "%g" % shift_v, "%g" % shift_a, shift_src),
-            "  adaln lora : {}".format(adaln_fp or "(none)"),
-            "  extra rows : {}".format(
-                "t=%.3f%s pre-computed" % (pins[0], " / t=%.3f" % pins[1] if len(pins) > 1 else "")
-                if pins else "off (text-only tables will lack t=0.999)"),
-            "  for base   : {}".format(
-                "{} (fp {})".format(target[1], target[0]) if target else
-                "(none) -- table=(auto) will NOT find this table; set for_model "
-                "to the pruned base, or pick the file in `table`"),
-            "  saves to   : {}/{}".format(table_folder(), hint),
-            "",
-            "  Rows are captured live and written when this run ends. Re-recording",
-            "  the same schedule changes nothing; a different schedule adds rows to",
-            "  the same file instead of replacing it. Apply finds this table by",
-            "  its target fingerprint -- no pick, no 'most recent' guess.",
-        ])
+        if target:
+            meta["target_base"] = target[0]
+            meta["target_name"] = target[1]
+
+        rep.add("exec", "teacher     : full fp {} · {} projections hooked".format(
+            model_fp, hooked))
+        rep.add("exec", "adaln lora  : {}".format(adaln_fp or "none"))
+        rep.add("exec", "shift       : {}/{} [{}]".format(
+            "%g" % shift_v, "%g" % shift_a, shift_src))
+        rep.add("exec", "signature   : {}".format(sig))
+        rep.add("exec", "extra rows  : {}".format(
+            "t={:.3f}{} pre-computed".format(
+                pins[0], " / t={:.3f}".format(pins[1]) if len(pins) > 1 else "")
+            if pins else "off -- a text-only table will lack the t=0.999 row"))
+        rep.add("exec", "for base    : {}".format(
+            "{} (fp {})".format(target[1], target[0]) if target else
+            "none -- table=(auto) will NOT find this table"))
+        rep.add("exec", "saves to    : {}/{}".format(table_folder(), hint))
+        rep.add("exec", "flows       : rows are captured live; every ON_CLEANUP "
+                        "merges what is new into that file, so a refine / "
+                        "SelfLift pass adds its own timesteps instead of losing "
+                        "them")
+
         if shift_src != "transformer_options":
-            logging.warning(
-                "H3AdaLN: shift %g/%g came from %s, NOT from the running "
-                "forward's transformer_options. A MiniMaxH3SigmaShift node placed "
-                "downstream of this node is invisible here, so the printed shift "
-                "is a fallback, not the workflow's shift. Captured t rows are "
-                "unaffected (they come from time_embedder's input).",
-                shift_v, shift_a, shift_src)
-        logging.info("%s", report)
-        return (model, table, report)
+            msg = ("shift %g/%g came from %s, NOT from the running forward's "
+                   "transformer_options. A MiniMaxH3SigmaShift node placed "
+                   "downstream of this node is invisible here, so this value is "
+                   "a fallback; the captured t rows are unaffected (they come "
+                   "from time_embedder's input)." % (
+                       shift_v, shift_a, shift_src))
+            logging.warning("H3AdaLN: %s", msg)
+            rep.add("exec", "WARNING     : " + msg)
+        rep.log()
+        return (model, table, rep)
 
     # -- apply --------------------------------------------------------
-    def _apply(self, model, dm, choice, table_in):
+    def _apply(self, model, dm, choice, table_in, level="brief"):
+        rep = _nodes.Report("H3 AdaLN · apply", level)
+        # Recording and injecting on the SAME diffusion module is a
+        # contradiction: the recorder would capture the injected rows as if the
+        # teacher had produced them. Close the recording before arming.
+        if getattr(model, "_h3_recorder", None) is not None:
+            _seal_recorder(model, getattr(model, "_h3_report", None),
+                           "an apply node took over this model")
+        model._h3_report = rep
         if table_in is not None:
-            table, src = table_in, "table_in"
+            table, src = table_in, "table_in (live, from this prompt)"
+            allow = False
         else:
             path, src = resolve_for_model(model, dm, choice)
+            rep.add("exec", "resolved    : {}".format(path))
             try:
                 table = table_io.read_table_file(path)
             except Exception as e:
                 raise RuntimeError(
                     "H3AdaLN: cannot read table {}: {}: {}".format(
                         path, type(e).__name__, e))
-        lines = ["H3 AdaLN · apply · {}".format(src)] + _inject(model, dm, table)
-        return (model, table, "\n".join(lines))
+            allow = (src == "picked")
+        _inject(model, dm, table, rep, source=src, allow_lora_mismatch=allow)
+        rep.log()
+        return (model, table, rep)
 
 
 class H3AdaLNHybrid:
     """Assemble a bX-49 table from two recordings (blocks 0..split-1 | split..49)."""
+
+    # This node writes a .safetensors and arms injection hooks, so it must not be
+    # served from a cached output: a cached run would neither re-merge nor
+    # re-inject, and the sampling would silently use the base's native AdaLN.
+    NOT_IDEMPOTENT = True
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        return time.time()
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1342,22 +1676,45 @@ class H3AdaLNHybrid:
                 "split": ("INT", {"default": 25, "min": 0, "max": 50, "step": 1,
                                   "tooltip": "First block taken from table_b."}),
             },
+            "optional": {
+                "final_from": (["a", "b"], {
+                    "default": "a",
+                    "tooltip": "Which side supplies final_layer. A bX-49 file "
+                               "keeps the donor's final_layer in some recipes; "
+                               "this used to be hardcoded to 'a'."}),
+                "for_model": (_model_choices(), {
+                    "default": NONE,
+                    "tooltip": "Optional: declare the bX-49 checkpoint this "
+                               "hybrid table is for, so apply's table=(auto) "
+                               "finds it. Without it the hybrid table inherits "
+                               "no base and must be picked by name."}),
+                "report_level": (_nodes.REPORT_LEVELS, {
+                    "default": "brief",
+                    "tooltip": "See H3 AdaLN. `report` can be rendered after "
+                               "sampling by the H3 AdaLN Report node."}),
+            },
         }
 
-    RETURN_TYPES = ("MODEL", TABLE_TYPE, "STRING")
+    RETURN_TYPES = ("MODEL", TABLE_TYPE, _nodes.REPORT_TYPE)
     RETURN_NAMES = ("model", "table", "report")
     FUNCTION = "run"
     CATEGORY = _nodes.CATEGORY
 
-    def run(self, model, table_a="", table_b="", split=25):
+    def run(self, model, table_a="", table_b="", split=25, final_from="a",
+            for_model=NONE, report_level="brief"):
+        level = report_level if report_level in _nodes.REPORT_LEVELS else "brief"
+        rep = _nodes.Report("H3 AdaLN · hybrid", level)
+        model._h3_report = rep
+
         split = int(split)
+        final_from = str(final_from).lower()
         path_a = find_table(table_a, "table_a")
         path_b = find_table(table_b, "table_b")
         if os.path.abspath(path_a) == os.path.abspath(path_b):
             raise RuntimeError("H3AdaLNHybrid: table_a and table_b are the same file")
         a = table_io.read_table_file(path_a)
         b = table_io.read_table_file(path_b)
-        merged = table_io.merge_tables(a, b, split=split, final_from="a")
+        merged = table_io.merge_tables(a, b, split=split, final_from=final_from)
 
         dm = _nodes._dm_of(model)
         out_dtype = merged.out_dtype
@@ -1369,6 +1726,11 @@ class H3AdaLNHybrid:
             "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "runs": "1",
         })
+        target = target_from_choice(for_model) if str(for_model or "").strip() not in (
+            "", NONE) else None
+        if target:
+            merged.meta["target_base"] = target[0]
+            merged.meta["target_name"] = target[1]
         name = "h3_hybrid_x{}_{}_{}_{}.safetensors".format(
             split, a.meta.get("model_fingerprint", "a")[:6],
             b.meta.get("model_fingerprint", "b")[:6], _short_dtype(out_dtype))
@@ -1376,17 +1738,26 @@ class H3AdaLNHybrid:
             merged.t_values, merged.raw_by_key, merged.meta, out_dtype, name)
         merged.source = path
 
-        lines = ["H3 AdaLN · hybrid"]
-        if split > 0:
-            lines.append("  blocks 0-{} : {}".format(split - 1,
-                                                     os.path.basename(path_a)))
-        if split < 50:
-            lines.append("  blocks {}-49 : {}".format(split,
-                                                      os.path.basename(path_b)))
-        lines.append("  {} : {} (+{} rows, {} total)".format(action, path, added, total))
+        rep.add("exec", "table_a     : {} ({} t rows)".format(
+            os.path.basename(path_a), len(a.t_values)))
+        rep.add("exec", "table_b     : {} ({} t rows)".format(
+            os.path.basename(path_b), len(b.t_values)))
+        rep.add("exec", "split       : blocks 0-{} <- A | blocks {}-49 <- B | "
+                        "final_layer <- {}".format(
+                            split - 1 if split > 0 else "none", split,
+                            final_from))
+        rep.add("exec", "lora fp     : A={} B={}".format(
+            _norm_adaln_fp(a.meta.get("adaln_lora_fingerprint")) or "none",
+            _norm_adaln_fp(b.meta.get("adaln_lora_fingerprint")) or "none"))
+        rep.add("exec", "wrote       : {} {} (+{} rows, {} total)".format(
+            action, path, added, total))
+        rep.add("exec", "for base    : {}".format(
+            "{} (fp {})".format(target[1], target[0]) if target
+            else "none -- table=(auto) will not find this hybrid; pick it by name"))
         if dm is not None:
-            lines += _inject(model, dm, merged)
-        return (model, merged, "\n".join(lines))
+            _inject(model, dm, merged, rep, source="hybrid merge")
+        rep.log()
+        return (model, merged, rep)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -1398,3 +1769,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3AdaLN": "H3 AdaLN (record / apply)",
     "H3AdaLNHybrid": "H3 AdaLN Hybrid (bX-49)",
 }
+

@@ -69,7 +69,8 @@ def clean():
 # ---------------------------------------------------------------- schema
 def test_schema():
     spec = H.H3AdaLN.INPUT_TYPES()
-    assert list(spec["required"]) == ["model", "mode"], spec["required"]
+    assert list(spec["required"]) == ["model", "mode", "report_level"], spec["required"]
+    assert list(spec["required"]["report_level"][0]) == ["silent", "brief", "debug"]
     assert list(spec["optional"]) == ["for_model", "fill_reference_row", "table",
                                       "table_in", "after"], spec["optional"]
     assert spec["required"]["mode"][0] == ["apply", "record", "off"]
@@ -78,14 +79,70 @@ def test_schema():
     assert H.AUTO not in spec["optional"]["for_model"][0], \
         "for_model must not offer an (auto) mode"
     assert spec["optional"]["fill_reference_row"][1]["default"] is True
-    assert H.H3AdaLN.RETURN_TYPES == ("MODEL", H.TABLE_TYPE, "STRING")
+    assert H.H3AdaLN.RETURN_TYPES == ("MODEL", H.TABLE_TYPE, H.REPORT_TYPE)
 
     hybrid = H.H3AdaLNHybrid.INPUT_TYPES()
     assert list(hybrid["required"]) == ["model", "table_a", "table_b", "split"]
     assert hybrid["required"]["split"][1]["default"] == 25
+    assert hybrid["optional"]["final_from"][0] == ["a", "b"]
+    assert H.H3AdaLNHybrid.RETURN_TYPES == ("MODEL", H.TABLE_TYPE, H.REPORT_TYPE)
 
 
-def test_only_three_nodes_are_registered():
+def test_report_node():
+    """The report output is a live object; this node turns it into text."""
+    import nodes as h3nodes
+
+    rep = h3nodes.Report("H3 AdaLN · apply", "brief")
+    rep.add("exec", "table : x.safetensors")
+    rep.add("pass 1", "INJECTION : PASS")
+    node = h3nodes.H3AdaLNReport()
+    out = node.run(rep, after=None, save_file=False)
+    text = out["result"][0]
+    assert "table : x.safetensors" in text, text
+    assert "INJECTION : PASS" in text, text
+    assert out["ui"]["text"][0] == text
+
+    # A plain string must still render (older graphs pass one through).
+    assert "raw text" in node.run("raw text", save_file=False)["result"][0]
+
+    # `silent` must say it is off rather than look like an empty report.
+    quiet = h3nodes.Report("t", "silent")
+    quiet.add("exec", "should not appear")
+    assert "diagnostics are off" in str(quiet), str(quiet)
+    assert "should not appear" not in str(quiet)
+
+    # debug-only lines are filtered at brief level.
+    brief = h3nodes.Report("t", "brief")
+    brief.add("exec", "always")
+    brief.add("exec", "debug only", debug_only=True)
+    assert "always" in str(brief) and "debug only" not in str(brief)
+
+    # Each pass must reach the console on its own, without re-printing the
+    # sections before it (the console is the primary verification channel).
+    import logging
+    captured = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    lg = logging.getLogger("H3AdaLN")
+    handler = Capture()
+    old_level = lg.level
+    lg.addHandler(handler)
+    lg.setLevel(logging.INFO)
+    try:
+        brief.log_section("exec")
+        brief.log_section("pass 1")
+        brief.log_section("missing section")
+    finally:
+        lg.removeHandler(handler)
+        lg.setLevel(old_level)
+    assert len(captured) == 1, captured          # "pass 1" has no body -> skipped
+    assert "always" in captured[0], captured
+
+
+def test_only_four_nodes_are_registered():
     import importlib.util
     import os
     import sys
@@ -97,7 +154,8 @@ def test_only_three_nodes_are_registered():
     sys.modules["h3_pack_for_test"] = mod
     spec.loader.exec_module(mod)
     assert set(mod.NODE_CLASS_MAPPINGS) == {
-        "H3AdaLN", "H3AdaLNHybrid", "H3LatentCompare"}, set(mod.NODE_CLASS_MAPPINGS)
+        "H3AdaLN", "H3AdaLNHybrid", "H3AdaLNReport",
+        "H3LatentCompare"}, set(mod.NODE_CLASS_MAPPINGS)
 
 
 # ---------------------------------------------------------------- identity
@@ -558,8 +616,10 @@ def test_only_one_table_directory_is_scanned():
 
 check("scan: only models/h3_exact_adaln is searched",
       test_only_one_table_directory_is_scanned)
-check("schema: exactly three core nodes are registered",
-      test_only_three_nodes_are_registered)
+check("report: the live report object renders through H3 AdaLN Report",
+      test_report_node)
+check("schema: exactly four core nodes are registered",
+      test_only_four_nodes_are_registered)
 check("name: derived from model fp + dtype (+ AdaLN LoRA)", test_auto_name)
 check("identity: model / AdaLN LoRA / dtype, nothing else", test_identity_is_model_lora_dtype)
 check("t-set: shape-free, but steps/scheduler/shift change it",

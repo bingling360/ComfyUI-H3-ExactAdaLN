@@ -4,13 +4,14 @@ Make a pruned MiniMax-H3 checkpoint reproduce the *full* model's AdaLN
 modulation exactly, so "pruned base + table + LoRA" is bitwise identical to
 "full teacher + the same LoRA".
 
-Exactly three nodes:
+Exactly four nodes:
 
   H3 AdaLN           record on the full teacher (one sampling run writes a
                      table) / apply on the pruned base (lookup by fingerprint).
                      Nothing to type, nothing to pick.
   H3 AdaLN Hybrid    bX-49 only: merge two recordings when no full hybrid
                      teacher is available.
+  H3 AdaLN Report    render the live run report after sampling (debug helper).
   H3 Latent Compare  A/B verification: are two LATENT outputs bitwise equal?
 
 Only `record` produces an exact table: it stores the tensors the teacher
