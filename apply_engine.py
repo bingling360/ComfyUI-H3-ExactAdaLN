@@ -31,6 +31,7 @@ primary path.
 import contextlib
 import functools
 import logging
+import time
 
 import torch
 
@@ -143,7 +144,7 @@ class ExactAdaLNRuntime:
             "last_segs": 0, "last_tokens": 0, "per_row_timestep": False,
             "layout_changes": 0, "shift_changes": 0, "hook_seconds": 0.0,
             "first_dist": None, "first_key": None, "gather_bytes": 0,
-            "last_shift": None,
+            "last_shift": None, "last_hook_at": 0.0,
         }
         self.trace = []            # one entry per forward, blocks.0 only
         self.trace_cap = 96
@@ -156,6 +157,14 @@ class ExactAdaLNRuntime:
         # This runtime's hooks are gone by design, so "zero forwards" here is
         # not a failure -- the other node did the injection.
         self.superseded = False
+        # Set by the node: emits the pass report for counters that no
+        # ON_CLEANUP has claimed. A chain that samples with a patcher we are not
+        # attached to never fires our callback for that pass, and its numbers
+        # were otherwise lost.
+        self.pending_report = None
+        # Extra per-forward console line in debug mode, so a pass that never
+        # gets a report block is still visible while it runs.
+        self.verbose = False
 
     # -- key construction ------------------------------------------------
     def _discover_key_sets(self, dm):
@@ -476,6 +485,7 @@ class ExactAdaLNRuntime:
     def _trace(self, key, t_emb, indices, maxd, tol, how, note):
         """One report line per forward -- recorded on the first projection only."""
         self.state["last_emb_width"] = int(t_emb.shape[-1])
+        self.state["last_hook_at"] = time.time()
         if key != self._trace_key or len(self.trace) >= self.trace_cap:
             return
         self.trace.append({
@@ -493,6 +503,16 @@ class ExactAdaLNRuntime:
             "segs": self.state.get("last_segs"),
             "shift": self.state.get("last_shift"),
         })
+        if self.verbose:
+            sigma = self.state.get("last_sigma")
+            logging.info(
+                "H3AdaLN: fwd %d %s t_emb=%dx%d -> rows=%s max_dist=%.3e "
+                "sigma=%s%s",
+                len(self.trace) - 1, how,
+                int(t_emb.shape[0]), int(t_emb.shape[-1]),
+                indices, maxd,
+                "{:.7f}".format(sigma) if isinstance(sigma, float) else "?",
+                "" if how != "native" else "  (NATIVE AdaLN -- not injected)")
 
     # -- registration ------------------------------------------------------
     def register(self, model, use_sigma_wrapper=True, use_dit_patch=False):

@@ -769,6 +769,11 @@ def _clear_runtime(model, seal=True):
             obj.seal() if seal else obj.remove()
         except Exception:
             pass
+    for obj in list(getattr(dm, "_h3_exact_runtimes", []) or []) + ([rt] if rt else []):
+        try:
+            _LIVE_RUNTIMES.remove(obj)
+        except ValueError:
+            pass
     _nodes._clear_registered(model, "_h3_exact_runtimes")
 
 
@@ -985,6 +990,68 @@ def _audit(runtime, table, delta, model, dm, lora_mismatch=False, pass_no=1):
     return lines, summary
 
 
+def _report_pass(runtime, model, dm, table, rep, lora_mismatch=False,
+                 deferred=False):
+    """Emit the audit block for the counters since the previous report.
+
+    Called from ON_CLEANUP (once per sampling pass) and, with `deferred=True`,
+    from the watchdog for a pass whose cleanup never reached us -- a chain that
+    samples with a patcher we are not attached to leaves its numbers unclaimed.
+    """
+    delta = runtime.begin_pass()
+    pass_no = runtime._report_count
+    prev_sig = runtime._pass_sig
+    sig = _pass_signature(runtime)
+    runtime._pass_sig = sig
+    try:
+        section = "pass {}{}".format(pass_no, " (deferred)" if deferred else "")
+        lines, summary = _audit(runtime, table, delta, model, dm,
+                                lora_mismatch, pass_no)
+        if prev_sig is not None:
+            changed = [k for k in ("sigma", "t", "rows", "tokens", "segs",
+                                   "shift", "width")
+                       if prev_sig.get(k) != sig.get(k)]
+            lines.append("PASS DIFF   : {} vs pass {} -> changed: {}".format(
+                "identical" if not changed else "DIFFERENT",
+                pass_no - 1, ", ".join(changed) or "nothing"))
+            lines.append("  pass {}: {}".format(pass_no - 1, _describe_pass(prev_sig)))
+            lines.append("  pass {}: {}".format(pass_no, _describe_pass(sig)))
+        else:
+            lines.append("PASS DIFF   : first pass in this prompt ({})".format(
+                _describe_pass(sig)))
+        rep.add(section, "this pass     : injections={} matched={} "
+                         "failures={} native={} wrapper_steps={}".format(*delta))
+        rep.extend(section, lines)
+        trace_section = "{} · trace".format(section)
+        counters_section = "{} · counters".format(section)
+        if rep.debug:
+            rep.extend(trace_section, runtime.trace_lines())
+            rep.extend(counters_section, runtime.summary().splitlines())
+        if pass_no == 1:
+            rep.add("summary", "{} : {}".format(
+                summary.get("verdict") or
+                ("PASS" if summary["ok"] else "FAIL"),
+                summary["equivalence"]))
+        rep.log_section(section)
+        rep.log_section(trace_section)
+        rep.log_section(counters_section)
+        # The reconstruction's "missing" set is per-pass: keeping the union
+        # would attribute pass 1's rounding noise to a genuine pass-2 gap.
+        runtime.state["missing"] = set()
+    except Exception as e:  # never let reporting break the prompt
+        logging.warning("H3AdaLN: could not build the apply report (%s: %s)",
+                        type(e).__name__, e)
+    finally:
+        # ON_CLEANUP fires after the FIRST sampling pass, but a director chain
+        # then runs a SECOND pass (refine / SelfLift / custom sigmas) with a
+        # different t set. Removing the hooks here silently drops that pass from
+        # injection and stats. Keep them alive until the next prompt re-arms via
+        # _clear_runtime. The malloc-graph repair only makes sense on the
+        # sampler thread, never from the watchdog.
+        if not deferred:
+            apply_engine.recover_stale_malloc_graph()
+
+
 def _inject(model, dm, table, rep=None, source="", allow_lora_mismatch=False):
     """Replace all 51 AdaLN projections with the table's rows."""
     if rep is None:
@@ -1042,65 +1109,19 @@ def _inject(model, dm, table, rep=None, source="", allow_lora_mismatch=False):
     _clear_runtime(model)
     runtime = apply_engine.ExactAdaLNRuntime(
         table.t_values, table.raw_by_key, table.meta, dm, mode="strict")
+    runtime.verbose = rep.debug
     hooked = runtime.register(model)
     _nodes._track_registered(model, "_h3_exact_runtimes", runtime)
     model._h3_exact_runtime = runtime
 
     def _done(*_a, **_k):
-        # ON_CLEANUP fires once per sampling pass (first pass, refine, ...).
-        # ComfyUI never unregisters these callbacks, so this one is installed
-        # under a fixed key and replaced on the next apply -- never appended.
-        delta = runtime.begin_pass()
-        pass_no = runtime._report_count
-        prev_sig = runtime._pass_sig
-        sig = _pass_signature(runtime)
-        runtime._pass_sig = sig
-        try:
-            section = "pass {}".format(pass_no)
-            lines, summary = _audit(runtime, table, delta, model, dm,
-                                    lora_mismatch, pass_no)
-            if prev_sig is not None:
-                changed = [k for k in ("sigma", "t", "rows", "tokens", "segs",
-                                       "shift", "width")
-                           if prev_sig.get(k) != sig.get(k)]
-                lines.append("PASS DIFF   : {} vs pass {} -> changed: {}".format(
-                    "identical" if not changed else "DIFFERENT",
-                    pass_no - 1, ", ".join(changed) or "nothing"))
-                lines.append("  pass {}: {}".format(pass_no - 1, _describe_pass(prev_sig)))
-                lines.append("  pass {}: {}".format(pass_no, _describe_pass(sig)))
-            else:
-                lines.append("PASS DIFF   : first pass in this prompt ({})".format(
-                    _describe_pass(sig)))
-            rep.add(section, "this pass     : injections={} matched={} "
-                             "failures={} native={} wrapper_steps={}".format(*delta))
-            rep.extend(section, lines)
-            trace_section = "{} · trace".format(section)
-            counters_section = "{} · counters".format(section)
-            if rep.debug:
-                rep.extend(trace_section, runtime.trace_lines())
-                rep.extend(counters_section, runtime.summary().splitlines())
-            if pass_no == 1:
-                rep.add("summary", "{} : {}".format(
-                    summary.get("verdict") or
-                    ("PASS" if summary["ok"] else "FAIL"),
-                    summary["equivalence"]))
-            rep.log_section(section)
-            rep.log_section(trace_section)
-            rep.log_section(counters_section)
-            # The reconstruction's "missing" set is per-pass: keeping the union
-            # would attribute pass 1's rounding noise to a genuine pass-2 gap.
-            runtime.state["missing"] = set()
-        except Exception as e:  # never let reporting break the prompt
-            logging.warning("H3AdaLN: could not build the apply report (%s: %s)",
-                            type(e).__name__, e)
-        finally:
-            # ON_CLEANUP fires after the FIRST sampling pass, but a director
-            # chain then runs a SECOND pass (refine / SelfLift / custom sigmas)
-            # with a different t set. Removing the hooks here silently drops
-            # that pass from injection and stats. Keep them alive until the
-            # next prompt re-arms via _clear_runtime.
-            apply_engine.recover_stale_malloc_graph()
+        _report_pass(runtime, model, dm, table, rep, lora_mismatch)
 
+    runtime.pending_report = (
+        lambda: _report_pass(runtime, model, dm, table, rep, lora_mismatch,
+                             deferred=True))
+    _LIVE_RUNTIMES.append(runtime)
+    _ensure_autosave()
     _set_callback_once(model, "h3_adaln_apply", _done)
 
     rep.add("exec", "source      : {}".format(source or "(table_in)"))
@@ -1496,6 +1517,9 @@ _AUTOSAVE = {"thread": None, "lock": threading.Lock()}
 # (a headless / scripted `run()` has no unique_id, and the watchdog must still
 # find it).
 _LIVE_RECORDERS = []
+# Same idea for apply runtimes: needed to emit a report for a pass whose
+# ON_CLEANUP never fired.
+_LIVE_RUNTIMES = []
 
 
 def _ensure_autosave():
@@ -1543,6 +1567,27 @@ def _autosave_tick():
                      "sampling path did not fire ON_CLEANUP) -- merging them now",
                      rows - int(getattr(model, "_h3_saved_rows", 0) or 0))
         _save_recorded(model, seal_when_idle=False, quiet=True)
+
+    # Apply side: a pass whose ON_CLEANUP never reached us still has counters
+    # worth reporting. Only after the same idle window, so a run in progress is
+    # never split in half.
+    for rt in list(_LIVE_RUNTIMES):
+        report = getattr(rt, "pending_report", None)
+        if report is None or getattr(rt, "superseded", False):
+            continue
+        st = rt.state
+        snap = (st["injected"], st["match_hits"], st["match_failures"],
+                st["native_steps"], st["wrapper_steps"])
+        if snap == getattr(rt, "_last_report", (0, 0, 0, 0, 0)):
+            continue
+        if now - float(st.get("last_hook_at", 0.0) or 0.0) < AUTOSAVE_IDLE:
+            continue
+        logging.info("H3AdaLN: a sampling pass ended without ON_CLEANUP -- "
+                     "reporting its counters now")
+        try:
+            report()
+        except Exception:
+            continue
 
 
 # ---------------------------------------------------------------- nodes

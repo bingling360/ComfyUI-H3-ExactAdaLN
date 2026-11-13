@@ -443,6 +443,34 @@ def test_quantised_checkpoint_is_refused():
     raise AssertionError("a quantised checkpoint silently produced a fingerprint")
 
 
+def test_deferred_apply_report_without_cleanup():
+    """A pass with no ON_CLEANUP still gets a report, from the watchdog.
+
+    Real case: the 8-step first pass reports at its own cleanup, then the refine
+    pass runs through a sibling patcher and no cleanup ever reaches the armed
+    runtime -- its 4 steps (204 injections) were invisible in the console.
+    """
+    dm = tiny_model(seed=1313)
+    patcher = patcher_for(dm)
+    _, table, _rep = H().run(patcher, "record", fill_reference_row=False)
+    feed(dm, [1.0, 0.5])
+    patcher.cleanup()
+
+    _, _t, rep = H().run(patcher, "apply", report_level="debug",
+                         table=os.path.basename(table.source))
+    feed(dm, [1.0, 0.5])                    # sampled, but no patcher.cleanup()
+    runtime = patcher._h3_exact_runtime
+    assert runtime is not None
+    assert runtime.state["injected"] == 3, runtime.state["injected"]
+
+    runtime.state["last_hook_at"] -= (plugin.h3_unified.AUTOSAVE_IDLE + 1)
+    plugin.h3_unified._autosave_tick()
+
+    assert "deferred" in rep, rep
+    assert "injected=3" in rep, rep
+    plugin.h3_unified._clear_runtime(patcher)
+
+
 def test_two_passes_are_both_saved():
     """ON_CLEANUP fires per pass; a refine pass must add rows, not be dropped."""
     before = set(os.listdir(TABLE_DIR))
@@ -562,6 +590,8 @@ for name, fn in [
      test_missing_reference_row_is_reported),
     ("apply: resolves by declared base, hooks, cleanup unhooks",
      test_apply_arms_and_cleanup_unhooks),
+    ("apply: a pass with no ON_CLEANUP is reported by the watchdog",
+     test_deferred_apply_report_without_cleanup),
     ("record: a second sampling pass adds rows instead of losing them",
      test_two_passes_are_both_saved),
     ("record: a pass with no ON_CLEANUP is saved by the watchdog",
