@@ -1346,7 +1346,12 @@ def _save_recorded_inner(model, seal_when_idle=False, quiet=False):
         _seal_recorder(model, rep, "the save failed")
         return
 
-    model._h3_saved_rows = rows_now
+    # Count AFTER finalize, not before. `finalize()` folds the pre-computed
+    # reference rows into `rec.rows`, so the pre-build count is short by the
+    # number of pins -- the watchdog then saw "2 rows never saved", re-read the
+    # whole 462 MiB file just to answer "unchanged", and printed a phantom
+    # second pass.
+    model._h3_saved_rows = len(getattr(rec, "rows", {}) or {})
     model._h3_save_passes = int(getattr(model, "_h3_save_passes", 0) or 0) + 1
     rec.saved_once = True
     rec.passes = model._h3_save_passes

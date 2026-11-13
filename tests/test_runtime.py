@@ -280,6 +280,17 @@ def test_pinned_rows_match_a_real_reference_batch():
     assert "t=0.999 pre-computed" in pins, pins
     assert "t=1.000 produced by this run" in pins, pins
 
+    # The saved-row watermark must be the count AFTER finalize(): finalize folds
+    # the pre-computed pins into rec.rows, so a pre-build count leaves the
+    # watchdog thinking 2 rows were never written, and it re-reads the whole
+    # 462 MiB table to answer "unchanged".
+    assert patcher._h3_saved_rows == len(patcher._h3_recorder.rows), (
+        patcher._h3_saved_rows, len(patcher._h3_recorder.rows))
+    passes = patcher._h3_save_passes
+    patcher._h3_recorder.last_row_at -= (plugin.h3_unified.AUTOSAVE_IDLE + 1)
+    plugin.h3_unified._autosave_tick()
+    assert patcher._h3_save_passes == passes, "phantom save after the pins"
+
 
 def test_missing_reference_row_is_reported():
     """A text-only run should say, at save time, that t=0.999 is absent."""
