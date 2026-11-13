@@ -351,7 +351,7 @@ def test_apply_arms_and_cleanup_unhooks():
     assert len(runtime.hook_handles) == 3, "refine pass must still be hooked"
     assert "[pass 1]" in report, report          # per-pass audit exists
     assert "INJECTION" in report and "EQUIVALENCE" in report, report
-    assert "no sampling in this pass" in report, report
+    assert "zero forwards" in report, report      # armed but nothing sampled
 
     patcher.cleanup()
     assert "[pass 2]" in report, "a second pass must get its own section"

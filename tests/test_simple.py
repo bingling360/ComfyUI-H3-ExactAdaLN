@@ -145,6 +145,56 @@ def test_report_node():
     assert "always" in captured[0], captured
 
 
+def test_audit_distinguishes_noise_from_gaps():
+    """A perfect pass must not be reported FAIL because of sigma-rounding.
+
+    The real 4080 run injected 408/408 rows with max_dist=0 and was still
+    reported `INJECTION: FAIL / 5 timestep(s) absent`, because the sigma
+    reconstruction (`timestep/1000`) rounds differently from the DiT's own
+    `1 - sigma` and produced 5 near-miss values.
+    """
+    import types
+
+    class FakeModel:
+        patches = {}
+
+    model = FakeModel()
+    dm = types.SimpleNamespace(manual_cast_dtype=None)
+    sig = H.runtime_signature(model, dm)
+    table = H.table_io.AdaLNTable(
+        [0.0, 0.0117646], {"blocks.0": torch.zeros(2, 1)},
+        {"record_mode": "observed during sampling", "runtime_signature": sig,
+         "repeat_conflicts": "0", "max_repeat_delta": "0.000e+00"})
+    state = {
+        "missing": {0.0117647, 0.0666666}, "injection_delta_measured": True,
+        "max_injection_delta": 0.4, "match_hits": 51, "match_approx": 0,
+        "max_match_distance": 0.0, "first_key": "blocks.0", "first_dist": 0.0,
+        "last_segs": 4, "last_tokens": 62453, "layout_changes": 0,
+        "shift_changes": 0, "per_row_timestep": False,
+    }
+    runtime = types.SimpleNamespace(state=dict(state), trace=[])
+    lines, summary = H._audit(runtime, table, (51, 51, 0, 0, 1), model, dm)
+    text = "\n".join(lines)
+    assert summary["ok"], text
+    assert "timestep/1000 rounding" in text, text
+
+    # Same pass, but with a real gap (a hook could not be matched): FAIL.
+    hard = dict(state)
+    hard["missing"] = set()
+    lines2, summary2 = H._audit(
+        types.SimpleNamespace(state=hard, trace=[]), table, (50, 51, 1, 0, 1),
+        model, dm)
+    assert not summary2["ok"], lines2
+    assert "could not be matched" in "\n".join(lines2)
+
+    # Zero forwards through this runtime is a failure, not "no sampling".
+    lines3, summary3 = H._audit(
+        types.SimpleNamespace(state=dict(state, missing=set()), trace=[]),
+        table, (0, 0, 0, 0, 0), model, dm)
+    assert not summary3["ok"], lines3
+    assert "zero forwards" in "\n".join(lines3), lines3
+
+
 def test_only_four_nodes_are_registered():
     import importlib.util
     import os
@@ -621,6 +671,8 @@ check("scan: only models/h3_exact_adaln is searched",
       test_only_one_table_directory_is_scanned)
 check("report: the live report object renders through H3 AdaLN Report",
       test_report_node)
+check("report: sigma-reconstruction noise is not an injection failure",
+      test_audit_distinguishes_noise_from_gaps)
 check("schema: exactly four core nodes are registered",
       test_only_four_nodes_are_registered)
 check("name: derived from model fp + dtype (+ AdaLN LoRA)", test_auto_name)

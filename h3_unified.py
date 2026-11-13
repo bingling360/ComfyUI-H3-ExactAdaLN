@@ -832,17 +832,38 @@ def _audit(runtime, table, delta, model, dm, lora_mismatch=False, pass_no=1):
     meta = table.meta or {}
     sampled = injections > 0 or wrapper > 0 or native > 0
     measured = bool(st.get("injection_delta_measured"))
+    # `missing` comes from the sigma-reconstruction fallback, which rebuilds t
+    # from `timestep / 1000`. That division rounds differently from the way the
+    # DiT derived t (`1 - sigma` on the schedule's own float32), so a run whose
+    # t_emb match was EXACT can still produce a handful of "missing" values that
+    # differ in the 7th decimal. Treating those as an injection failure made a
+    # perfect 408/408 pass report FAIL and NOT ESTABLISHED.
+    real_gap = (failures > 0) or (native > 0)
 
     injection_problems = []
     if not sampled:
-        injection_state = "N/A (no sampling in this pass)"
+        # Not "no sampling": this runtime cannot tell. What it does know is that
+        # none of its hooks (or its own DIFFUSION_MODEL wrapper) ever saw a
+        # forward. On a real run that means the chain sampled a different model
+        # object -- a rebuilt ModelPatcher, or a checkpoint instantiated inside
+        # the custom sampling node -- and AdaLN was NOT injected.
+        injection_state = "FAIL (no forward reached this runtime)"
+        injection_problems.append(
+            "this runtime saw zero forwards. If this chain really sampled, it "
+            "did not sample the model this Apply node is attached to (a "
+            "rebuilt patcher or a checkpoint reloaded inside a custom sampler "
+            "has no hooks), so AdaLN was NOT injected for this pass")
     else:
         if injections == 0:
             injection_problems.append("no table row was injected this pass")
         if native:
             injection_problems.append(
                 "{} step(s) used the base's native AdaLN".format(native))
-        if missing:
+        if failures:
+            injection_problems.append(
+                "{} hook call(s) could not be matched to a table row"
+                .format(failures))
+        if missing and real_gap:
             injection_problems.append(
                 "{} timestep(s) absent from the table".format(len(missing)))
         if lora_mismatch:
@@ -887,10 +908,10 @@ def _audit(runtime, table, delta, model, dm, lora_mismatch=False, pass_no=1):
         shift_note += " -- NOT authoritative, the header shift is a fallback"
 
     provenance_ok = not provenance_problems
-    if not sampled:
-        equivalence = "NOT EVALUATED (no sampling in this pass)"
-    elif not injection_ok:
-        equivalence = "NOT ESTABLISHED -- the table did not fully replace AdaLN"
+    if not injection_ok:
+        equivalence = ("NOT ESTABLISHED -- the table did not replace AdaLN in "
+                       "this pass ({})".format(
+                           "; ".join(injection_problems[:2]) or "see above"))
     elif provenance_ok:
         equivalence = ("ESTABLISHED BY CONSTRUCTION: every step injected a row "
                        "observed from the teacher, under a matching runtime")
@@ -920,6 +941,12 @@ def _audit(runtime, table, delta, model, dm, lora_mismatch=False, pass_no=1):
         "  per-row t : {}".format(
             "YES -- denoise_mask; only the t_emb match is reliable"
             if st["per_row_timestep"] else "no"),
+        "  recon     : {}".format(
+            "clean" if not missing else
+            ("{} t value(s) the sigma rebuild could not place, but every t_emb "
+             "row matched exactly -- timestep/1000 rounding, not a gap"
+             .format(len(missing)) if not real_gap else
+             "{} t value(s) missing from the table".format(len(missing)))),
         "PROVENANCE  : {} | mode={} conflicts={}".format(
             "OK" if provenance_ok else "DEGRADED", record_mode or "?",
             meta.get("repeat_conflicts", "?")),
@@ -980,6 +1007,18 @@ def _inject(model, dm, table, rep=None, source="", allow_lora_mismatch=False):
             warnings.append("table is {} but this model computes in {} -- the "
                             "result will NOT be bitwise".format(want, got))
 
+    # Two Apply nodes on one shared diffusion model: only the last armed one
+    # ever injects, and the other one silently becomes a no-op that still
+    # reports "this pass saw no sampling". Say it instead of hiding it.
+    other = [r for r in (getattr(dm, "_h3_exact_runtimes", None) or [])
+             if getattr(r, "hook_handles", None)
+             and getattr(r, "_wrapper_model", model) is not model]
+    if other:
+        msg = ("another Apply node was already armed on this shared diffusion "
+               "model; its hooks are detached now, so only this node injects. "
+               "Two Apply nodes on one model cannot both run.")
+        rep.add("exec", "TOOK OVER   : " + msg)
+        logging.warning("H3AdaLN: %s", msg)
     _clear_runtime(model)
     runtime = apply_engine.ExactAdaLNRuntime(
         table.t_values, table.raw_by_key, table.meta, dm, mode="strict")
@@ -1026,6 +1065,9 @@ def _inject(model, dm, table, rep=None, source="", allow_lora_mismatch=False):
             rep.log_section(section)
             rep.log_section(trace_section)
             rep.log_section(counters_section)
+            # The reconstruction's "missing" set is per-pass: keeping the union
+            # would attribute pass 1's rounding noise to a genuine pass-2 gap.
+            runtime.state["missing"] = set()
         except Exception as e:  # never let reporting break the prompt
             logging.warning("H3AdaLN: could not build the apply report (%s: %s)",
                             type(e).__name__, e)
