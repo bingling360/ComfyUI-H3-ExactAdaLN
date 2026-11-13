@@ -273,6 +273,13 @@ def test_pinned_rows_match_a_real_reference_batch():
     idx = [i for i, v in enumerate(t_values) if abs(v - 0.999) < 1e-6][0]
     assert torch.equal(raw["blocks.0"][idx], want.float()), "pinned row differs"
 
+    # The report must say HOW each pin got there: 0.999 was pre-computed in an
+    # extra batch, 1.0 was produced by the run itself. Both used to print
+    # "captured", which hides a failed pin pre-computation.
+    pins = patcher._h3_recorder.pins_report
+    assert "t=0.999 pre-computed" in pins, pins
+    assert "t=1.000 produced by this run" in pins, pins
+
 
 def test_missing_reference_row_is_reported():
     """A text-only run should say, at save time, that t=0.999 is absent."""
@@ -380,6 +387,49 @@ def test_apply_hook_end_to_end():
     assert "max delta : UNAVAILABLE" not in rep, rep
     assert "NOT ESTABLISHED" not in rep, rep
     plugin.h3_unified._clear_runtime(patcher)
+
+
+def test_deferred_save_covers_a_pass_without_cleanup():
+    """A custom sampling node that never fires ON_CLEANUP must not lose rows.
+
+    The real 4080 run did exactly this: the refine pass went through a
+    hand-written sampler that unloads models itself, so `ModelPatcher.cleanup()`
+    never ran and the 8 timesteps it captured never reached the table.
+    """
+    dm = tiny_model(seed=1212)
+    patcher = patcher_for(dm)
+    _, table, _rep = H().run(patcher, "record", fill_reference_row=False)
+    feed(dm, [1.0, 0.5])
+    patcher.cleanup()                              # pass 1 -> saved
+    assert len(plugin.table_io.load_table(table.source)[0]) == 2
+
+    feed(dm, [0.25, 0.1])                          # refine, NO cleanup
+    rec = patcher._h3_recorder
+    assert len(rec.rows) == 4, len(rec.rows)
+
+    rec.last_row_at -= (plugin.h3_unified.AUTOSAVE_IDLE + 1)
+    plugin.h3_unified._autosave_tick()
+
+    t_values = plugin.table_io.load_table(table.source)[0]
+    assert len(t_values) == 4, t_values
+    assert patcher._h3_saved_rows == 4, patcher._h3_saved_rows
+
+
+def test_quantised_checkpoint_is_refused():
+    """A file-side fingerprint over int8 bytes can never match the loaded model."""
+    import torch as _t
+    from safetensors.torch import save_file
+
+    path = os.path.join(CKPT_DIR, "quantised.safetensors")
+    save_file({"blocks.0.adaln_proj.linear.weight":
+               _t.zeros((8, 8), dtype=_t.int8),
+               "blocks.0.adaln_proj.linear.bias": _t.zeros(8)}, path)
+    try:
+        plugin.h3_unified.base_fingerprint_from_file(path)
+    except RuntimeError as e:
+        assert "quantised" in str(e), str(e)
+        return
+    raise AssertionError("a quantised checkpoint silently produced a fingerprint")
 
 
 def test_two_passes_are_both_saved():
@@ -503,6 +553,10 @@ for name, fn in [
      test_apply_arms_and_cleanup_unhooks),
     ("record: a second sampling pass adds rows instead of losing them",
      test_two_passes_are_both_saved),
+    ("record: a pass with no ON_CLEANUP is saved by the watchdog",
+     test_deferred_save_covers_a_pass_without_cleanup),
+    ("fingerprint: a quantised checkpoint is refused",
+     test_quantised_checkpoint_is_refused),
     ("apply: real AdalnProj forward is replaced (cdist + delta)",
      test_apply_hook_end_to_end),
     ("apply: a foreign AdaLN LoRA is refused, not injected silently",

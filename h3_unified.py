@@ -49,6 +49,7 @@ sampling segment, and rows from different schedules simply accumulate.
 import hashlib
 import logging
 import os
+import threading
 import time
 
 import torch
@@ -460,15 +461,39 @@ def base_fingerprint_from_file(path):
         blocks = 0
         while "blocks.{}.adaln_proj.linear.weight".format(blocks) in keys:
             blocks += 1
+        picks = [0, blocks // 2, blocks - 1] if blocks else []
+        prefixes = [("blocks.{}".format(i) if isinstance(i, int) else "final_layer")
+                    for i in picks + ["final_layer"]]
+        # A quantised checkpoint stores adaln_proj as int8 plus scale factors.
+        # Hashing those bytes as float32 can never equal the fingerprint of the
+        # loaded (dequantised) module, so the table would be stamped with a base
+        # that no apply run can ever match -- and nothing would say why. Refuse.
+        quantised = []
+        for key in (["adaln_t_table"] if "adaln_t_table" in keys else []) + \
+                [p + ".adaln_proj.linear.weight" for p in prefixes]:
+            try:
+                head = f.get_slice(key)[0]
+            except Exception:
+                continue
+            if not torch.is_tensor(head) or head.is_floating_point():
+                continue
+            quantised.append("{} ({})".format(key, head.dtype))
+        if quantised:
+            raise RuntimeError(
+                "H3AdaLN: {} stores the AdaLN branch quantised, not as floats "
+                "({}). A file-side fingerprint would never match the loaded "
+                "model, so this table could not be found by table=(auto). "
+                "Use a checkpoint that keeps adaln_proj / adaln_t_table in "
+                "bf16/fp16/fp32, or record with for_model=(none) and pick the "
+                "table by name.".format(os.path.basename(path),
+                                        ", ".join(quantised[:4])))
         h = hashlib.sha1()
         h.update("curve={};blocks={};".format(
             "adaln_t_table" in keys, blocks).encode())
         if "adaln_t_table" in keys:
             h.update(_f32_bytes(f.get_slice("adaln_t_table")[0:4],
                                 round_to_bf16=True))
-        picks = [0, blocks // 2, blocks - 1] if blocks else []
-        for i in picks + ["final_layer"]:
-            prefix = "blocks.{}".format(i) if isinstance(i, int) else "final_layer"
+        for prefix in prefixes:
             h.update(_file_head(f, prefix + ".adaln_proj.linear.weight",
                                 round_to_bf16=True))
             h.update(_file_head(f, prefix + ".adaln_proj.linear.bias",
@@ -1123,6 +1148,10 @@ def _stop_recording(model):
             recorder.remove()
         except Exception:
             pass
+        try:
+            _LIVE_RECORDERS.remove(recorder)
+        except ValueError:
+            pass
         model._h3_recorder = None
     if uid:
         _ACTIVE_RECORDERS.pop(uid, None)
@@ -1173,7 +1202,22 @@ def _finish_record(model):
             pass
 
 
-def _save_recorded(model, seal_when_idle=False):
+def _save_recorded(model, seal_when_idle=False, quiet=False):
+    """Merge this run's rows into the table. Re-entrancy guarded.
+
+    Called from ON_CLEANUP (main thread) and from the deferred-save watchdog
+    (background thread), so it must never run twice at once.
+    """
+    if getattr(model, "_h3_saving", False):
+        return
+    model._h3_saving = True
+    try:
+        _save_recorded_inner(model, seal_when_idle, quiet)
+    finally:
+        model._h3_saving = False
+
+
+def _save_recorded_inner(model, seal_when_idle=False, quiet=False):
     table = getattr(model, "_h3_pending_table", None)
     if table is None:
         return
@@ -1199,6 +1243,12 @@ def _save_recorded(model, seal_when_idle=False):
     try:
         table.finalize(required=True)
     except Exception as e:
+        if quiet:
+            # A watchdog flush can land between two projections of one forward;
+            # the row sets are inconsistent for a moment and build() refuses.
+            # Nothing is wrong, and the next tick will try again.
+            logging.info("H3AdaLN: deferred save skipped -- %s", e)
+            return
         logging.error("H3AdaLN: nothing saved -- %s", e)
         if rep is not None:
             rep.add("record", "SAVE FAILED : {}".format(e))
@@ -1336,10 +1386,94 @@ def _seal_recorder(model, rep, why):
     except Exception:
         pass
     model._h3_recorder = None
+    try:
+        _LIVE_RECORDERS.remove(rec)
+    except ValueError:
+        pass
+    uid = str(getattr(model, "_h3_rec_uid", "") or "")
+    if uid:
+        _ACTIVE_RECORDERS.pop(uid, None)
+    dm = getattr(model, "_h3_rec_dm", None)
+    if dm is not None:
+        try:
+            active = getattr(dm, "_h3_active_recorders", None)
+            if isinstance(active, dict) and uid:
+                active.pop(uid, None)
+        except Exception:
+            pass
     if rep is not None:
         rep.add("record", "sealed      : {} -- hooks detached; a new record run "
                           "re-arms automatically".format(why))
     logging.info("H3AdaLN: recording closed (%s)", why)
+
+
+# ---------------------------------------------------------------- deferred save
+# ON_CLEANUP is the only save trigger, and it comes from
+# `CFGGuider.outer_sample`'s finally block. A custom node that samples on its
+# own (a director "second pass" / SelfLift step) never goes through that path,
+# so its timesteps are captured into the recorder and then sit there forever:
+# observed on a real 4080 run, where the refine pass added 8 t rows that never
+# reached the table.
+#
+# The watchdog below closes that hole without hooking anything global: as soon
+# as the recorder has been quiet for AUTOSAVE_IDLE seconds with rows that are
+# not on disk yet, they are merged in. It only touches CPU tensors and file I/O,
+# never CUDA, and `_save_recorded` is re-entrancy guarded, so a flush can never
+# race an in-flight save.
+AUTOSAVE_IDLE = 60.0
+AUTOSAVE_TICK = 5.0
+_AUTOSAVE = {"thread": None, "lock": threading.Lock()}
+# Every recorder that is still capturing, independent of the UNIQUE_ID registry
+# (a headless / scripted `run()` has no unique_id, and the watchdog must still
+# find it).
+_LIVE_RECORDERS = []
+
+
+def _ensure_autosave():
+    if _AUTOSAVE["thread"] is not None:
+        return
+    with _AUTOSAVE["lock"]:
+        if _AUTOSAVE["thread"] is not None:
+            return
+        thread = threading.Thread(target=_autosave_loop,
+                                  name="h3-adaln-autosave", daemon=True)
+        _AUTOSAVE["thread"] = thread
+        thread.start()
+
+
+def _autosave_loop():
+    while True:
+        time.sleep(AUTOSAVE_TICK)
+        try:
+            _autosave_tick()
+        except Exception:  # a watchdog must never take the process down
+            continue
+
+
+def _autosave_tick():
+    now = time.time()
+    for rec in list(_LIVE_RECORDERS):
+        if rec is None or getattr(rec, "sealed", False) or getattr(rec, "abandoned", False):
+            try:
+                _LIVE_RECORDERS.remove(rec)
+            except ValueError:
+                pass
+            continue
+        model = getattr(rec, "model", None)
+        if model is None or getattr(model, "_h3_recorder", None) is not rec:
+            continue
+        rows = len(getattr(rec, "rows", {}) or {})
+        if rows <= int(getattr(model, "_h3_saved_rows", 0) or 0):
+            continue
+        last = float(getattr(rec, "last_row_at", 0.0) or 0.0)
+        if now - last < AUTOSAVE_IDLE:
+            continue
+        if getattr(model, "_h3_saving", False):
+            continue
+        logging.info("H3AdaLN: %d row(s) were captured but never saved (the "
+                     "sampling path did not fire ON_CLEANUP) -- merging them now",
+                     rows - int(getattr(model, "_h3_saved_rows", 0) or 0))
+        _save_recorded(model, seal_when_idle=False, quiet=True)
 
 
 # ---------------------------------------------------------------- nodes
@@ -1542,6 +1676,7 @@ class H3AdaLN:
         _nodes._track_registered(model, "_h3_recorders", recorder)
         model._h3_recorder = recorder
         model._h3_rec_uid = uid
+        _LIVE_RECORDERS.append(recorder)
         if uid:
             _ACTIVE_RECORDERS[uid] = recorder
             if active is not None:
@@ -1585,6 +1720,7 @@ class H3AdaLN:
         model._h3_saved = False
         model._h3_saved_rows = 0
         model._h3_save_passes = 0
+        _ensure_autosave()
         if not _set_callback_once(model, "h3_adaln_record",
                                   lambda *a, **k: _finish_record(model)):
             logging.warning("H3AdaLN: cannot hook save-on-cleanup; the table "

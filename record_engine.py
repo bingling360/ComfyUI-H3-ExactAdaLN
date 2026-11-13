@@ -34,12 +34,14 @@ the same dtype the teacher used.
 
 import logging
 import threading
+import time
 
 import torch
 
 try:
-    from . import sigma_plan
+    from . import apply_engine, sigma_plan
 except ImportError:
+    import apply_engine
     import sigma_plan
 
 
@@ -141,6 +143,10 @@ class AdaLNRecorder:
         self.trace_cap = 64
         self._labels_cache = None
         self.pins_report = ""
+        # Wall clock of the last captured row. The deferred-save watchdog uses
+        # it to tell "a pass is still running" from "sampling stopped and the
+        # rows are sitting in memory, unsaved".
+        self.last_row_at = 0.0
 
     # -- registration ----------------------------------------------------
     def register(self):
@@ -150,14 +156,22 @@ class AdaLNRecorder:
                 "H3AdaLN: this checkpoint has no `time_embedder` -- it is a "
                 "pruned/curve base. Record must run on the FULL teacher model "
                 "(same checkpoint you would feed to Bake).")
-        self.handles.append(te.register_forward_hook(self._time_embedder_hook))
+        # Same reason as the injection hooks: these run inside the DiT forward,
+        # which ComfyUI 0.44+ wraps in a comfy-aimdo malloc graph. The bulk
+        # `output.to(torch.float32)` below is a GPU allocation made inside that
+        # graph -- it is recorded as a "rogue" and breaks the compiled prefetch
+        # allocation plan ("Comfy model compiler graph breaks: N, rogues: N").
+        outside = apply_engine._outside_malloc_graph
+        self.handles.append(te.register_forward_hook(
+            outside(self._time_embedder_hook)))
 
         for key, ap in _adln_projections(self.dm):
             expected = int(getattr(ap, "expand", 0)) * int(getattr(ap, "hidden", 0)) \
                 * int(getattr(ap, "modalities", 0))
             self.proj_keys.append(key)
             self.handles.append(
-                ap.linear.register_forward_hook(self._linear_hook(key, ap, expected)))
+                ap.linear.register_forward_hook(
+                    outside(self._linear_hook(key, ap, expected))))
         if not self.proj_keys:
             raise RuntimeError("H3AdaLN: no adaln_proj modules found")
         self._canary_key = "blocks.0" if "blocks.0" in self.proj_keys else self.proj_keys[0]
@@ -342,6 +356,8 @@ class AdaLNRecorder:
                 slot[key] = rows_cpu[i]
                 if len(slot) == 1:
                     self.t_order.append(t)
+            if new_rows:
+                self.last_row_at = time.time()
             # The same t must produce the same row on every step / every CFG
             # pass, for EVERY block -- a LoRA or a weight change that only
             # touches blocks 20..49 left blocks.0 identical, so a canary-only
@@ -397,6 +413,10 @@ class AdaLNRecorder:
                 "saved; re-record with fill_reference_row enabled and a single "
                 "record node.".format(
                     ", ".join("{:.3f}".format(p) for p in missing_pins)))
+        # Computed BEFORE the pre-computed rows are folded into self.rows --
+        # otherwise every successful pin reports "captured", which is exactly the
+        # ambiguity the line exists to remove.
+        self.pins_report = self._pins_report()
         for pin, entries in sorted(self.pinned.items()):
             key_t = sigma_plan.f32_image(pin)
             if key_t in self.rows:
@@ -409,8 +429,6 @@ class AdaLNRecorder:
                 continue
             self.rows[key_t] = dict(entries)
             self.t_order.append(key_t)
-
-        self.pins_report = self._pins_report()
 
         t_values = sorted(self.rows)
         raw = {}

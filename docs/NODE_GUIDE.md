@@ -480,6 +480,21 @@ Bake 引擎已删除，依赖它们的 01~08 工作流也一并删除。现在 `
 - full→pruned 主路径被「模型指纹相等」检查误杀 → 现在只在 full 目标上比较。
 - **v2 新增**：同一 t 出现两种调制值 → 拒绝写盘，不会静默保留其中一份。
 
+### 7.5.1 自定义采样节点不会触发 `ON_CLEANUP`
+
+`ON_CLEANUP` 只从 `comfy/samplers.py` 的 `CFGGuider.outer_sample` finally 里发出。标准
+`SamplerCustomAdvanced` / `KSampler` 都会走到，但**自己写循环采样、自己
+`unload_all_models` 的节点（导演台二采 / SelfLift 这类）不会走**。
+
+症状：日志里出现 `first rows captured at t=0.6500000, …`（说明行确实录到了），
+但后面既没有 `saved` / `merged`，也没有 `[pass 2]` 报告块；表里缺这一段 t，
+之后 apply 会在第一步报 `missing from table (0.65…)`。
+
+现在有兜底：录制器连续 `AUTOSAVE_IDLE`（60 s）没有新行、且还有没落盘的行时，
+后台看门狗会自己合并一次，并在日志里说
+`N row(s) were captured but never saved (the sampling path did not fire ON_CLEANUP)`。
+如果这段采样本身超过 60 s 一步，可能提前存一次不完整的表（下次会继续合并，不影响正确性）。
+
 ### 7.6 SelfLift 的 30 dB 残差（不是 bug，别再改插件）
 
 SelfLift 在两段之间插入 clean endpoint → 学习式 `LatentResizer3D` 上采样
