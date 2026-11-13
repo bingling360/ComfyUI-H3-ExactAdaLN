@@ -152,6 +152,10 @@ class ExactAdaLNRuntime:
         self._last_report = (0, 0, 0, 0, 0)
         self._report_count = 0
         self._pass_sig = None
+        # Set when another Apply node takes over the shared diffusion model.
+        # This runtime's hooks are gone by design, so "zero forwards" here is
+        # not a failure -- the other node did the injection.
+        self.superseded = False
 
     # -- key construction ------------------------------------------------
     def _discover_key_sets(self, dm):
@@ -597,13 +601,17 @@ class ExactAdaLNRuntime:
     def trace_lines(self, limit=None):
         """Per-forward mapping trace, for the debug report."""
         out = []
-        for i, item in enumerate(self.trace[:limit] if limit else self.trace):
+        entries = self.trace[:limit] if limit else self.trace
+        for i, item in enumerate(entries):
             sigma = item.get("sigma")
             shift = item.get("shift")
+            # `forward` is the wrapper's step counter, which stays 0 when the
+            # wrapper does not run (a chain that samples without model_options).
+            # Printing it as "step" produced eight identical `step 0` lines.
             out.append(
-                "step {:<3} {:<10} sigma={} shift={}/{} tokens={} segs={} "
-                "t_emb={}x{} -> rows={} {} max_dist={:.3e}".format(
-                    item["forward"], item["how"],
+                "fwd {:<3} wrapper#{} {:<14} sigma={} shift={}/{} tokens={} "
+                "segs={} t_emb={}x{} -> rows={} {} max_dist={:.3e}".format(
+                    i, item.get("forward", 0), item["how"],
                     "{:.7f}".format(sigma) if isinstance(sigma, float) else sigma,
                     "{:g}".format(shift[0]) if shift else "?",
                     "{:g}".format(shift[1]) if shift else "?",

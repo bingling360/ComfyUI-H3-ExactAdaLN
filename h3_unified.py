@@ -841,7 +841,13 @@ def _audit(runtime, table, delta, model, dm, lora_mismatch=False, pass_no=1):
     real_gap = (failures > 0) or (native > 0)
 
     injection_problems = []
-    if not sampled:
+    superseded = bool(getattr(runtime, "superseded", False))
+    if not sampled and superseded:
+        # Another Apply node on the same diffusion model took this runtime's
+        # hooks away on purpose. Reporting FAIL here was a false alarm: the
+        # node that took over did inject, and its own report says so.
+        injection_state = "N/A (superseded by another Apply node)"
+    elif not sampled:
         # Not "no sampling": this runtime cannot tell. What it does know is that
         # none of its hooks (or its own DIFFUSION_MODEL wrapper) ever saw a
         # forward. On a real run that means the chain sampled a different model
@@ -908,7 +914,10 @@ def _audit(runtime, table, delta, model, dm, lora_mismatch=False, pass_no=1):
         shift_note += " -- NOT authoritative, the header shift is a fallback"
 
     provenance_ok = not provenance_problems
-    if not injection_ok:
+    if not sampled and superseded:
+        equivalence = ("NOT EVALUATED -- this runtime was superseded by another "
+                       "Apply node on the same model; that node did the injection")
+    elif not injection_ok:
         equivalence = ("NOT ESTABLISHED -- the table did not replace AdaLN in "
                        "this pass ({})".format(
                            "; ".join(injection_problems[:2]) or "see above"))
@@ -965,8 +974,11 @@ def _audit(runtime, table, delta, model, dm, lora_mismatch=False, pass_no=1):
                         "(explicit `table` pick, injection allowed)".format(
                             meta.get("adaln_lora_fingerprint") or "none",
                             _adaln_lora_fingerprint(model) or "none"))
+    verdict = ("SUPERSEDED" if (not sampled and superseded)
+               else "PASS" if (injection_ok and provenance_ok) else "FAIL")
     summary = {
         "ok": bool(injection_ok and provenance_ok),
+        "verdict": verdict,
         "injected": injections, "native": native, "missing": len(missing),
         "equivalence": equivalence,
     }
@@ -1019,6 +1031,14 @@ def _inject(model, dm, table, rep=None, source="", allow_lora_mismatch=False):
                "Two Apply nodes on one model cannot both run.")
         rep.add("exec", "TOOK OVER   : " + msg)
         logging.warning("H3AdaLN: %s", msg)
+        for r in other:
+            # Its ON_CLEANUP still fires (its patcher is cleaned as usual), and
+            # without this flag it would report "zero forwards -> FAIL" for a
+            # model that the node in front of it is injecting correctly.
+            try:
+                r.superseded = True
+            except Exception:
+                pass
     _clear_runtime(model)
     runtime = apply_engine.ExactAdaLNRuntime(
         table.t_values, table.raw_by_key, table.meta, dm, mode="strict")
@@ -1061,7 +1081,9 @@ def _inject(model, dm, table, rep=None, source="", allow_lora_mismatch=False):
                 rep.extend(counters_section, runtime.summary().splitlines())
             if pass_no == 1:
                 rep.add("summary", "{} : {}".format(
-                    "PASS" if summary["ok"] else "FAIL", summary["equivalence"]))
+                    summary.get("verdict") or
+                    ("PASS" if summary["ok"] else "FAIL"),
+                    summary["equivalence"]))
             rep.log_section(section)
             rep.log_section(trace_section)
             rep.log_section(counters_section)

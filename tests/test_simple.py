@@ -194,6 +194,14 @@ def test_audit_distinguishes_noise_from_gaps():
     assert not summary3["ok"], lines3
     assert "zero forwards" in "\n".join(lines3), lines3
 
+    # ... unless another Apply node took this runtime's hooks on purpose.
+    lines4, summary4 = H._audit(
+        types.SimpleNamespace(state=dict(state, missing=set()), trace=[],
+                              superseded=True),
+        table, (0, 0, 0, 0, 0), model, dm)
+    assert summary4["verdict"] == "SUPERSEDED", (summary4, lines4)
+    assert "superseded" in "\n".join(lines4), lines4
+
 
 def test_only_four_nodes_are_registered():
     import importlib.util
