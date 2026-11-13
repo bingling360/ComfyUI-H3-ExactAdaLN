@@ -153,10 +153,11 @@ def test_registration():
     assert "H3AdaLN" in plugin.NODE_CLASS_MAPPINGS
     assert "H3AdaLNHybrid" in plugin.NODE_CLASS_MAPPINGS
     spec_i = H.INPUT_TYPES()
-    assert list(spec_i["required"]) == ["model", "mode", "report_level"], \
-        list(spec_i["required"])
-    assert list(spec_i["optional"]) == ["for_model", "fill_reference_row",
-                                      "table", "table_in", "after"]
+    assert list(spec_i["required"]) == ["model", "mode"], list(spec_i["required"])
+    assert "report_level" in spec_i["optional"], spec_i["optional"]
+    assert list(spec_i["optional"]) == ["report_level", "for_model",
+                                        "fill_reference_row", "table",
+                                        "table_in", "after"]
     assert os.path.isdir(FOLDER), "register_folder() did not create {}".format(FOLDER)
     paths = folder_paths.get_folder_paths("h3_exact_adaln")
     assert FOLDER in paths, "not registered as a model folder: {}".format(paths)

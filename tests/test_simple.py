@@ -69,10 +69,13 @@ def clean():
 # ---------------------------------------------------------------- schema
 def test_schema():
     spec = H.H3AdaLN.INPUT_TYPES()
-    assert list(spec["required"]) == ["model", "mode", "report_level"], spec["required"]
-    assert list(spec["required"]["report_level"][0]) == ["silent", "brief", "debug"]
-    assert list(spec["optional"]) == ["for_model", "fill_reference_row", "table",
+    assert list(spec["required"]) == ["model", "mode"], spec["required"]
+    # report_level must stay OPTIONAL: /prompt rejects a graph that omits a
+    # required input, and prompts written before this widget existed omit it.
+    assert list(spec["optional"]) == ["report_level", "for_model",
+                                      "fill_reference_row", "table",
                                       "table_in", "after"], spec["optional"]
+    assert list(spec["optional"]["report_level"][0]) == ["silent", "brief", "debug"]
     assert spec["required"]["mode"][0] == ["apply", "record", "off"]
     assert spec["optional"]["table"][0][0] == H.AUTO
     assert spec["optional"]["for_model"][0][0] == H.NONE

@@ -1372,6 +1372,13 @@ class H3AdaLN:
                                "record: capture one while this (full) model samples; "
                                "it is written when the run ends.\n"
                                "off: pass through, for an A/B control run."}),
+            },
+            "optional": {
+                # Optional on purpose: ComfyUI's /prompt validation rejects a
+                # graph that omits a *required* input, so prompts written before
+                # this widget existed (scripts, saved API workflows) would fail
+                # with "Required input is missing: report_level". As an optional
+                # widget it still shows up in the UI with its default.
                 "report_level": (_nodes.REPORT_LEVELS, {
                     "default": "brief",
                     "tooltip": "How much this node says.\n"
@@ -1385,8 +1392,6 @@ class H3AdaLN:
                                "The same text is available on the `report` "
                                "output: connect it to `H3 AdaLN Report` and put "
                                "that node AFTER sampling."}),
-            },
-            "optional": {
                 "for_model": (_model_choices(), {
                     "default": NONE,
                     "tooltip": "record only: choose the pruned base this table "

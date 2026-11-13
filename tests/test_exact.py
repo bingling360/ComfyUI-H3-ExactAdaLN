@@ -278,8 +278,9 @@ def main():
 
     spec = H.H3AdaLN.INPUT_TYPES()
     check("nodes: H3AdaLN schema (model/mode + optional inputs)",
-          list(spec["required"]) == ["model", "mode", "report_level"] and
-          set(spec["optional"]) == {"for_model", "fill_reference_row", "table",
+          list(spec["required"]) == ["model", "mode"] and
+          set(spec["optional"]) == {"report_level", "for_model",
+                                    "fill_reference_row", "table",
                                     "table_in", "after"}, str(spec))
     check("nodes: exactly four core nodes",
           set(h3nodes.NODE_CLASS_MAPPINGS) == {"H3LatentCompare", "H3AdaLNReport"} and
