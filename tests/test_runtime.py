@@ -500,7 +500,7 @@ def test_each_pass_reports_only_its_own_forwards():
     at the previous pass's last step, and the signature compared
     `t_emb.shape[0]` (always 3) instead of the injected row ids.
     """
-    dm = tiny_model(seed=4242)
+    dm = tiny_model(seed=5151)     # not 4242/4343: the hybrid test owns those
     patcher = patcher_for(dm)
     _, table, _ = H().run(patcher, "record", fill_reference_row=False)
     feed(dm, [1.0, 0.5])
@@ -638,6 +638,8 @@ for name, fn in [
      test_deferred_apply_report_without_cleanup),
     ("record: a second sampling pass adds rows instead of losing them",
      test_two_passes_are_both_saved),
+    ("apply: each pass reports only its own forwards and row ids",
+     test_each_pass_reports_only_its_own_forwards),
     ("record: a pass with no ON_CLEANUP is saved by the watchdog",
      test_deferred_save_covers_a_pass_without_cleanup),
     ("fingerprint: a quantised checkpoint is refused",
