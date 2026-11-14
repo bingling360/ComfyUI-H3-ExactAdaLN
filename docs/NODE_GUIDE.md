@@ -132,7 +132,11 @@ t_a = 1 − shift(sigma; v, a)        ← sigma 经过一次单调重映射，�
 
 > 直接接 `Preview Any` 也可以，但没有 `after` 排序时它可能在采样前就被求值，那时只有「已武装」那段。
 
-报告里每段都会有一行 `PASS DIFF`，比较本段与上一段的 sigma / t 集合 / token 数 / shift —— 二采、SelfLift 这类高低模链路里「第二段到底换了什么」就看这一行。
+报告里每段都会有一行 `PASS DIFF`，比较本段与上一段的 sigma / t 集合 / **命中的表行号** / token 数 / shift —— 二采、SelfLift 这类高低模链路里「第二段到底换了什么」就看这一行。
+
+`· trace` 只列**本段**的前向（`fwd` 后面的数字是整段的绝对编号，所以第二段从 `fwd 8` 开始是正常的）；`· counters` 是**整段 apply 的累计值**，首行会写明 `scope: cumulative since arm`，per-pass 的数看块首的 `this pass`。
+
+自定义采样节点直接调 `model.forward(...)` 时不会经过 `DIFFUSION_MODEL` wrapper，于是 sigma / t / token 这些「只有 wrapper 才更新」的字段会停在上一段。这种情况块里会多一行 `wrapper: 0 calls this pass -- sigma / t / token above are the last values the wrapper saw`，此时**行号才是本段真实用到的行**，别拿 sigma 去反推。
 
 ### `H3 AdaLN Hybrid`（只有 bX-49 混合模型用）
 

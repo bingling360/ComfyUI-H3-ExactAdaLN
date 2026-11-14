@@ -801,14 +801,25 @@ def _set_callback_once(model, key, fn):
 
 
 def _pass_signature(runtime):
-    """What a single pass looked like -- used to diff pass 1 against pass 2."""
+    """What a single pass looked like -- used to diff pass 1 against pass 2.
+
+    The row identity has to come from the trace: `sigma` / `t` are only
+    refreshed by the DIFFUSION_MODEL wrapper, and a custom sampler that calls
+    the model directly never runs it. Comparing `t_emb.shape[0]` instead (the
+    old `rows` field, always 3) made such a pass look identical to the one
+    before it while its table rows had in fact changed.
+    """
     st = runtime.state
     shift = st.get("last_shift")
-    last = runtime.trace[-1] if runtime.trace else {}
+    last = {}
+    _start, _end = getattr(runtime, "_trace_slice", None) or (0, len(runtime.trace))
+    if _end > _start:
+        last = runtime.trace[_end - 1]
+    indices = last.get("indices")
     return {
         "sigma": st.get("last_sigma"),
         "t": tuple(round(t, 7) for t in (st.get("last_t") or ())),
-        "rows": last.get("rows"),
+        "indices": tuple(indices) if indices is not None else None,
         "tokens": st.get("last_tokens"),
         "segs": st.get("last_segs"),
         "shift": shift,
@@ -820,9 +831,9 @@ def _describe_pass(sig):
     if not sig:
         return "none"
     shift = sig.get("shift")
-    return ("sigma={} rows={} t={} tokens={} segs={} shift={}/{}".format(
+    return ("sigma={} indices={} t={} tokens={} segs={} shift={}/{}".format(
         "{:.7f}".format(sig["sigma"]) if isinstance(sig["sigma"], float) else "?",
-        sig.get("rows"),
+        sig.get("indices"),
         ",".join("{:.7f}".format(t) for t in sig["t"][:6]) or "?",
         sig["tokens"], sig["segs"],
         "{:g}".format(shift[0]) if shift else "?",
@@ -1007,8 +1018,17 @@ def _report_pass(runtime, model, dm, table, rep, lora_mismatch=False,
         section = "pass {}{}".format(pass_no, " (deferred)" if deferred else "")
         lines, summary = _audit(runtime, table, delta, model, dm,
                                 lora_mismatch, pass_no)
+        if delta[4] == 0 and delta[0] > 0:
+            # This pass injected, but never went through the DIFFUSION_MODEL
+            # wrapper. Everything in `state` that only the wrapper writes is
+            # therefore left over from the previous pass -- say so instead of
+            # presenting a frozen sigma as this pass's schedule.
+            lines.append(
+                "  wrapper   : 0 calls this pass -- sigma / t / token above are "
+                "the last values the wrapper saw, NOT this pass's; the row "
+                "identity comes from the t_emb match")
         if prev_sig is not None:
-            changed = [k for k in ("sigma", "t", "rows", "tokens", "segs",
+            changed = [k for k in ("sigma", "t", "indices", "tokens", "segs",
                                    "shift", "width")
                        if prev_sig.get(k) != sig.get(k)]
             lines.append("PASS DIFF   : {} vs pass {} -> changed: {}".format(

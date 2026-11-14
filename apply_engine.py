@@ -153,6 +153,11 @@ class ExactAdaLNRuntime:
         self._last_report = (0, 0, 0, 0, 0)
         self._report_count = 0
         self._pass_sig = None
+        # Which slice of `trace` the pass that is currently being reported owns.
+        # The trace is appended to for the whole lifetime of the runtime, so a
+        # pass block that printed all of it claimed forwards it never ran.
+        self._trace_mark = 0
+        self._trace_slice = None
         # Set when another Apply node takes over the shared diffusion model.
         # This runtime's hooks are gone by design, so "zero forwards" here is
         # not a failure -- the other node did the injection.
@@ -593,6 +598,11 @@ class ExactAdaLNRuntime:
         Called from ON_CLEANUP, i.e. once per sampling call, so a director
         chain reports pass 1 and pass 2 separately instead of one cumulative
         blob where a pass that injected nothing hides inside the total.
+
+        Also freezes which slice of `trace` belongs to this pass. The trace is
+        appended to for the whole runtime, so printing all of it under one
+        block made a 4-forward refine look like a 12-forward pass (the first
+        eight forwards belonged to the pass before it).
         """
         snap = (self.state["injected"], self.state["match_hits"],
                 self.state["match_failures"], self.state["native_steps"],
@@ -600,6 +610,8 @@ class ExactAdaLNRuntime:
         prev = self._last_report
         self._last_report = snap
         self._report_count += 1
+        self._trace_slice = (self._trace_mark, len(self.trace))
+        self._trace_mark = len(self.trace)
         return [b - a for a, b in zip(prev, snap)]
 
     def detach_payload(self):
@@ -618,11 +630,25 @@ class ExactAdaLNRuntime:
         self.remove()
         self.detach_payload()
 
-    def trace_lines(self, limit=None):
-        """Per-forward mapping trace, for the debug report."""
+    def trace_lines(self, limit=None, start=None, end=None):
+        """Per-forward mapping trace, for the debug report.
+
+        Defaults to the pass `begin_pass()` just closed (`_trace_slice`), not
+        the whole runtime. The index printed is still the absolute trace
+        position, so a pass that starts at `fwd 8` is visibly a continuation of
+        the one before it -- it just no longer re-prints that pass's forwards.
+        """
+        if start is None and end is None and self._trace_slice:
+            start, end = self._trace_slice
+        if start is None:
+            start = 0
+        if end is None:
+            end = len(self.trace)
+        entries = self.trace[start:end]
+        if limit:
+            entries = entries[:limit]
         out = []
-        entries = self.trace[:limit] if limit else self.trace
-        for i, item in enumerate(entries):
+        for i, item in enumerate(entries, start=start):
             sigma = item.get("sigma")
             shift = item.get("shift")
             # `forward` is the wrapper's step counter, which stays 0 when the
@@ -630,7 +656,7 @@ class ExactAdaLNRuntime:
             # Printing it as "step" produced eight identical `step 0` lines.
             out.append(
                 "fwd {:<3} wrapper#{} {:<14} sigma={} shift={}/{} tokens={} "
-                "segs={} t_emb={}x{} -> rows={} {} max_dist={:.3e}".format(
+                "segs={} t_emb={}x{} -> indices={} {} max_dist={:.3e}".format(
                     i, item.get("forward", 0), item["how"],
                     "{:.7f}".format(sigma) if isinstance(sigma, float) else sigma,
                     "{:g}".format(shift[0]) if shift else "?",
@@ -646,6 +672,8 @@ class ExactAdaLNRuntime:
     def summary(self):
         st = self.state
         lines = [
+            "scope            : cumulative since arm -- the delta for this pass "
+            "is the `this pass` line above",
             "mode             : {}".format(self.mode),
             "injection mode   : {}".format(self.match_mode),
             "t rows in table  : {}".format(len(self.t_values)),

@@ -490,6 +490,48 @@ def test_two_passes_are_both_saved():
     assert "merged" in str(report) or "saved" in str(report), report
 
 
+def test_each_pass_reports_only_its_own_forwards():
+    """A pass block must not inherit the previous pass's forwards or row ids.
+
+    Real case (2026-11-14): the 8-step first pass and the 4-step refine both
+    injected, but the refine's deferred block printed 12 `fwd` lines -- 8 of
+    them the first pass's -- and said `PASS DIFF: identical`. Two reasons:
+    the refine bypasses the DIFFUSION_MODEL wrapper, so sigma/t stayed frozen
+    at the previous pass's last step, and the signature compared
+    `t_emb.shape[0]` (always 3) instead of the injected row ids.
+    """
+    dm = tiny_model(seed=4242)
+    patcher = patcher_for(dm)
+    _, table, _ = H().run(patcher, "record", fill_reference_row=False)
+    feed(dm, [1.0, 0.5])
+    patcher.cleanup()
+    feed(dm, [0.25, 0.1])                  # second schedule -> four rows
+    patcher.cleanup()
+
+    _, _t, rep = H().run(patcher, "apply", report_level="debug",
+                         table=os.path.basename(table.source))
+    feed(dm, [1.0, 0.5])                   # pass 1 -> rows 3, 2
+    patcher.cleanup()
+    feed(dm, [0.25, 0.1])                  # pass 2 -> rows 1, 0
+    patcher.cleanup()
+
+    text = str(rep)
+    # One forward per pass -- not 1 + 2. The trace is sliced per pass now.
+    assert text.count("fwd ") == 2, text
+    assert "indices=[3, 2]" in text, text
+    assert "indices=[1, 0]" in text, text
+    # Row ids changed, so the diff must not claim the passes were identical.
+    assert "DIFFERENT" in text, text
+    assert "indices=(3, 2)" in text, text
+    assert "indices=(1, 0)" in text, text
+    # This sampler never calls the wrapper; say it instead of printing a
+    # frozen sigma as if it were this pass's schedule.
+    assert "0 calls this pass" in text, text
+    # The counters block is cumulative and now says so.
+    assert "cumulative since arm" in text, text
+    plugin.h3_unified._clear_runtime(patcher)
+
+
 def test_lora_mismatch_is_reported_not_silent():
     base, _path = student()
     path, _why = plugin.h3_unified.resolve_for_model(
