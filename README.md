@@ -30,6 +30,12 @@ H3 的 AdaLN 分支输出只依赖 timestep：`modulation = adaln_proj(time_embe
 
 `report_level` 三档：`silent`（只报错，最省时间）/ `brief`（每段采样一块结论）/ `debug`（每步 trace + 完整计数器 + 落 txt）。想在不改动工作流的情况下看详细报告，把 `report` 接到 `H3 AdaLN Report`，并把它的 `after` 接到采样链末端。
 
+报告按**采样段**分块（一采、二采各一块），每块给出注入次数、命中 / 失败数、缺哪些 t、注入增量与 `EQUIVALENCE` 判定，并有一行 `PASS DIFF` 比较本段与上一段的**命中表行号** / token 数 / shift。三点值得记住：
+
+- 这一段如果没经过 `ON_CLEANUP`（自定义采样节点常见），60 秒后看门狗会补一块 `pass N (deferred)`，那一段的数不会悄悄消失；
+- 同一个 diffusion model 上挂了两个 `H3 AdaLN(apply)` 时，只有后 arm 的那个真正注入，被顶掉的报 `SUPERSEDED` 而不是 FAIL；
+- 只拿得到基座原生 AdaLN（一次都没注入）的那一段会明确写 `FAIL (no forward reached this runtime)` —— 那是「这段采样跑的不是这个节点挂的模型」。
+
 表的行为：
 
 - **自动命名与合并**：文件名由「教师指纹 + AdaLN LoRA 指纹 + dtype」算出；重复录制同一 schedule 不改动，换 schedule 只**追加**缺失的 t 行（不新建表）；只有同一个 t 出现不同数值（模型 / LoRA / dtype 变了）才拒绝写入。
@@ -50,6 +56,7 @@ git clone --depth 1 -b main https://github.com/bingling360/ComfyUI-H3-ExactAdaLN
 ### 三步
 
 1. **录制**：加载**完整教师** + 你的 LoRA，把 `H3 AdaLN` 插在 shift 节点与 guider 之间，`mode=record`，在 `for_model` 下拉里**选中你准备使用的那个剪枝基座**，然后跑一遍你实际要用的工作流。prompt 结束时表自动写入 `models/h3_exact_adaln/`，不需要 Save 节点。
+   - 一采 + 二采这类多段链路**一次录完**：每一段结束都会把新 t 合并进同一张文件；如果某一段的采样没有触发 `ON_CLEANUP`（自己写循环采样的节点就是这样），最后一步停止 60 秒后由后台补写，日志里会出现 `merging them now`。
    - `for_model` 没有 auto 模式：目录里有多个相似基座时，只有你知道要用哪个，节点不扫描、不记忆、不猜测。这个选择会随 workflow 保存，**只需设置一次**；它的指纹写进表头后，之后所有推理都不用再选。
    - 录制可以用最小尺寸（H3 latent 支持 `256x128` / 5 帧）来省时间：表只依赖 t，与分辨率、帧数无关。但步数、scheduler、shift、参考 / 关键帧配置必须与实际出片一致。
 2. **应用**：换成该剪枝基座，`mode=apply`，`table` 保持 `(auto)`。表头的 `target_base` 会命中当前模型，无需选表。
@@ -72,12 +79,15 @@ git clone --depth 1 -b main https://github.com/bingling360/ComfyUI-H3-ExactAdaLN
 
 **录制与运行**
 
-- `record` 必须在**完整教师**上跑：剪枝基座没有 `time_embedder`，节点会直接报错。录制需要一次完整采样，峰值显存按教师算；表本身约 315 MiB / 17 个 t 行，随录过的 schedule 增长。
+- `record` 必须在**完整教师**上跑：剪枝基座没有 `time_embedder`，节点会直接报错。录制需要一次完整采样，峰值显存按教师算；表约 18.5 MiB / t 行（17 行 ≈ 315 MiB，25 行 ≈ 462 MiB），随录过的 schedule 增长。
+- **一个 diffusion model 上只放一个 `record`、一个 `apply`**。两个 record 会互相顶掉（日志 `TOOK OVER`，只有一个在录），两个 apply 也只有后 arm 的那个生效（另一个报 `SUPERSEDED`）。要让两条链同时工作，给它们各自接一个 `UNETLoader`（同一文件再加载一次即可，显存由 DynamicVRAM 管，不会翻倍）。
 - 没有声明 `target_base` 的表（没设 `for_model`、或 v1 旧表）`table=(auto)` **不会**使用：宁可报错也不静默用错教师。请在 `table` 里显式指定一次，或重录时补上 `for_model`。
+- `for_model` 的文件侧指纹要求该检查点的 `adaln_proj` / `adaln_t_table` 以浮点存储。有些 int8 检查点会把整条 AdaLN 分支也量化，这时会直接报「stores the AdaLN branch quantised」而不是生成一个永远匹配不上的指纹 —— 换用 AdaLN 保持 bf16 的检查点，或 `for_model=(none)` 后用 `table` 按名字选表。
+- AdaLN LoRA 指纹不符时默认**拒绝注入**；只有显式在 `table` 里挑文件才允许覆盖，此时报告会写 `MISMATCH`，`EQUIVALENCE` 也不会给 PASS。
 - 同一个基座被两张表声明、或一张表都不匹配，都会明确报错并列出表头的 `target_base` 与 LoRA 指纹；`mode=off` 可显式不用表。
 - 不支持逐行 `denoise_mask` 的 timestep、HyperFlow 式 `(t, r)` 端点条件，以及绕过 `module.forward` 的 C++ / 融合 kernel。
 - **混合模型（b25-49 等）**：剪枝版文件不能直接录制。请在对应的**完整教师**上录一次，现成权重见 [MiniMax-H3-b25-49-full](https://huggingface.co/binglingzhimeng/MiniMax-H3-b25-49-full)。
 - `H3 AdaLN Hybrid` 拼接两张独立录制的表只是近似方案，不是逐位解。追求逐位一致，请用上面的完整教师直接录制。
 - ComfyUI 缓存会制造假 PASS：换模型 / 换表 / 换 mode 后换 seed 或重启再对照。
 
-**附**：详细参数与排错见 [docs/NODE_GUIDE.md](docs/NODE_GUIDE.md)，设计说明见 [docs/unified-node.md](docs/unified-node.md)，[HANDOFF.md](HANDOFF.md) 是历史验证记录（节点行为以本文为准）。CPU 测试：`python tests/test_simple.py`、`tests/test_workflows.py`、`tests/test_merge.py`；`test_exact.py` / `test_runtime.py` 需要 ComfyUI 环境（`COMFYUI_DIR`）。
+**附**：详细参数与排错见 [docs/NODE_GUIDE.md](docs/NODE_GUIDE.md)，设计说明见 [docs/unified-node.md](docs/unified-node.md)，[HANDOFF.md](HANDOFF.md) 是历史验证记录（节点行为以本文为准）。测试：`test_simple.py` / `test_merge.py` / `test_workflows.py` 纯 CPU；`test_exact.py` 与 `test_runtime.py` 需要 ComfyUI 环境，后者用 `COMFYUI_DIR=<ComfyUI 路径> python tests/test_runtime.py` 跑（它会以 `--cpu` 建一个微型 MiniMaxH3，不加载任何检查点）。
