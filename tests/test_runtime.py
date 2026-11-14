@@ -525,8 +525,10 @@ def test_each_pass_reports_only_its_own_forwards():
     assert "indices=(3, 2)" in text, text
     assert "indices=(1, 0)" in text, text
     # This sampler never calls the wrapper; say it instead of printing a
-    # frozen sigma as if it were this pass's schedule.
+    # frozen sigma as if it were this pass's schedule. The trace rebuilds
+    # sigma from the matched row, so it cannot inherit the previous pass's.
     assert "0 calls this pass" in text, text
+    assert "sigma=0.0000000(row)" in text, text
     # The counters block is cumulative and now says so.
     assert "cumulative since arm" in text, text
     plugin.h3_unified._clear_runtime(patcher)

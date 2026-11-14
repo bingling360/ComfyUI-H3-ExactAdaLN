@@ -111,6 +111,23 @@ def _parse_dtype(name):
 # ComfyUI process dies. Keeping the rows on the host sidesteps it entirely.
 
 
+def _sigma_text(sigma, t_hit):
+    """Sigma for one trace line.
+
+    `sigma` comes from the DIFFUSION_MODEL wrapper, which a custom sampler that
+    calls the model directly never runs -- it then holds the *previous* pass's
+    last step (0.6315789 in the 2026-11-14 run), so four refine steps all
+    printed the same value. The matched table row is immune to that: its t is
+    the value the model actually used, and sigma = 1 - t by construction. When
+    the two disagree, the row wins and says so.
+    """
+    derived = 1.0 - float(t_hit[0]) if t_hit else None
+    if derived is not None and (not isinstance(sigma, float)
+                                or abs(sigma - derived) > 1e-5):
+        return "{:.7f}(row)".format(derived)
+    return "{:.7f}".format(sigma) if isinstance(sigma, float) else "?"
+
+
 class ExactAdaLNRuntime:
     def __init__(self, t_values, raw_by_key, meta, dm, mode="strict"):
         self.t_values = list(t_values)
@@ -493,12 +510,22 @@ class ExactAdaLNRuntime:
         self.state["last_hook_at"] = time.time()
         if key != self._trace_key or len(self.trace) >= self.trace_cap:
             return
+        # Only a match tells us which row (hence which t) this forward used.
+        # A sigma-fallback reuses `state["t_indices"]`, which may be the
+        # previous pass's, so it must not be presented as this forward's t.
+        t_hit = None
+        if how in ("exact", "approx") and indices is not None:
+            try:
+                t_hit = [round(float(self.t_values[i]), 7) for i in indices]
+            except (IndexError, TypeError, ValueError):
+                t_hit = None
         self.trace.append({
             "forward": self.state["wrapper_steps"],
             "module": key,
             "rows": int(t_emb.shape[0]),
             "width": int(t_emb.shape[-1]),
             "indices": list(indices) if indices is not None else None,
+            "t_hit": t_hit,
             "max_dist": float(maxd),
             "tol": float(tol),
             "how": how,
@@ -509,14 +536,13 @@ class ExactAdaLNRuntime:
             "shift": self.state.get("last_shift"),
         })
         if self.verbose:
-            sigma = self.state.get("last_sigma")
             logging.info(
                 "H3AdaLN: fwd %d %s t_emb=%dx%d -> rows=%s max_dist=%.3e "
                 "sigma=%s%s",
                 len(self.trace) - 1, how,
                 int(t_emb.shape[0]), int(t_emb.shape[-1]),
                 indices, maxd,
-                "{:.7f}".format(sigma) if isinstance(sigma, float) else "?",
+                _sigma_text(self.state.get("last_sigma"), t_hit),
                 "" if how != "native" else "  (NATIVE AdaLN -- not injected)")
 
     # -- registration ------------------------------------------------------
@@ -648,23 +674,28 @@ class ExactAdaLNRuntime:
         if limit:
             entries = entries[:limit]
         out = []
+        used_row = False
         for i, item in enumerate(entries, start=start):
             sigma = item.get("sigma")
             shift = item.get("shift")
+            sigma_txt = _sigma_text(sigma, item.get("t_hit"))
+            used_row = used_row or sigma_txt.endswith("(row)")
             # `forward` is the wrapper's step counter, which stays 0 when the
             # wrapper does not run (a chain that samples without model_options).
             # Printing it as "step" produced eight identical `step 0` lines.
             out.append(
                 "fwd {:<3} wrapper#{} {:<14} sigma={} shift={}/{} tokens={} "
                 "segs={} t_emb={}x{} -> indices={} {} max_dist={:.3e}".format(
-                    i, item.get("forward", 0), item["how"],
-                    "{:.7f}".format(sigma) if isinstance(sigma, float) else sigma,
+                    i, item.get("forward", 0), item["how"], sigma_txt,
                     "{:g}".format(shift[0]) if shift else "?",
                     "{:g}".format(shift[1]) if shift else "?",
                     item.get("tokens"), item.get("segs"),
                     item.get("rows"), item.get("width"),
                     item.get("indices"), "" if item["how"] != "approx"
                     else "(nearest)", item.get("max_dist", 0.0)))
+        if used_row:
+            out.append("  (row) = 1 - t of the matched table row: the wrapper did "
+                       "not run for that forward, so its own sigma was stale")
         if len(self.trace) >= self.trace_cap:
             out.append("... trace truncated at {} forwards".format(self.trace_cap))
         return out
@@ -695,7 +726,7 @@ class ExactAdaLNRuntime:
                 "{:.6e} (table row vs native AdaLN)".format(st["max_injection_delta"])
                 if st["injection_delta_measured"]
                 else "UNAVAILABLE (another Apply hook already replaced output)"),
-            "last sigma / t   : {} / {}".format(
+            "last wrapper sigma/t: {} / {}".format(
                 st["last_sigma"],
                 ",".join("{:.7f}".format(t) for t in (st["last_t"] or [])[:6])
                 or "none"),

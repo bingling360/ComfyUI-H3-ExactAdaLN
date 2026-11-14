@@ -807,7 +807,9 @@ def _pass_signature(runtime):
     refreshed by the DIFFUSION_MODEL wrapper, and a custom sampler that calls
     the model directly never runs it. Comparing `t_emb.shape[0]` instead (the
     old `rows` field, always 3) made such a pass look identical to the one
-    before it while its table rows had in fact changed.
+    before it while its table rows had in fact changed. `sigma` / `t` follow
+    the matched row (1 - t) when there is one, so a frozen wrapper value cannot
+    leak into the diff.
     """
     st = runtime.state
     shift = st.get("last_shift")
@@ -816,9 +818,19 @@ def _pass_signature(runtime):
     if _end > _start:
         last = runtime.trace[_end - 1]
     indices = last.get("indices")
+    t_hit = last.get("t_hit")
+    if t_hit:
+        # A matched row carries the real t of that forward; sigma is 1 - t by
+        # construction. The wrapper's own values are only trustworthy when it
+        # ran, and a custom sampler never calls it.
+        t = tuple(t_hit)
+        sigma = round(1.0 - float(t_hit[0]), 7)
+    else:
+        t = tuple(round(x, 7) for x in (st.get("last_t") or ()))
+        sigma = st.get("last_sigma")
     return {
-        "sigma": st.get("last_sigma"),
-        "t": tuple(round(t, 7) for t in (st.get("last_t") or ())),
+        "sigma": sigma,
+        "t": t,
         "indices": tuple(indices) if indices is not None else None,
         "tokens": st.get("last_tokens"),
         "segs": st.get("last_segs"),

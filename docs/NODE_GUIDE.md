@@ -136,7 +136,9 @@ t_a = 1 − shift(sigma; v, a)        ← sigma 经过一次单调重映射，�
 
 `· trace` 只列**本段**的前向（`fwd` 后面的数字是整段的绝对编号，所以第二段从 `fwd 8` 开始是正常的）；`· counters` 是**整段 apply 的累计值**，首行会写明 `scope: cumulative since arm`，per-pass 的数看块首的 `this pass`。
 
-自定义采样节点直接调 `model.forward(...)` 时不会经过 `DIFFUSION_MODEL` wrapper，于是 sigma / t / token 这些「只有 wrapper 才更新」的字段会停在上一段。这种情况块里会多一行 `wrapper: 0 calls this pass -- sigma / t / token above are the last values the wrapper saw`，此时**行号才是本段真实用到的行**，别拿 sigma 去反推。
+自定义采样节点直接调 `model.forward(...)` 时不会经过 `DIFFUSION_MODEL` wrapper，于是 sigma / t / token 这些「只有 wrapper 才更新」的字段会停在上一段。这种情况块里会多一行 `wrapper: 0 calls this pass -- sigma / t / token above are the last values the wrapper saw`。
+
+trace 里遇到这种前向，sigma 不再引用那个冻结值，而是按命中的表行反算：`t` 是模型真正用的值，`sigma = 1 - t`，显示成 `sigma=0.4474000(row)`，段末附一行说明。所以二采四个不同 t 的步现在会显示四个不同的 sigma；`PASS DIFF` 的 sigma / t 也来自同一来源，不会再出现「四步同一个 0.6316」这种假象。`· counters` 里的 `last wrapper sigma/t` 仍然是 wrapper 最后一次看到的值，前缀已标明来源。
 
 ### `H3 AdaLN Hybrid`（只有 bX-49 混合模型用）
 
